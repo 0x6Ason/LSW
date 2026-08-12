@@ -1,0 +1,15 @@
+[package]
+name = "lsw-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LSW QMP lifecycle supervisor"
+publish = false
+
+[[bin]]
+name = "lswd"
+path = "src/main.rs"
+
+[dependencies]
+lsw-core = { path = "../lsw-core" }

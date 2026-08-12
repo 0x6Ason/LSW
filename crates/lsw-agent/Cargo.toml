@@ -1,0 +1,15 @@
+[package]
+name = "lsw-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LSW authenticated Windows guest agent"
+publish = false
+
+[[bin]]
+name = "lsw-agent"
+path = "src/main.rs"
+
+[dependencies]
+lsw-core = { path = "../lsw-core" }

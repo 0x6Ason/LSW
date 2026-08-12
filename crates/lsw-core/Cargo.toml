@@ -1,0 +1,10 @@
+[package]
+name = "lsw-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core manifest, installer, protocol, and QEMU planning logic for LSW"
+publish = false
+
+[dependencies]
