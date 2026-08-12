@@ -1,0 +1,15 @@
+[package]
+name = "lsw-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LSW local Windows development runtime CLI"
+publish = false
+
+[[bin]]
+name = "lsw"
+path = "src/main.rs"
+
+[dependencies]
+lsw-core = { path = "../lsw-core" }
