@@ -6,7 +6,9 @@ use crate::{LswError, Result};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
 pub const CAPABILITY_CONPTY_V1: &str = "conpty-v1";
+pub const CAPABILITY_SESSION_CONTROL_V1: &str = "session-control-v1";
 pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
+pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 1024;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
@@ -27,6 +29,9 @@ pub enum FrameKind {
     Resize = 14,
     Exit = 15,
     TerminalStart = 16,
+    SessionOptions = 17,
+    StdinClose = 18,
+    SessionCancel = 19,
     FilePut = 20,
     FileGet = 21,
     FileData = 22,
@@ -50,6 +55,9 @@ impl TryFrom<u8> for FrameKind {
             14 => Ok(Self::Resize),
             15 => Ok(Self::Exit),
             16 => Ok(Self::TerminalStart),
+            17 => Ok(Self::SessionOptions),
+            18 => Ok(Self::StdinClose),
+            19 => Ok(Self::SessionCancel),
             20 => Ok(Self::FilePut),
             21 => Ok(Self::FileGet),
             22 => Ok(Self::FileData),
@@ -185,6 +193,44 @@ pub struct StartRequest {
     pub kind: SessionKind,
     pub argv: Vec<String>,
     pub working_directory: Option<String>,
+}
+
+/// Opts a single authenticated process session into capability-gated control
+/// semantics without changing the version-one handshake or start payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionOptions {
+    pub cancel_on_disconnect: bool,
+}
+
+impl SessionOptions {
+    const CANCEL_ON_DISCONNECT: u8 = 1;
+
+    pub fn encode(self) -> Vec<u8> {
+        vec![if self.cancel_on_disconnect {
+            Self::CANCEL_ON_DISCONNECT
+        } else {
+            0
+        }]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let flags = match payload {
+            [flags] => *flags,
+            _ => {
+                return Err(LswError::Protocol(
+                    "session options payload must contain one byte".to_owned(),
+                ))
+            }
+        };
+        if flags & !Self::CANCEL_ON_DISCONNECT != 0 {
+            return Err(LswError::Protocol(format!(
+                "session options contain unknown flags 0x{flags:02x}"
+            )));
+        }
+        Ok(Self {
+            cancel_on_disconnect: flags & Self::CANCEL_ON_DISCONNECT != 0,
+        })
+    }
 }
 
 impl StartRequest {
@@ -588,6 +634,35 @@ mod tests {
             FrameKind::try_from(16).expect("kind should decode"),
             FrameKind::TerminalStart
         );
+    }
+
+    #[test]
+    fn session_control_is_append_only_and_strictly_encoded() {
+        assert_eq!(
+            FrameKind::try_from(17).expect("options kind should decode"),
+            FrameKind::SessionOptions
+        );
+        assert_eq!(
+            FrameKind::try_from(18).expect("stdin-close kind should decode"),
+            FrameKind::StdinClose
+        );
+        assert_eq!(
+            FrameKind::try_from(19).expect("cancel kind should decode"),
+            FrameKind::SessionCancel
+        );
+
+        for cancel_on_disconnect in [false, true] {
+            let options = SessionOptions {
+                cancel_on_disconnect,
+            };
+            assert_eq!(
+                SessionOptions::decode(&options.encode()).expect("options should decode"),
+                options
+            );
+        }
+        assert!(SessionOptions::decode(&[]).is_err());
+        assert!(SessionOptions::decode(&[0, 0]).is_err());
+        assert!(SessionOptions::decode(&[2]).is_err());
     }
 
     #[test]

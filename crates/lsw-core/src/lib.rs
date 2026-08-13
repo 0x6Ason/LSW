@@ -37,7 +37,8 @@ pub const MANIFEST_FILE: &str = "instance.lsw";
 pub use agent_protocol::{
     constant_time_token_eq, decode_exit, decode_file_length, decode_resize, encode_exit,
     encode_file_length, encode_resize, read_frame, write_frame, ClientHello, FileGetRequest,
-    FilePutRequest, Frame, FrameKind, ServerHello, SessionKind, StartRequest, TerminalSize,
-    TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
-    CAPABILITY_TERMINAL_RESIZE_V1, MAX_FRAME_BYTES, MAX_TERMINAL_DIMENSION,
+    FilePutRequest, Frame, FrameKind, ServerHello, SessionKind, SessionOptions, StartRequest,
+    TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
+    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_TERMINAL_RESIZE_V1, MAX_FRAME_BYTES,
+    MAX_TERMINAL_DIMENSION, SESSION_CANCEL_EXIT_CODE,
 };

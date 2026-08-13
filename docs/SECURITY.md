@@ -47,6 +47,23 @@ local loopback-to-QEMU user network, not a LAN or Internet connection. Do not
 forward the agent port externally. A future non-local transport must add channel
 encryption and peer identity rather than relying on this token protocol alone.
 
+After authentication, peers advertising `session-control-v1` can opt a process
+session into explicit control semantics. `STDIN_CLOSE` delivers EOF without
+termination; `SESSION_CANCEL` terminates the direct child and returns exit code
+130; `cancel-on-disconnect` releases that direct child when a disconnect is
+observed. Before a process starts, an unprefixed control request, an invalid
+options payload, or any request sent before authentication is rejected. Once a
+legacy process has started, it keeps the version-one behavior rather than
+gaining the new control semantics, including TCP half-close as stdin EOF.
+
+This is not yet process-tree containment. beta.3 does not assign Windows
+descendants to a Job Object or host-side descendants to a process group, and a
+half-open TCP peer may remain indistinguishable from an idle connection without
+a lease/heartbeat. Descendants can therefore survive direct-child cancellation
+or keep inherited output handles open. Do not treat session cancellation as a
+guest workload kill boundary until tree ownership and bounded liveness are
+implemented.
+
 Agent powers are intentionally broad after authentication: it can execute as the
 logged-in Windows user and read or create files that user can access. Protect the
 host token and state backups accordingly. Transfers reject symlinks and existing
@@ -102,10 +119,12 @@ of shared images, and retain a driverless secure profile.
 
 - Run QEMU/swtpm with a reduced host privilege and platform sandbox policy.
 - Add encrypted transport before supporting any non-local agent connection.
+- Own each process tree with a Windows Job Object or host process group, and add
+  a bounded lease/heartbeat for half-open session cleanup.
 - Threat-model clipboard, host folders, USB and per-HWND input before enabling
   those integrations.
-- Fuzz PE parsing and the ConPTY/resize protocol in addition to malformed agent
-  and QMP traffic.
+- Fuzz PE parsing and the ConPTY/resize/session-control protocol in addition to
+  malformed agent and QMP traffic.
 - Add signed release provenance and a documented vulnerability-reporting route.
 - Exercise agent, QMP, suspend/resume, port forwarding, and ConPTY with
   long-running soak tests on a real Windows guest.

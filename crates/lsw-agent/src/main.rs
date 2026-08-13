@@ -5,12 +5,11 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-#[cfg(windows)]
-use std::net::Shutdown;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -19,13 +18,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind,
-    ServerHello, SessionKind, StartRequest, TerminalStartRequest, AGENT_GUEST_PORT,
-    AGENT_PROTOCOL_VERSION,
+    ServerHello, SessionKind, SessionOptions, StartRequest, TerminalStartRequest, AGENT_GUEST_PORT,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_SESSION_CONTROL_V1, SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
 use lsw_core::{TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_TERMINAL_RESIZE_V1};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_SESSIONS: usize = 32;
 
@@ -95,6 +95,40 @@ impl Drop for SessionSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionMode {
+    Legacy,
+    Controlled(SessionOptions),
+}
+
+impl SessionMode {
+    fn is_controlled(self) -> bool {
+        matches!(self, Self::Controlled(_))
+    }
+
+    fn cancel_on_disconnect(self) -> bool {
+        match self {
+            Self::Legacy => false,
+            Self::Controlled(options) => options.cancel_on_disconnect,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SessionControlEvent {
+    Cancel,
+    Disconnect,
+    ProtocolError(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SessionEnd {
+    Normal,
+    Cancelled,
+    Disconnected,
+    ProtocolError(String),
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     expected_token: &str,
@@ -140,9 +174,34 @@ fn handle_connection(
         write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
         return Ok(());
     }
+    let (request_frame, session_mode) = if request_frame.kind == FrameKind::SessionOptions {
+        let options = match SessionOptions::decode(&request_frame.payload) {
+            Ok(options) => options,
+            Err(error) => {
+                send_error(&mut stream, &error.to_string())?;
+                return Err(error.into());
+            }
+        };
+        let request_frame = read_frame(&mut stream)?;
+        if !matches!(
+            request_frame.kind,
+            FrameKind::Start | FrameKind::TerminalStart
+        ) {
+            send_error(
+                &mut stream,
+                "SESSION_OPTIONS must be followed by START or TERMINAL_START",
+            )?;
+            return Err("client sent an invalid controlled-session request".into());
+        }
+        (request_frame, SessionMode::Controlled(options))
+    } else {
+        (request_frame, SessionMode::Legacy)
+    };
     match request_frame.kind {
-        FrameKind::Start => run_process_request(stream, &request_frame.payload),
-        FrameKind::TerminalStart => run_terminal_request(stream, &request_frame.payload),
+        FrameKind::Start => run_process_request(stream, &request_frame.payload, session_mode),
+        FrameKind::TerminalStart => {
+            run_terminal_request(stream, &request_frame.payload, session_mode)
+        }
         FrameKind::FilePut => receive_file(stream, &request_frame.payload),
         FrameKind::FileGet => send_file(stream, &request_frame.payload),
         _ => {
@@ -158,6 +217,7 @@ fn agent_capabilities() -> Vec<String> {
         "shell-fallback-v1".to_owned(),
         "stderr-v1".to_owned(),
         "file-transfer-v1".to_owned(),
+        CAPABILITY_SESSION_CONTROL_V1.to_owned(),
     ];
     #[cfg(windows)]
     let capabilities = {
@@ -172,6 +232,7 @@ fn agent_capabilities() -> Vec<String> {
 fn run_process_request(
     mut stream: TcpStream,
     payload: &[u8],
+    session_mode: SessionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = StartRequest::decode(payload)?;
     let mut child = match spawn_request(&request) {
@@ -182,7 +243,7 @@ fn run_process_request(
         }
     };
 
-    bridge_process(&mut child, stream)?;
+    bridge_process(&mut child, stream, session_mode)?;
     Ok(())
 }
 
@@ -190,6 +251,7 @@ fn run_process_request(
 fn run_terminal_request(
     mut stream: TcpStream,
     payload: &[u8],
+    session_mode: SessionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let terminal_request = TerminalStartRequest::decode(payload)?;
     if terminal_request.request.kind != SessionKind::Shell {
@@ -210,13 +272,14 @@ fn run_terminal_request(
                 return Err(error.into());
             }
         };
-    bridge_terminal(process, stream)
+    bridge_terminal(process, stream, session_mode)
 }
 
 #[cfg(not(windows))]
 fn run_terminal_request(
     mut stream: TcpStream,
     payload: &[u8],
+    _session_mode: SessionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     TerminalStartRequest::decode(payload)?;
     send_error(
@@ -410,28 +473,36 @@ fn spawn_program(
     command.spawn()
 }
 
-fn bridge_process(child: &mut Child, stream: TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+fn bridge_process(
+    child: &mut Child,
+    stream: TcpStream,
+    session_mode: SessionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let child_stdin = child.stdin.take().ok_or("child stdin was not piped")?;
     let child_stdout = child.stdout.take().ok_or("child stdout was not piped")?;
     let child_stderr = child.stderr.take().ok_or("child stderr was not piped")?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
+    let input_shutdown = stream.try_clone()?;
+    let (control_sender, control_receiver) = mpsc::channel();
 
     let stdout_thread = spawn_output_bridge(child_stdout, Arc::clone(&writer), FrameKind::Stdout);
     let stderr_thread = spawn_output_bridge(child_stderr, Arc::clone(&writer), FrameKind::Stderr);
-    let _input_thread = spawn_input_bridge(stream, child_stdin);
+    let input_thread = spawn_input_bridge(stream, child_stdin, session_mode, control_sender);
 
-    let status = child.wait()?;
-    join_bridge(stdout_thread)?;
-    join_bridge(stderr_thread)?;
-    let code = status.code().unwrap_or(255);
-    send_shared(&writer, &Frame::new(FrameKind::Exit, encode_exit(code)))?;
-    Ok(())
+    let (status, session_end) = wait_for_child(child, &control_receiver)?;
+    let _ = input_shutdown.shutdown(Shutdown::Read);
+    join_input_bridge(input_thread)?;
+    let peer_disconnected = session_end == SessionEnd::Disconnected;
+    join_bridge(stdout_thread, peer_disconnected)?;
+    join_bridge(stderr_thread, peer_disconnected)?;
+    finish_session(&writer, session_end, status.code().unwrap_or(255))
 }
 
 #[cfg(windows)]
 fn bridge_terminal(
     process: windows_conpty::ConPtyProcess,
     stream: TcpStream,
+    session_mode: SessionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let windows_conpty::ConPtyProcess {
         process,
@@ -441,20 +512,110 @@ fn bridge_terminal(
     } = process;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let input_shutdown = stream.try_clone()?;
+    let (control_sender, control_receiver) = mpsc::channel();
     let output_thread = spawn_output_bridge(output, Arc::clone(&writer), FrameKind::Stdout);
-    let input_thread = spawn_terminal_input_bridge(stream, input, Arc::clone(&console));
+    let input_thread = spawn_terminal_input_bridge(
+        stream,
+        input,
+        Arc::clone(&console),
+        session_mode,
+        control_sender,
+    );
 
-    let code = windows_conpty::wait_for_process(&process)?;
+    let (code, session_end) = wait_for_terminal_process(&process, &control_receiver)?;
     let _ = input_shutdown.shutdown(Shutdown::Read);
-    // A disconnect only closes ConPTY input; it deliberately does not kill a
-    // guest shell. A shell which ignores EOF can retain this session slot until
-    // it exits. Adding an authenticated cancel/terminate frame is follow-up
-    // protocol work because implicit process termination would be surprising.
     join_terminal_input(input_thread)?;
     drop(console);
-    join_bridge(output_thread)?;
-    send_shared(&writer, &Frame::new(FrameKind::Exit, encode_exit(code)))?;
-    Ok(())
+    join_bridge(output_thread, session_end == SessionEnd::Disconnected)?;
+    finish_session(&writer, session_end, code)
+}
+
+fn wait_for_child(
+    child: &mut Child,
+    controls: &Receiver<SessionControlEvent>,
+) -> Result<(ExitStatus, SessionEnd), Box<dyn std::error::Error>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, SessionEnd::Normal));
+        }
+        match controls.recv_timeout(PROCESS_POLL_INTERVAL) {
+            Ok(SessionControlEvent::Cancel) => {
+                let (status, terminated) = terminate_child(child)?;
+                return Ok((status, cancel_session_end(terminated)));
+            }
+            Ok(SessionControlEvent::Disconnect) => {
+                return Ok((terminate_child(child)?.0, SessionEnd::Disconnected))
+            }
+            Ok(SessionControlEvent::ProtocolError(message)) => {
+                return Ok((
+                    terminate_child(child)?.0,
+                    SessionEnd::ProtocolError(message),
+                ))
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok((child.wait()?, SessionEnd::Normal)),
+        }
+    }
+}
+
+fn cancel_session_end(process_was_terminated: bool) -> SessionEnd {
+    if process_was_terminated {
+        SessionEnd::Cancelled
+    } else {
+        SessionEnd::Normal
+    }
+}
+
+/// Returns the exit status and whether this call actually issued a kill.
+fn terminate_child(child: &mut Child) -> io::Result<(ExitStatus, bool)> {
+    if let Some(status) = child.try_wait()? {
+        return Ok((status, false));
+    }
+    if let Err(error) = child.kill() {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        return Err(error);
+    }
+    Ok((child.wait()?, true))
+}
+
+#[cfg(windows)]
+fn wait_for_terminal_process(
+    process: &std::os::windows::io::OwnedHandle,
+    controls: &Receiver<SessionControlEvent>,
+) -> Result<(i32, SessionEnd), Box<dyn std::error::Error>> {
+    let poll_milliseconds = u32::try_from(PROCESS_POLL_INTERVAL.as_millis())
+        .expect("the process poll interval fits in a u32");
+    loop {
+        if let Some(code) = windows_conpty::wait_for_process_timeout(process, poll_milliseconds)? {
+            return Ok((code, SessionEnd::Normal));
+        }
+        let session_end = match controls.try_recv() {
+            Ok(SessionControlEvent::Cancel) => SessionEnd::Cancelled,
+            Ok(SessionControlEvent::Disconnect) => SessionEnd::Disconnected,
+            Ok(SessionControlEvent::ProtocolError(message)) => SessionEnd::ProtocolError(message),
+            Err(mpsc::TryRecvError::Empty) => continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Ok((
+                    windows_conpty::wait_for_process(process)?,
+                    SessionEnd::Normal,
+                ))
+            }
+        };
+        if let Some(code) = windows_conpty::wait_for_process_timeout(process, 0)? {
+            return Ok((code, SessionEnd::Normal));
+        }
+        let cancel_exit_code = u32::try_from(SESSION_CANCEL_EXIT_CODE)
+            .expect("the session cancel exit code is non-negative");
+        if let Err(error) = windows_conpty::terminate_process(process, cancel_exit_code) {
+            if let Some(code) = windows_conpty::wait_for_process_timeout(process, 0)? {
+                return Ok((code, SessionEnd::Normal));
+            }
+            return Err(error.into());
+        }
+        return Ok((windows_conpty::wait_for_process(process)?, session_end));
+    }
 }
 
 fn spawn_output_bridge(
@@ -477,22 +638,92 @@ fn spawn_output_bridge(
 
 fn spawn_input_bridge(
     mut stream: TcpStream,
-    mut child_stdin: impl Write + Send + 'static,
+    child_stdin: impl Write + Send + 'static,
+    session_mode: SessionMode,
+    control_sender: Sender<SessionControlEvent>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        match read_frame(&mut stream) {
-            Ok(frame) if frame.kind == FrameKind::Stdin => {
-                if child_stdin.write_all(&frame.payload).is_err() || child_stdin.flush().is_err() {
-                    break;
+    thread::spawn(move || {
+        let mut child_stdin = Some(child_stdin);
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.kind == FrameKind::Stdin => {
+                    let Some(stdin) = child_stdin.as_mut() else {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "STDIN was sent after STDIN_CLOSE",
+                        );
+                        return;
+                    };
+                    if let Err(error) = stdin.write_all(&frame.payload).and_then(|()| stdin.flush())
+                    {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            &format!("could not write child stdin: {error}"),
+                        );
+                        return;
+                    }
+                }
+                Ok(frame) if frame.kind == FrameKind::Resize => {
+                    // Pipe sessions cannot resize. ConPTY-capable agents will negotiate
+                    // a separate capability before acting on this frame.
+                    if let Err(error) = decode_resize(&frame.payload) {
+                        report_protocol_error(&control_sender, session_mode, &error.to_string());
+                        return;
+                    }
+                }
+                Ok(frame) if frame.kind == FrameKind::StdinClose => {
+                    if !session_mode.is_controlled() || !frame.payload.is_empty() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "STDIN_CLOSE requires a controlled session and an empty payload",
+                        );
+                        return;
+                    }
+                    if child_stdin.take().is_none() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "STDIN_CLOSE was sent more than once",
+                        );
+                        return;
+                    }
+                }
+                Ok(frame) if frame.kind == FrameKind::SessionCancel => {
+                    if !session_mode.is_controlled() || !frame.payload.is_empty() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "SESSION_CANCEL requires a controlled session and an empty payload",
+                        );
+                        return;
+                    }
+                    drop(child_stdin.take());
+                    let _ = control_sender.send(SessionControlEvent::Cancel);
+                    return;
+                }
+                Ok(frame) => {
+                    report_protocol_error(
+                        &control_sender,
+                        session_mode,
+                        &format!("unexpected {:?} frame in process session", frame.kind),
+                    );
+                    return;
+                }
+                Err(lsw_core::LswError::Io(_)) => {
+                    drop(child_stdin.take());
+                    if session_mode.cancel_on_disconnect() {
+                        let _ = control_sender.send(SessionControlEvent::Disconnect);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    report_protocol_error(&control_sender, session_mode, &error.to_string());
+                    return;
                 }
             }
-            Ok(frame) if frame.kind == FrameKind::Resize => {
-                // Pipe sessions cannot resize. ConPTY-capable agents will negotiate
-                // a separate capability before acting on this frame.
-                let _ = decode_resize(&frame.payload);
-            }
-            Ok(_) => break,
-            Err(_) => break,
         }
     })
 }
@@ -500,42 +731,139 @@ fn spawn_input_bridge(
 #[cfg(windows)]
 fn spawn_terminal_input_bridge(
     mut stream: TcpStream,
-    mut input: impl Write + Send + 'static,
+    input: impl Write + Send + 'static,
     console: Arc<windows_conpty::PseudoConsole>,
+    session_mode: SessionMode,
+    control_sender: Sender<SessionControlEvent>,
 ) -> thread::JoinHandle<Result<(), String>> {
-    thread::spawn(move || loop {
-        match read_frame(&mut stream) {
-            Ok(frame) if frame.kind == FrameKind::Stdin => {
-                input
-                    .write_all(&frame.payload)
-                    .and_then(|()| input.flush())
-                    .map_err(|error| error.to_string())?;
+    thread::spawn(move || {
+        let mut input = Some(input);
+        loop {
+            match read_frame(&mut stream) {
+                Ok(frame) if frame.kind == FrameKind::Stdin => {
+                    let Some(input) = input.as_mut() else {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "STDIN was sent after STDIN_CLOSE",
+                        );
+                        return Ok(());
+                    };
+                    if let Err(error) = input.write_all(&frame.payload).and_then(|()| input.flush())
+                    {
+                        return terminal_bridge_failure(
+                            &control_sender,
+                            session_mode,
+                            error.to_string(),
+                        );
+                    }
+                }
+                Ok(frame) if frame.kind == FrameKind::Resize => {
+                    let size = match TerminalSize::decode(&frame.payload) {
+                        Ok(size) => size,
+                        Err(error) => {
+                            return terminal_bridge_failure(
+                                &control_sender,
+                                session_mode,
+                                error.to_string(),
+                            )
+                        }
+                    };
+                    if let Err(error) = console.resize(size) {
+                        return terminal_bridge_failure(
+                            &control_sender,
+                            session_mode,
+                            error.to_string(),
+                        );
+                    }
+                }
+                Ok(frame) if frame.kind == FrameKind::StdinClose => {
+                    if !session_mode.is_controlled() || !frame.payload.is_empty() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "STDIN_CLOSE requires a controlled session and an empty payload",
+                        );
+                        return Ok(());
+                    }
+                    if input.take().is_none() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "STDIN_CLOSE was sent more than once",
+                        );
+                        return Ok(());
+                    }
+                }
+                Ok(frame) if frame.kind == FrameKind::SessionCancel => {
+                    if !session_mode.is_controlled() || !frame.payload.is_empty() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "SESSION_CANCEL requires a controlled session and an empty payload",
+                        );
+                        return Ok(());
+                    }
+                    drop(input.take());
+                    let _ = control_sender.send(SessionControlEvent::Cancel);
+                    return Ok(());
+                }
+                Ok(frame) => {
+                    let message = format!("unexpected {:?} frame in terminal session", frame.kind);
+                    if session_mode.is_controlled() {
+                        let _ = control_sender.send(SessionControlEvent::ProtocolError(message));
+                        return Ok(());
+                    }
+                    return Err(message);
+                }
+                Err(lsw_core::LswError::Io(_)) => {
+                    drop(input.take());
+                    if session_mode.cancel_on_disconnect() {
+                        let _ = control_sender.send(SessionControlEvent::Disconnect);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    if session_mode.is_controlled() {
+                        let _ = control_sender
+                            .send(SessionControlEvent::ProtocolError(error.to_string()));
+                        return Ok(());
+                    }
+                    return Err(error.to_string());
+                }
             }
-            Ok(frame) if frame.kind == FrameKind::Resize => {
-                let size =
-                    TerminalSize::decode(&frame.payload).map_err(|error| error.to_string())?;
-                console.resize(size).map_err(|error| error.to_string())?;
-            }
-            Ok(frame) => {
-                return Err(format!(
-                    "unexpected {:?} frame in terminal session",
-                    frame.kind
-                ))
-            }
-            Err(lsw_core::LswError::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::UnexpectedEof
-                        | io::ErrorKind::ConnectionAborted
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::NotConnected
-                ) =>
-            {
-                return Ok(())
-            }
-            Err(error) => return Err(error.to_string()),
         }
     })
+}
+
+#[cfg(windows)]
+fn terminal_bridge_failure(
+    sender: &Sender<SessionControlEvent>,
+    session_mode: SessionMode,
+    message: String,
+) -> Result<(), String> {
+    if session_mode.is_controlled() {
+        let _ = sender.send(SessionControlEvent::ProtocolError(message));
+        Ok(())
+    } else {
+        Err(message)
+    }
+}
+
+fn report_protocol_error(
+    sender: &Sender<SessionControlEvent>,
+    session_mode: SessionMode,
+    message: &str,
+) {
+    if session_mode.is_controlled() {
+        let _ = sender.send(SessionControlEvent::ProtocolError(message.to_owned()));
+    }
+}
+
+fn join_input_bridge(thread: thread::JoinHandle<()>) -> Result<(), Box<dyn std::error::Error>> {
+    thread
+        .join()
+        .map_err(|_| "process input bridge panicked".into())
 }
 
 #[cfg(windows)]
@@ -551,11 +879,38 @@ fn join_terminal_input(
 
 fn join_bridge(
     thread: thread::JoinHandle<Result<(), String>>,
+    ignore_stream_error: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match thread.join() {
         Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) if ignore_stream_error => Ok(()),
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err("process I/O bridge panicked".into()),
+    }
+}
+
+fn finish_session(
+    writer: &Arc<Mutex<TcpStream>>,
+    session_end: SessionEnd,
+    normal_exit_code: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match session_end {
+        SessionEnd::Normal => send_shared(
+            writer,
+            &Frame::new(FrameKind::Exit, encode_exit(normal_exit_code)),
+        ),
+        SessionEnd::Cancelled => send_shared(
+            writer,
+            &Frame::new(FrameKind::Exit, encode_exit(SESSION_CANCEL_EXIT_CODE)),
+        ),
+        SessionEnd::Disconnected => Ok(()),
+        SessionEnd::ProtocolError(message) => {
+            send_shared(
+                writer,
+                &Frame::new(FrameKind::Error, message.as_bytes().to_vec()),
+            )?;
+            Err(message.into())
+        }
     }
 }
 
@@ -654,6 +1009,7 @@ mod windows_conpty {
     const INFINITE: u32 = u32::MAX;
     const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
     const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -770,6 +1126,8 @@ mod windows_conpty {
         ) -> i32;
         #[link_name = "ResizePseudoConsole"]
         fn resize_pseudo_console(console: PseudoConsoleHandle, size: Coord) -> i32;
+        #[link_name = "TerminateProcess"]
+        fn terminate_process_ffi(process: Handle, exit_code: u32) -> i32;
         #[link_name = "UpdateProcThreadAttribute"]
         fn update_proc_thread_attribute(
             list: *mut c_void,
@@ -995,7 +1353,22 @@ mod windows_conpty {
     }
 
     pub(super) fn wait_for_process(process: &OwnedHandle) -> io::Result<i32> {
-        let wait_result = unsafe { wait_for_single_object(process.as_raw_handle(), INFINITE) };
+        wait_for_process_timeout(process, INFINITE)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "an infinite process wait unexpectedly timed out",
+            )
+        })
+    }
+
+    pub(super) fn wait_for_process_timeout(
+        process: &OwnedHandle,
+        milliseconds: u32,
+    ) -> io::Result<Option<i32>> {
+        let wait_result = unsafe { wait_for_single_object(process.as_raw_handle(), milliseconds) };
+        if wait_result == WAIT_TIMEOUT {
+            return Ok(None);
+        }
         if wait_result != WAIT_OBJECT_0 {
             return Err(io::Error::last_os_error());
         }
@@ -1003,7 +1376,15 @@ mod windows_conpty {
         if unsafe { get_exit_code_process(process.as_raw_handle(), &mut exit_code) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(exit_code as i32)
+        Ok(Some(exit_code as i32))
+    }
+
+    pub(super) fn terminate_process(process: &OwnedHandle, exit_code: u32) -> io::Result<()> {
+        if unsafe { terminate_process_ffi(process.as_raw_handle(), exit_code) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 
     fn new_pipe() -> io::Result<(File, File)> {
@@ -1155,6 +1536,12 @@ mod tests {
     }
 
     #[test]
+    fn normal_exit_wins_a_cancel_race() {
+        assert_eq!(cancel_session_end(false), SessionEnd::Normal);
+        assert_eq!(cancel_session_end(true), SessionEnd::Cancelled);
+    }
+
+    #[test]
     fn windows_command_line_quotes_empty_and_space_containing_arguments() {
         assert_eq!(windows_command_line("", &[]), "\"\"");
         assert_eq!(
@@ -1189,6 +1576,335 @@ mod tests {
         assert!(!capabilities
             .iter()
             .any(|capability| capability == lsw_core::CAPABILITY_TERMINAL_RESIZE_V1));
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability == lsw_core::CAPABILITY_SESSION_CONTROL_V1));
+    }
+
+    #[cfg(unix)]
+    fn controlled_test_connection(
+        token: String,
+    ) -> (TcpStream, Receiver<Result<(), String>>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let expected_token = token.clone();
+        let active_sessions = Arc::new(AtomicUsize::new(1));
+        let server_sessions = Arc::clone(&active_sessions);
+        let (done_sender, done_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = {
+                let _slot = SessionSlot(server_sessions);
+                let (stream, _) = listener.accept().expect("fixture should connect");
+                handle_connection(stream, &expected_token).map_err(|error| error.to_string())
+            };
+            let _ = done_sender.send(result);
+        });
+
+        let mut stream = TcpStream::connect(address).expect("client should connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout should apply");
+        let hello = ClientHello {
+            version: AGENT_PROTOCOL_VERSION,
+            token,
+        };
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Hello, hello.encode().unwrap()),
+        )
+        .expect("hello should be sent");
+        let response = read_frame(&mut stream).expect("hello response should arrive");
+        assert_eq!(response.kind, FrameKind::HelloOk);
+        let hello = ServerHello::decode(&response.payload).expect("server hello should decode");
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SESSION_CONTROL_V1));
+        (stream, done_receiver, active_sessions)
+    }
+
+    #[cfg(unix)]
+    fn send_session_options(stream: &mut TcpStream) {
+        let options = SessionOptions {
+            cancel_on_disconnect: true,
+        };
+        write_frame(
+            stream,
+            &Frame::new(FrameKind::SessionOptions, options.encode()),
+        )
+        .expect("session options should be sent");
+    }
+
+    #[cfg(unix)]
+    fn send_exec(stream: &mut TcpStream, argv: &[&str]) {
+        let request = StartRequest {
+            kind: SessionKind::Exec,
+            argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+            working_directory: None,
+        };
+        write_frame(
+            stream,
+            &Frame::new(FrameKind::Start, request.encode().unwrap()),
+        )
+        .expect("start should be sent");
+    }
+
+    #[cfg(unix)]
+    fn collect_process(stream: &mut TcpStream) -> (Vec<u8>, i32) {
+        let mut stdout = Vec::new();
+        loop {
+            let frame = read_frame(stream).expect("process response should arrive");
+            match frame.kind {
+                FrameKind::Stdout => stdout.extend(frame.payload),
+                FrameKind::Stderr => {}
+                FrameKind::Exit => return (stdout, lsw_core::decode_exit(&frame.payload).unwrap()),
+                other => panic!("unexpected process frame {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_session_released(
+        done: Receiver<Result<(), String>>,
+        active_sessions: Arc<AtomicUsize>,
+    ) {
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .expect("server session should succeed");
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_cancel_terminates_a_controlled_process() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("d".repeat(64));
+        send_session_options(&mut stream);
+        send_exec(&mut stream, &["sleep", "5"]);
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::SessionCancel, Vec::new()),
+        )
+        .expect("cancel should be sent");
+
+        assert_eq!(
+            collect_process(&mut stream),
+            (Vec::new(), SESSION_CANCEL_EXIT_CODE)
+        );
+        drop(stream);
+        assert_session_released(done, active_sessions);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_control_is_unavailable_before_authentication() {
+        let expected_token = "7".repeat(64);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("fixture should connect");
+            handle_connection(stream, &expected_token).map_err(|error| error.to_string())
+        });
+        let mut stream = TcpStream::connect(address).expect("client should connect");
+        let hello = ClientHello {
+            version: AGENT_PROTOCOL_VERSION,
+            token: "8".repeat(64),
+        };
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Hello, hello.encode().unwrap()),
+        )
+        .expect("hello should be sent");
+        let response = read_frame(&mut stream).expect("authentication error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("authentication"));
+        assert!(server
+            .join()
+            .expect("fixture should not panic")
+            .expect_err("authentication should fail")
+            .contains("authentication"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_disconnect_terminates_process_and_releases_slot() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("e".repeat(64));
+        send_session_options(&mut stream);
+        send_exec(&mut stream, &["sleep", "5"]);
+        drop(stream);
+
+        assert_session_released(done, active_sessions);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_frames_reject_nonempty_cancel_payloads() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("9".repeat(64));
+        send_session_options(&mut stream);
+        send_exec(&mut stream, &["sleep", "5"]);
+        write_frame(&mut stream, &Frame::new(FrameKind::SessionCancel, [1]))
+            .expect("malformed cancel should be sent");
+
+        let response = read_frame(&mut stream).expect("protocol error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("empty payload"));
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .is_err());
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_options_only_prefix_process_start_requests() {
+        for invalid_kind in [
+            FrameKind::SessionOptions,
+            FrameKind::Ping,
+            FrameKind::FileGet,
+            FrameKind::FilePut,
+            FrameKind::SessionCancel,
+            FrameKind::StdinClose,
+        ] {
+            let token_byte = match invalid_kind {
+                FrameKind::SessionOptions => 'a',
+                FrameKind::Ping => 'b',
+                FrameKind::FileGet => 'c',
+                FrameKind::FilePut => 'd',
+                FrameKind::SessionCancel => 'e',
+                FrameKind::StdinClose => 'f',
+                _ => unreachable!(),
+            };
+            let (mut stream, done, active_sessions) =
+                controlled_test_connection(token_byte.to_string().repeat(64));
+            send_session_options(&mut stream);
+            let payload = if invalid_kind == FrameKind::SessionOptions {
+                SessionOptions {
+                    cancel_on_disconnect: true,
+                }
+                .encode()
+            } else {
+                Vec::new()
+            };
+            write_frame(&mut stream, &Frame::new(invalid_kind, payload))
+                .expect("invalid controlled request should be sent");
+            let response = read_frame(&mut stream).expect("protocol error should arrive");
+            assert_eq!(response.kind, FrameKind::Error);
+            assert!(String::from_utf8_lossy(&response.payload).contains("must be followed"));
+            assert!(done
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server session should finish promptly")
+                .is_err());
+            assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_session_option_flags_are_rejected_before_spawn() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("2".repeat(64));
+        write_frame(&mut stream, &Frame::new(FrameKind::SessionOptions, [2]))
+            .expect("unknown options should be sent");
+        let response = read_frame(&mut stream).expect("protocol error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("unknown flags"));
+
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .expect_err("unknown option flags should fail")
+            .contains("unknown flags"));
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_control_frame_is_rejected_without_starting_a_process() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("3".repeat(64));
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::SessionCancel, Vec::new()),
+        )
+        .expect("legacy cancel should be sent");
+        let response = read_frame(&mut stream).expect("protocol error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("unsupported request"));
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .is_err());
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_stdin_close_delivers_eof_without_cancelling() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("f".repeat(64));
+        send_session_options(&mut stream);
+        send_exec(
+            &mut stream,
+            &["sh", "-c", "IFS= read -r value; printf controlled-eof"],
+        );
+        write_frame(&mut stream, &Frame::new(FrameKind::StdinClose, Vec::new()))
+            .expect("stdin close should be sent");
+
+        assert_eq!(
+            collect_process(&mut stream),
+            (b"controlled-eof".to_vec(), 0)
+        );
+        drop(stream);
+        assert_session_released(done, active_sessions);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controlled_child_stdin_failure_terminates_process_and_releases_slot() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("0".repeat(64));
+        send_session_options(&mut stream);
+        send_exec(
+            &mut stream,
+            &["sh", "-c", "exec 0<&-; printf ready; exec sleep 5"],
+        );
+
+        let ready = read_frame(&mut stream).expect("child readiness should arrive");
+        assert_eq!(ready.kind, FrameKind::Stdout);
+        assert_eq!(ready.payload, b"ready");
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Stdin, b"input after child closed stdin"),
+        )
+        .expect("stdin payload should be sent");
+
+        let response = read_frame(&mut stream).expect("protocol error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("child stdin"));
+        drop(stream);
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .expect_err("child stdin failure should fail the session")
+            .contains("child stdin"));
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_half_close_remains_stdin_eof_not_cancellation() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("1".repeat(64));
+        send_exec(
+            &mut stream,
+            &["sh", "-c", "IFS= read -r value; printf legacy-eof"],
+        );
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("legacy write side should close");
+
+        assert_eq!(collect_process(&mut stream), (b"legacy-eof".to_vec(), 0));
+        drop(stream);
+        assert_session_released(done, active_sessions);
     }
 
     #[cfg(unix)]

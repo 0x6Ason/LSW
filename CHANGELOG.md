@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.0-beta.3
+
+- Added the capability-gated `session-control-v1` process-session extension
+  without changing the version-one agent handshake. Explicit stdin close now
+  delivers EOF without cancellation; authenticated cancellation terminates the
+  direct child and reports exit code 130; opted-in disconnect cleanup releases
+  the direct-child session. Older agents retain their half-close behavior.
+- Added loopback protocol coverage for controlled EOF, cancellation,
+  disconnect cleanup, malformed control frames, authentication, and legacy
+  compatibility. Process-tree cleanup and bounded half-open-peer detection
+  remain follow-up work.
+- Added a timeout-bounded headless QEMU CI smoke gate covering `qemu-img`, TCG,
+  OVMF, swtpm/vTPM traffic, QMP `stop`/`cont`/`quit`, and loopback-only usernet
+  forwarding. The same firmware-level path was run with Ubuntu's QEMU 8.2.2
+  packages on the Codex VPS; KVM and Windows guest E2E remain separate gates.
+
 ## 1.0.0-beta.2
 
 - Added manifest v3 and repeatable `lsw create --publish HOST:GUEST` mappings.

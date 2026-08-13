@@ -12,7 +12,7 @@ guest. Host platform and accelerator selection are separated from guest
 protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
 and QEMU argument generation exist as planner-level work only. There are no
 macOS or Windows host-side binaries, daemon IPC integrations, or runtime
-validation claims in beta.2.
+validation claims in beta.3.
 
 ## Components
 
@@ -20,9 +20,9 @@ validation claims in beta.2.
 | --- | --- | --- |
 | `lsw` | Implemented | Instance management, installer seed, default shell, process and file commands |
 | `lswd` | Implemented | User-private Unix API, QEMU/swtpm supervision, QMP reconciliation and shutdown |
-| QEMU backend | Linux runtime implemented | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
+| QEMU backend | Linux runtime implemented; firmware smoke passed | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
 | Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
-| `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY process sessions and file transfer |
+| `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY process sessions, capability-gated session control and file transfer |
 | ConPTY transport | Implemented; E2E gated | Capability negotiation, console I/O and terminal resize; real installed-Windows validation remains |
 | PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
@@ -49,6 +49,9 @@ validation claims in beta.2.
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
    ConPTY and host stdin is a terminal, the host enters raw mode and forwards
    resize events; otherwise the established pipe session remains available.
+   When both ends advertise `session-control-v1`, the host prefixes the start
+   request with per-session options and uses distinct stdin-close and cancel
+   frames. Older peers retain the version-one half-close behavior.
 7. `lsw suspend` sends QMP `stop` and records `suspended`; `lsw resume` requires
    the same live QEMU process in QMP `paused` state and sends `cont`. This is
    deliberately not a RAM snapshot, hibernation, or migration mechanism.
@@ -77,10 +80,41 @@ trusting a PID file.
 
 The agent protocol uses a five-byte binary frame header, an 8 MiB frame limit,
 explicit UTF-8 string lengths, a protocol version, and constant-time comparison
-of the per-instance token. Capability strings negotiate ConPTY and terminal
-resize without breaking older pipe-only agents. Host forwarding binds to
-`127.0.0.1`; commands and file payloads are binary-safe. Upload and download
-destinations are never overwritten implicitly.
+of the per-instance token. Capability strings negotiate ConPTY, terminal resize,
+and `session-control-v1` without breaking older pipe-only agents. Host
+forwarding binds to `127.0.0.1`; commands and file payloads are binary-safe.
+Upload and download destinations are never overwritten implicitly.
+
+For an opted-in controlled session, `STDIN_CLOSE` drops only the child's input
+handle so it can observe EOF and exit normally. Authenticated `SESSION_CANCEL`
+terminates the direct child and reports exit code 130; the negotiated
+cancel-on-disconnect option also asks the agent to clean up that child when the
+connection disappears. With a legacy peer, TCP write-half-close continues to
+mean stdin EOF. These additions are
+append-only frames under protocol version one and are advertised by capability.
+
+The cleanup boundary in beta.3 is deliberately narrower than a process tree:
+there is no Windows Job Object or host process group covering descendants, and
+there is no lease/heartbeat that bounds detection of a half-open TCP peer. A
+descendant that survives the direct child or inherits an output handle can keep
+work or a bridge alive. Process-tree ownership and bounded peer liveness are
+required before this becomes a complete session supervisor.
+
+## Headless runtime smoke boundary
+
+On the Codex VPS, Ubuntu's QEMU 8.2.2, OVMF and swtpm packages were staged in a
+temporary root because they were not preinstalled. With TCG, the test created
+and checked a qcow2 disk, entered OVMF, observed vTPM command traffic, drove TCP
+QMP through `stop`, `cont` and `quit`, and connected to two loopback-only usernet
+host-forward endpoints targeting guest ports 5040 and 8080. Both host ports were
+released after QMP quit, and QEMU and swtpm exited with status zero. CI now
+repeats a timeout-bounded version of this firmware-level smoke with distribution
+packages.
+
+That environment has no `/dev/kvm`, licensed Windows ISO, graphical desktop, or
+filesystem Unix sockets. The smoke therefore validates the QEMU building
+blocks, not KVM acceleration, the product daemon's Unix-socket lifecycle,
+Windows Setup/OOBE, the logged-in agent, or ConPTY end to end.
 
 ## Network publishing
 

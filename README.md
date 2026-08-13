@@ -4,10 +4,11 @@ LSW 是 Linux 上的本機 Windows 開發執行環境。操作方式接近容器
 instance 後，可直接進入 PowerShell／CMD、執行 Windows 程式及傳輸檔案；實際隔離
 邊界則是 QEMU/KVM microVM，因為 Windows 核心不能與 Linux host 共用。
 
-目前版本為 `1.0.0-beta.2`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
-檔案傳輸、ConPTY 終端機與 ephemeral overlay 已實作。逐視窗 Wayland/X11 整合尚未
-完成，因此 GUI 安裝／救援暫時使用 private Unix-socket VNC。ConPTY 及真正的
-Windows/KVM 開機路徑仍需在實機完成 E2E gate；詳見 [beta 狀態](docs/BETA.md)。
+目前版本為 `1.0.0-beta.3`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
+檔案傳輸、ConPTY 終端機、受控 session 與 ephemeral overlay 已實作。逐視窗
+Wayland/X11 整合尚未完成，因此 GUI 安裝／救援暫時使用 private Unix-socket VNC。
+ConPTY 及真正的 Windows/KVM 開機路徑仍需在實機完成 E2E gate；詳見
+[beta 狀態](docs/BETA.md)。
 
 ## 支援範圍
 
@@ -19,6 +20,14 @@ Windows/KVM 開機路徑仍需在實機完成 E2E gate；詳見 [beta 狀態](do
 
 「container-like」指 UX 與 image lifecycle，不代表可達到 Linux namespace 容器的
 記憶體密度或冷啟動速度。
+
+在無 `/dev/kvm` 及 Windows ISO 的 headless Codex VPS 上，已用暫存的 Ubuntu 官方
+套件實際跑通 QEMU 8.2.2 TCG、OVMF、`qemu-img`、swtpm/vTPM、TCP QMP
+`stop`/`cont`/`quit`，以及兩個只綁定 `127.0.0.1`、分別轉到 guest 5040/8080 的
+host forwarding endpoint；QEMU 結束後兩個 host port 亦已釋放。QEMU 與 swtpm
+都正常結束。
+這項 firmware-level smoke test 證明基礎 VM 組合能啟動，不代表 Windows Setup、
+登入後 agent 或 ConPTY 已完成 E2E 驗收。
 
 ## 快速開始
 
@@ -89,8 +98,11 @@ lsw stop
 
 在互動式 host TTY 上，`lsw shell` 會與支援 capability 的 agent 協商 ConPTY，轉送
 console input/output 並同步 terminal resize；舊版或不支援 ConPTY 的 agent 仍使用 pipe
-session。此實作已通過編譯及協定測試，但 beta.2 尚未在登入後的真 Windows guest
-完成 E2E 驗收。
+session。beta.3 另以 `session-control-v1` capability 協商受控 session：stdin EOF 會以
+明確 frame 關閉輸入但讓程式正常結束；已驗證的 client 取消可終止 direct child 並回報
+exit code 130，而啟用選項後的連線中斷也會釋放 direct-child session。舊 agent 保留原有
+TCP half-close 相容行為。這些語義已通過 loopback protocol tests，但尚未在登入後的真
+Windows ConPTY session 完成 E2E 驗收。
 
 `lsw run` 已能在登入中的 Windows session 啟動程式，但 beta 尚未把個別 HWND 映射成
 Linux native window；GUI 仍只能從安裝／救援 display 看到。`lsw suspend` 只是暫停目前

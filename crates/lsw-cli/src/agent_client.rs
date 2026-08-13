@@ -13,9 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     decode_exit, decode_file_length, encode_file_length, read_frame, write_frame, ClientHello,
-    FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest, ServerHello, StartRequest,
-    TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
-    CAPABILITY_TERMINAL_RESIZE_V1,
+    FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest, ServerHello,
+    SessionOptions, StartRequest, TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_CONPTY_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_TERMINAL_RESIZE_V1,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -83,6 +83,7 @@ impl AgentClient {
     ) -> Result<i32, Box<dyn std::error::Error>> {
         let shell_session = matches!(request.kind, lsw_core::SessionKind::Shell);
         let conpty_available = self.has_capability(CAPABILITY_CONPTY_V1);
+        let controlled_session = self.has_capability(CAPABILITY_SESSION_CONTROL_V1);
         if shell_session && !conpty_available {
             eprintln!(
                 "lsw: note: this agent provides a pipe shell; ConPTY is not available in this beta build"
@@ -98,6 +99,15 @@ impl AgentClient {
             .as_ref()
             .and_then(TerminalModeGuard::size)
             .unwrap_or_default();
+        if controlled_session {
+            let options = SessionOptions {
+                cancel_on_disconnect: true,
+            };
+            write_frame(
+                &mut self.stream,
+                &Frame::new(FrameKind::SessionOptions, options.encode()),
+            )?;
+        }
         if terminal.is_some() {
             let terminal_request = TerminalStartRequest {
                 size: initial_size,
@@ -121,9 +131,14 @@ impl AgentClient {
             let writer = Arc::clone(&outbound);
             let stop = Arc::clone(&session_stop);
             Some(thread::spawn(move || {
-                forward_stdin(writer, stop, terminal_active)
+                forward_stdin(writer, stop, terminal_active, controlled_session)
             }))
         } else {
+            if controlled_session {
+                send_outbound(&outbound, &Frame::new(FrameKind::StdinClose, Vec::new()))?;
+            } else {
+                shutdown_outbound(&outbound);
+            }
             None
         };
 
@@ -162,6 +177,9 @@ impl AgentClient {
                 }
             }
         })();
+        if result.is_err() && controlled_session {
+            let _ = send_outbound(&outbound, &Frame::new(FrameKind::SessionCancel, Vec::new()));
+        }
         session_stop.store(true, Ordering::Release);
         if let Some(resize_thread) = resize_thread {
             let _ = resize_thread.join();
@@ -305,7 +323,12 @@ impl AgentClient {
     }
 }
 
-fn forward_stdin(stream: Arc<Mutex<TcpStream>>, stop: Arc<AtomicBool>, terminal_session: bool) {
+fn forward_stdin(
+    stream: Arc<Mutex<TcpStream>>,
+    stop: Arc<AtomicBool>,
+    terminal_session: bool,
+    controlled_session: bool,
+) {
     let mut stdin = io::stdin().lock();
     let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
     loop {
@@ -319,7 +342,11 @@ fn forward_stdin(stream: Arc<Mutex<TcpStream>>, stop: Arc<AtomicBool>, terminal_
                 continue;
             }
             Ok(0) => {
-                shutdown_outbound(&stream);
+                if controlled_session {
+                    let _ = send_outbound(&stream, &Frame::new(FrameKind::StdinClose, Vec::new()));
+                } else {
+                    shutdown_outbound(&stream);
+                }
                 return;
             }
             Ok(length) => {
@@ -336,7 +363,12 @@ fn forward_stdin(stream: Arc<Mutex<TcpStream>>, stop: Arc<AtomicBool>, terminal_
                 }
             }
             Err(_) => {
-                shutdown_outbound(&stream);
+                if controlled_session {
+                    let _ =
+                        send_outbound(&stream, &Frame::new(FrameKind::SessionCancel, Vec::new()));
+                } else {
+                    shutdown_outbound(&stream);
+                }
                 return;
             }
         }
@@ -523,5 +555,79 @@ mod tests {
         assert_eq!(state.update(changed), Some(changed));
         assert_eq!(state.update(changed), None);
         assert_eq!(state.last, changed);
+    }
+
+    #[test]
+    fn controlled_run_sends_options_start_and_explicit_stdin_close() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let options = read_frame(&mut stream).expect("options should arrive");
+            assert_eq!(options.kind, FrameKind::SessionOptions);
+            assert!(
+                SessionOptions::decode(&options.payload)
+                    .expect("options should decode")
+                    .cancel_on_disconnect
+            );
+
+            let start = read_frame(&mut stream).expect("start should arrive");
+            assert_eq!(start.kind, FrameKind::Start);
+            assert_eq!(
+                StartRequest::decode(&start.payload)
+                    .expect("start should decode")
+                    .argv,
+                vec!["fixture-command"]
+            );
+
+            let stdin_close = read_frame(&mut stream).expect("stdin close should arrive");
+            assert_eq!(stdin_close.kind, FrameKind::StdinClose);
+            assert!(stdin_close.payload.is_empty());
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            )
+            .expect("exit should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let client = AgentClient {
+            stream,
+            capabilities: vec![CAPABILITY_SESSION_CONTROL_V1.to_owned()],
+        };
+        let request = StartRequest {
+            kind: lsw_core::SessionKind::Exec,
+            argv: vec!["fixture-command".to_owned()],
+            working_directory: None,
+        };
+        assert_eq!(client.run(&request, false).expect("run should succeed"), 0);
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn legacy_run_still_starts_without_session_options() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let start = read_frame(&mut stream).expect("start should arrive");
+            assert_eq!(start.kind, FrameKind::Start);
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            )
+            .expect("exit should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let client = AgentClient {
+            stream,
+            capabilities: Vec::new(),
+        };
+        let request = StartRequest {
+            kind: lsw_core::SessionKind::Exec,
+            argv: vec!["fixture-command".to_owned()],
+            working_directory: None,
+        };
+        assert_eq!(client.run(&request, false).expect("run should succeed"), 0);
+        server.join().expect("fixture should not panic");
     }
 }

@@ -117,6 +117,21 @@ jobs:
           Write-Output "The native PE loaded and parsed --help on Windows."
           Write-Output "This job does not claim to boot a managed Windows guest or test ConPTY end-to-end."
 
+  qemu-smoke:
+    name: Headless QEMU integration smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install QEMU, OVMF, and software TPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ovmf python3-minimal qemu-system-x86 qemu-utils swtpm
+      - name: Boot an OVMF and vTPM VM under TCG
+        run: scripts/check-qemu-smoke.sh
+
   package:
     name: Release bundle smoke test
     runs-on: ubuntu-latest

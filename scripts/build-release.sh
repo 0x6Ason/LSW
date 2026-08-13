@@ -99,9 +99,14 @@ install -m 0644 -- docs/ARCHITECTURE.md docs/BETA.md docs/LEGAL_BOUNDARIES.md \
     docs/DEVELOPMENT.md docs/REFERENCES.md docs/SECURITY.md "$staged_bundle/docs/"
 (
     printf '%s\000' .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md rustfmt.toml
-    find .github crates docs scripts -type f -print0
+    find .github crates docs scripts -type f \
+        ! -path '*/__pycache__/*' \
+        ! -name '*.pyc' \
+        ! -name '*.pyo' \
+        -print0
 ) | LC_ALL=C sort -z | xargs -0 sha256sum >"$staged_bundle/SOURCE-MANIFEST.sha256"
-tar -cf - .github .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md \
+tar --exclude='*/__pycache__' --exclude='*.pyc' --exclude='*.pyo' \
+    -cf - .github .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md \
     crates docs rustfmt.toml scripts | tar -xf - -C "$staged_bundle/source"
 printf '%s\n' \
     "LSW_VERSION=$release_version" \
