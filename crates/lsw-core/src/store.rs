@@ -2,6 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,20 +49,15 @@ impl StateStore {
         }
 
         self.initialize()?;
-        if let Some(existing) = self
-            .list()?
-            .into_iter()
-            .find(|existing| existing.control_port == manifest.control_port)
-        {
-            return Err(LswError::InvalidValue {
-                field: "agent host port",
-                reason: format!(
-                    "instance {:?} already uses {}; choose another instance name",
-                    existing.spec.name, manifest.control_port
-                ),
-            });
+        self.ensure_host_ports_available(manifest, None)?;
+        let _port_reservations = reserve_host_ports(manifest)?;
+        match fs::create_dir(&instance_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(LswError::InstanceAlreadyExists(instance_dir))
+            }
+            Err(error) => return Err(error.into()),
         }
-        fs::create_dir(&instance_dir)?;
         set_private_directory_permissions(&instance_dir)?;
         let manifest_path = instance_dir.join(MANIFEST_FILE);
         if let Err(error) = write_atomic(&manifest_path, encoded.as_bytes()) {
@@ -80,14 +76,13 @@ impl StateStore {
     }
 
     pub fn update(&self, manifest: &InstanceManifest) -> Result<()> {
+        let encoded = manifest.encode()?;
         let instance_dir = self.instance_dir(&manifest.spec.name)?;
         if !is_real_directory(&instance_dir)? {
             return Err(LswError::InstanceNotFound(manifest.spec.name.clone()));
         }
-        write_atomic(
-            &instance_dir.join(MANIFEST_FILE),
-            manifest.encode()?.as_bytes(),
-        )
+        self.ensure_host_ports_available(manifest, Some(&manifest.spec.name))?;
+        write_atomic(&instance_dir.join(MANIFEST_FILE), encoded.as_bytes())
     }
 
     pub fn load(&self, name: &str) -> Result<InstanceManifest> {
@@ -219,6 +214,63 @@ impl StateStore {
     fn instances_root(&self) -> PathBuf {
         self.root.join("instances")
     }
+
+    fn ensure_host_ports_available(
+        &self,
+        manifest: &InstanceManifest,
+        excluded_instance: Option<&str>,
+    ) -> Result<()> {
+        let requested_ports = std::iter::once(manifest.control_port)
+            .chain(
+                manifest
+                    .spec
+                    .port_forwards
+                    .iter()
+                    .map(|forward| forward.host_port),
+            )
+            .collect::<Vec<_>>();
+        for existing in self.list()? {
+            if excluded_instance == Some(existing.spec.name.as_str()) {
+                continue;
+            }
+            let conflicting_port = requested_ports.iter().copied().find(|requested_port| {
+                existing.control_port == *requested_port
+                    || existing
+                        .spec
+                        .port_forwards
+                        .iter()
+                        .any(|forward| forward.host_port == *requested_port)
+            });
+            if let Some(port) = conflicting_port {
+                return Err(LswError::InvalidValue {
+                    field: "host port",
+                    reason: format!(
+                        "instance {:?} already reserves {port}; choose another instance name or published port",
+                        existing.spec.name
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn reserve_host_ports(manifest: &InstanceManifest) -> Result<Vec<TcpListener>> {
+    std::iter::once(manifest.control_port)
+        .chain(
+            manifest
+                .spec
+                .port_forwards
+                .iter()
+                .map(|forward| forward.host_port),
+        )
+        .map(|port| {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, port)).map_err(|error| LswError::InvalidValue {
+                field: "host port",
+                reason: format!("127.0.0.1:{port} cannot be reserved: {error}"),
+            })
+        })
+        .collect()
 }
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
@@ -353,6 +405,7 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -381,6 +434,141 @@ mod tests {
         );
         assert_eq!(store.list().expect("instances should list"), vec![manifest]);
 
+        fs::remove_dir_all(root).expect("test root should be removable");
+    }
+
+    #[test]
+    fn create_rejects_host_ports_reserved_by_another_instance() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lsw-store-port-test-{nonce}"));
+        let iso = root.join("windows.iso");
+        fs::create_dir_all(&root).expect("test root should be created");
+        fs::write(&iso, b"test media").expect("test ISO should be created");
+
+        let second = InstanceManifest::new(InstanceSpec {
+            name: "win-second".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("second manifest should be valid");
+        let first = InstanceManifest::new(InstanceSpec {
+            name: "win-first".to_owned(),
+            source_iso: iso,
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: vec![crate::PortForward::new(second.control_port, 8080)
+                .expect("published port should be valid")],
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("first manifest should be valid");
+
+        let store = StateStore::new(root.join("state"));
+        store
+            .create(&first)
+            .expect("first instance should be stored");
+        assert!(store.create(&second).is_err());
+        fs::remove_dir_all(root).expect("test root should be removable");
+    }
+
+    #[test]
+    fn update_cannot_introduce_a_cross_instance_port_collision() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lsw-store-update-port-test-{nonce}"));
+        let iso = root.join("windows.iso");
+        fs::create_dir_all(&root).expect("test root should be created");
+        fs::write(&iso, b"test media").expect("test ISO should be created");
+
+        let build_manifest = |name: &str| {
+            InstanceManifest::new(InstanceSpec {
+                name: name.to_owned(),
+                source_iso: iso.clone(),
+                profile: WindowsProfile::Standard,
+                cpus: 2,
+                memory_mib: 4096,
+                disk_gib: 64,
+                network: NetworkMode::Nat,
+                port_forwards: Vec::new(),
+                license_accepted: true,
+                allow_unsupported_requirements: false,
+            })
+            .expect("manifest should be valid")
+        };
+        let first = build_manifest("port-owner-one");
+        let mut second = build_manifest("port-owner-two");
+        assert_ne!(first.control_port, second.control_port);
+
+        let store = StateStore::new(root.join("state"));
+        store
+            .create(&first)
+            .expect("first instance should be stored");
+        store
+            .create(&second)
+            .expect("second instance should be stored");
+        second.spec.port_forwards = vec![crate::PortForward::new(first.control_port, 8080)
+            .expect("published port should be valid")];
+        assert!(store.update(&second).is_err());
+        assert!(store
+            .load("port-owner-two")
+            .expect("unchanged manifest should load")
+            .spec
+            .port_forwards
+            .is_empty());
+
+        fs::remove_dir_all(root).expect("test root should be removable");
+    }
+
+    #[test]
+    fn create_rejects_a_host_port_used_outside_the_state_store() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lsw-store-bound-port-test-{nonce}"));
+        let iso = root.join("windows.iso");
+        fs::create_dir_all(&root).expect("test root should be created");
+        fs::write(&iso, b"test media").expect("test ISO should be created");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("port should bind");
+        let port = listener.local_addr().expect("address should exist").port();
+        let manifest = InstanceManifest::new(InstanceSpec {
+            name: "external-port-owner".to_owned(),
+            source_iso: iso,
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: vec![
+                crate::PortForward::new(port, 8080).expect("published port should be valid")
+            ],
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("manifest should be valid");
+
+        let store = StateStore::new(root.join("state"));
+        assert!(store.create(&manifest).is_err());
+        assert!(!store
+            .instance_dir("external-port-owner")
+            .expect("instance path should resolve")
+            .exists());
+        drop(listener);
         fs::remove_dir_all(root).expect("test root should be removable");
     }
 }

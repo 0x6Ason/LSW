@@ -24,6 +24,9 @@ is complete.
   fixed argument forms and are not passed through a shell.
 - QEMU lifecycle uses QMP. A PID file is diagnostic state, not authority for
   sending signals to an arbitrary process.
+- In-memory suspend uses QMP `stop`; resume requires the same reachable QEMU
+  process in `paused` state. LSW does not serialize guest RAM or claim that a
+  suspended instance survives QEMU or host termination.
 - Storage preparation and Setup-seed creation reject symlink destinations and
   do not overwrite existing disks, firmware stores, seeds, or transferred files.
 
@@ -51,10 +54,29 @@ destinations and verify declared byte counts before committing a temporary file.
 
 ## Network policy
 
-`nat` is the create default: QEMU user networking permits guest egress, while
-only the agent port is forwarded to host loopback. `offline` sets QEMU
-`restrict=on`, blocking normal guest egress while retaining the host-only agent
-forward. Neither mode exposes a host directory.
+`nat` is the create default: QEMU user networking permits guest egress. The
+agent port is always forwarded to host loopback; an instance may additionally
+request repeatable TCP mappings with `--publish HOST:GUEST`. Every published
+listener is explicitly bound to `127.0.0.1`. Validation rejects zero or
+duplicate host ports, collision with the reserved agent port, collision with
+another instance, ports already bound by another local process at creation
+time, and all publishing in `offline` mode.
+
+`offline` sets QEMU `restrict=on`, blocking normal guest egress while retaining
+the host-only agent forward. Neither mode exposes a host directory. Loopback is
+an exposure boundary, not application authentication: treat a published guest
+service as untrusted, and do not re-export it to a LAN or the Internet without a
+separately reviewed security design.
+
+## Untrusted PE inspection
+
+`lsw inspect` parses input without executing or loading it. It limits files to
+512 MiB, caps aggregate inspected imports at 65,536 symbols and 16 MiB of names,
+and checks PE header, section, RVA, import-table, CLR-header, and string bounds.
+These checks reduce parser risk but are not a sandbox. Run current LSW builds
+when inspecting adversarial binaries. A reported certificate table means only
+that the PE data directory is present and in bounds; it does not verify an
+Authenticode chain, signature, timestamp, or publisher identity.
 
 ## Secure Boot and drivers
 
@@ -82,5 +104,8 @@ of shared images, and retain a driverless secure profile.
 - Add encrypted transport before supporting any non-local agent connection.
 - Threat-model clipboard, host folders, USB and per-HWND input before enabling
   those integrations.
+- Fuzz PE parsing and the ConPTY/resize protocol in addition to malformed agent
+  and QMP traffic.
 - Add signed release provenance and a documented vulnerability-reporting route.
-- Exercise malformed agent/QMP traffic with fuzzing and long-running soak tests.
+- Exercise agent, QMP, suspend/resume, port forwarding, and ConPTY with
+  long-running soak tests on a real Windows guest.

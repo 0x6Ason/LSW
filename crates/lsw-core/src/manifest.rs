@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{LswError, Result, WindowsProfile};
 
-const MANIFEST_VERSION: u32 = 2;
+const MANIFEST_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkMode {
@@ -40,6 +40,61 @@ impl FromStr for NetworkMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortForward {
+    pub host_port: u16,
+    pub guest_port: u16,
+}
+
+impl PortForward {
+    pub fn new(host_port: u16, guest_port: u16) -> Result<Self> {
+        if host_port == 0 {
+            return Err(LswError::InvalidValue {
+                field: "published port",
+                reason: "host port must be between 1 and 65535".to_owned(),
+            });
+        }
+        if guest_port == 0 {
+            return Err(LswError::InvalidValue {
+                field: "published port",
+                reason: "guest port must be between 1 and 65535".to_owned(),
+            });
+        }
+        Ok(Self {
+            host_port,
+            guest_port,
+        })
+    }
+}
+
+impl fmt::Display for PortForward {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.host_port, self.guest_port)
+    }
+}
+
+impl FromStr for PortForward {
+    type Err = LswError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (host, guest) = value
+            .split_once(':')
+            .ok_or_else(|| LswError::InvalidValue {
+                field: "published port",
+                reason: format!("{value:?} must use HOST_PORT:GUEST_PORT syntax"),
+            })?;
+        if host.is_empty() || guest.is_empty() || guest.contains(':') {
+            return Err(LswError::InvalidValue {
+                field: "published port",
+                reason: format!("{value:?} must use HOST_PORT:GUEST_PORT syntax"),
+            });
+        }
+        let host_port = parse_published_port(host, "host", value)?;
+        let guest_port = parse_published_port(guest, "guest", value)?;
+        Self::new(host_port, guest_port)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstanceSpec {
     pub name: String,
@@ -49,6 +104,7 @@ pub struct InstanceSpec {
     pub memory_mib: u32,
     pub disk_gib: u32,
     pub network: NetworkMode,
+    pub port_forwards: Vec<PortForward>,
     pub license_accepted: bool,
     pub allow_unsupported_requirements: bool,
 }
@@ -57,6 +113,34 @@ impl InstanceSpec {
     pub fn validate(&self) -> Result<()> {
         validate_instance_name(&self.name)?;
         validate_serializable_path(&self.source_iso)?;
+
+        if self.network == NetworkMode::Offline && !self.port_forwards.is_empty() {
+            return Err(LswError::InvalidValue {
+                field: "published ports",
+                reason: "port publishing requires --network nat".to_owned(),
+            });
+        }
+
+        let control_port = stable_control_port(&self.name);
+        let mut host_ports = BTreeSet::new();
+        for forward in &self.port_forwards {
+            PortForward::new(forward.host_port, forward.guest_port)?;
+            if forward.host_port == control_port {
+                return Err(LswError::InvalidValue {
+                    field: "published ports",
+                    reason: format!(
+                        "host port {} is reserved for the LSW agent of instance {:?}",
+                        forward.host_port, self.name
+                    ),
+                });
+            }
+            if !host_ports.insert(forward.host_port) {
+                return Err(LswError::InvalidValue {
+                    field: "published ports",
+                    reason: format!("host port {} appears more than once", forward.host_port),
+                });
+            }
+        }
 
         if !(1..=256).contains(&self.cpus) {
             return Err(LswError::InvalidValue {
@@ -203,6 +287,13 @@ impl InstanceManifest {
                 field: "source ISO",
                 reason: "path is not valid UTF-8 and cannot be stored portably".to_owned(),
             })?;
+        let port_forwards = self
+            .spec
+            .port_forwards
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
 
         Ok(format!(
             concat!(
@@ -214,6 +305,7 @@ impl InstanceManifest {
                 "memory_mib={}\n",
                 "disk_gib={}\n",
                 "network={}\n",
+                "port_forwards={}\n",
                 "license_accepted={}\n",
                 "allow_unsupported_requirements={}\n",
                 "state={}\n",
@@ -228,6 +320,7 @@ impl InstanceManifest {
             self.spec.memory_mib,
             self.spec.disk_gib,
             self.spec.network,
+            port_forwards,
             self.spec.license_accepted,
             self.spec.allow_unsupported_requirements,
             self.state,
@@ -253,7 +346,7 @@ impl InstanceManifest {
         }
 
         let version = parse_field::<u32>(&fields, "version")?;
-        if !matches!(version, 1 | MANIFEST_VERSION) {
+        if !matches!(version, 1 | 2 | MANIFEST_VERSION) {
             return Err(LswError::InvalidManifest(format!(
                 "unsupported manifest version {version}"
             )));
@@ -270,6 +363,11 @@ impl InstanceManifest {
                 required_field(&fields, "network")?.parse()?
             } else {
                 NetworkMode::Offline
+            },
+            port_forwards: if version >= 3 {
+                parse_port_forwards(required_field(&fields, "port_forwards")?)?
+            } else {
+                Vec::new()
             },
             license_accepted: parse_field(&fields, "license_accepted")?,
             allow_unsupported_requirements: parse_field(&fields, "allow_unsupported_requirements")?,
@@ -311,6 +409,20 @@ where
     value.parse::<T>().map_err(|error| {
         LswError::InvalidManifest(format!("could not parse {key:?} value {value:?}: {error}"))
     })
+}
+
+fn parse_published_port(value: &str, side: &str, pair: &str) -> Result<u16> {
+    value.parse().map_err(|error| LswError::InvalidValue {
+        field: "published port",
+        reason: format!("invalid {side} port in {pair:?}: {error}"),
+    })
+}
+
+fn parse_port_forwards(value: &str) -> Result<Vec<PortForward>> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+    value.split(',').map(str::parse).collect()
 }
 
 pub(crate) fn validate_instance_name(name: &str) -> Result<()> {
@@ -383,6 +495,7 @@ mod tests {
             memory_mib: 8192,
             disk_gib: 96,
             network: NetworkMode::Nat,
+            port_forwards: vec![PortForward::new(8080, 80).expect("ports should be valid")],
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -413,6 +526,7 @@ mod tests {
             memory_mib: 2048,
             disk_gib: 32,
             network: NetworkMode::Offline,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         };
@@ -437,6 +551,7 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -444,11 +559,84 @@ mod tests {
         let legacy = manifest
             .encode()
             .expect("manifest should encode")
-            .replace("version=2\n", "version=1\n")
-            .replace("network=nat\n", "");
+            .replace("version=3\n", "version=1\n")
+            .replace("network=nat\n", "")
+            .replace("port_forwards=\n", "");
         let migrated = InstanceManifest::decode(&legacy).expect("v1 manifest should migrate");
         assert_eq!(migrated.version, MANIFEST_VERSION);
         assert_eq!(migrated.spec.network, NetworkMode::Offline);
+        assert!(migrated.spec.port_forwards.is_empty());
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn version_two_manifests_migrate_without_published_ports() {
+        let iso = temporary_iso();
+        let manifest = InstanceManifest::new(InstanceSpec {
+            name: "version-two".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("manifest should be valid");
+        let legacy = manifest
+            .encode()
+            .expect("manifest should encode")
+            .replace("version=3\n", "version=2\n")
+            .replace("port_forwards=\n", "");
+        let migrated = InstanceManifest::decode(&legacy).expect("v2 manifest should migrate");
+        assert_eq!(migrated.spec.network, NetworkMode::Nat);
+        assert!(migrated.spec.port_forwards.is_empty());
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn published_ports_are_validated_before_launch() {
+        let iso = temporary_iso();
+        let base = InstanceSpec {
+            name: "port-validation".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        };
+
+        let duplicate = InstanceSpec {
+            port_forwards: vec![
+                PortForward::new(8080, 80).expect("ports should be valid"),
+                PortForward::new(8080, 443).expect("ports should be valid"),
+            ],
+            ..base.clone()
+        };
+        assert!(duplicate.validate().is_err());
+
+        let agent_collision = InstanceSpec {
+            port_forwards: vec![PortForward::new(stable_control_port(&base.name), 80)
+                .expect("ports should be valid")],
+            ..base.clone()
+        };
+        assert!(agent_collision.validate().is_err());
+
+        let offline = InstanceSpec {
+            network: NetworkMode::Offline,
+            port_forwards: vec![PortForward::new(8080, 80).expect("ports should be valid")],
+            ..base
+        };
+        assert!(offline.validate().is_err());
+        assert!("0:80".parse::<PortForward>().is_err());
+        assert!("8080:0".parse::<PortForward>().is_err());
+        assert!("8080".parse::<PortForward>().is_err());
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 
@@ -463,6 +651,7 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         })

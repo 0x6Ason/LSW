@@ -3,11 +3,12 @@
 use std::env;
 use std::path::PathBuf;
 
-use crate::WindowsProfile;
+use crate::{AcceleratorCapabilities, HostPlatform, VmAccelerator, WindowsProfile};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostCapabilities {
-    pub kvm: bool,
+    pub platform: HostPlatform,
+    pub accelerators: AcceleratorCapabilities,
     pub qemu_system: Option<PathBuf>,
     pub qemu_img: Option<PathBuf>,
     pub swtpm: Option<PathBuf>,
@@ -19,12 +20,20 @@ pub struct HostCapabilities {
 
 impl HostCapabilities {
     pub fn detect() -> Self {
-        Self {
-            kvm: std::fs::OpenOptions::new()
+        let platform = HostPlatform::current();
+        let mut accelerators = AcceleratorCapabilities::none();
+        if platform == HostPlatform::Linux
+            && std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open("/dev/kvm")
-                .is_ok(),
+                .is_ok()
+        {
+            accelerators = accelerators.with_available(VmAccelerator::Kvm);
+        }
+        Self {
+            platform,
+            accelerators,
             qemu_system: command_in_path("qemu-system-x86_64"),
             qemu_img: command_in_path("qemu-img"),
             swtpm: command_in_path("swtpm"),
@@ -64,6 +73,20 @@ impl HostCapabilities {
                     "/usr/share/edk2/ovmf/OVMF_VARS.secboot.fd",
                 ],
             ),
+        }
+    }
+
+    pub fn unavailable(platform: HostPlatform) -> Self {
+        Self {
+            platform,
+            accelerators: AcceleratorCapabilities::none(),
+            qemu_system: None,
+            qemu_img: None,
+            swtpm: None,
+            ovmf_code: None,
+            ovmf_vars: None,
+            ovmf_secure_code: None,
+            ovmf_secure_vars: None,
         }
     }
 
@@ -167,16 +190,7 @@ mod tests {
 
     #[test]
     fn missing_capabilities_are_reported_without_panicking() {
-        let capabilities = HostCapabilities {
-            kvm: false,
-            qemu_system: None,
-            qemu_img: None,
-            swtpm: None,
-            ovmf_code: None,
-            ovmf_vars: None,
-            ovmf_secure_code: None,
-            ovmf_secure_vars: None,
-        };
+        let capabilities = HostCapabilities::unavailable(HostPlatform::Linux);
         assert_eq!(capabilities.missing_for_launch().len(), 3);
         assert_eq!(capabilities.missing_for_preparation().len(), 2);
     }

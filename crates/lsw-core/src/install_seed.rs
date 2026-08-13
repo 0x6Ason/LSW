@@ -441,6 +441,7 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         })

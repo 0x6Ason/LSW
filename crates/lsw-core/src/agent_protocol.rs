@@ -5,9 +5,12 @@ use std::io::{Read, Write};
 use crate::{LswError, Result};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
+pub const CAPABILITY_CONPTY_V1: &str = "conpty-v1";
+pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 1024;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
+pub const MAX_TERMINAL_DIMENSION: u16 = i16::MAX as u16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -23,6 +26,7 @@ pub enum FrameKind {
     Stderr = 13,
     Resize = 14,
     Exit = 15,
+    TerminalStart = 16,
     FilePut = 20,
     FileGet = 21,
     FileData = 22,
@@ -45,6 +49,7 @@ impl TryFrom<u8> for FrameKind {
             13 => Ok(Self::Stderr),
             14 => Ok(Self::Resize),
             15 => Ok(Self::Exit),
+            16 => Ok(Self::TerminalStart),
             20 => Ok(Self::FilePut),
             21 => Ok(Self::FileGet),
             22 => Ok(Self::FileData),
@@ -219,6 +224,79 @@ impl StartRequest {
             kind,
             argv,
             working_directory,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub columns: u16,
+}
+
+impl TerminalSize {
+    pub const DEFAULT: Self = Self {
+        rows: 24,
+        columns: 80,
+    };
+
+    pub fn new(rows: u16, columns: u16) -> Result<Self> {
+        if rows == 0 || columns == 0 {
+            return Err(LswError::Protocol(
+                "terminal dimensions must be non-zero".to_owned(),
+            ));
+        }
+        if rows > MAX_TERMINAL_DIMENSION || columns > MAX_TERMINAL_DIMENSION {
+            return Err(LswError::Protocol(format!(
+                "terminal dimensions must not exceed {MAX_TERMINAL_DIMENSION}"
+            )));
+        }
+        Ok(Self { rows, columns })
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        encode_resize(self.rows, self.columns)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let (rows, columns) = decode_resize(payload)?;
+        Self::new(rows, columns)
+    }
+}
+
+impl Default for TerminalSize {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// A capability-gated terminal start message.
+///
+/// Clients send this as `FrameKind::TerminalStart` only after the server has
+/// advertised `conpty-v1`. Older agents therefore continue to receive the
+/// original `Start` frame and do not need to understand this payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalStartRequest {
+    pub size: TerminalSize,
+    pub request: StartRequest,
+}
+
+impl TerminalStartRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut payload = self.size.encode();
+        payload.extend_from_slice(&self.request.encode()?);
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 4 {
+            return Err(LswError::Protocol(
+                "terminal start payload is truncated".to_owned(),
+            ));
+        }
+        Ok(Self {
+            size: TerminalSize::decode(&payload[..4])?,
+            request: StartRequest::decode(&payload[4..])?,
         })
     }
 }
@@ -488,5 +566,36 @@ mod tests {
                 .expect("get should decode"),
             get
         );
+    }
+
+    #[test]
+    fn terminal_start_is_capability_gated_without_changing_start() {
+        let request = StartRequest {
+            kind: SessionKind::Shell,
+            argv: vec!["pwsh.exe".to_owned(), "cmd.exe".to_owned()],
+            working_directory: Some("C:\\src".to_owned()),
+        };
+        let terminal = TerminalStartRequest {
+            size: TerminalSize::new(42, 132).expect("terminal size should be valid"),
+            request,
+        };
+        assert_eq!(
+            TerminalStartRequest::decode(&terminal.encode().expect("request should encode"))
+                .expect("request should decode"),
+            terminal
+        );
+        assert_eq!(
+            FrameKind::try_from(16).expect("kind should decode"),
+            FrameKind::TerminalStart
+        );
+    }
+
+    #[test]
+    fn terminal_dimensions_fit_windows_coord() {
+        assert!(TerminalSize::new(0, 80).is_err());
+        assert!(TerminalSize::new(24, 0).is_err());
+        assert!(TerminalSize::new(MAX_TERMINAL_DIMENSION, MAX_TERMINAL_DIMENSION).is_ok());
+        assert!(TerminalSize::new(MAX_TERMINAL_DIMENSION + 1, 80).is_err());
+        assert!(TerminalSize::decode(&[0, 24, 0, 80, 0]).is_err());
     }
 }

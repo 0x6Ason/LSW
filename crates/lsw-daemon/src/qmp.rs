@@ -46,6 +46,16 @@ impl QmpClient {
         Ok(())
     }
 
+    pub fn pause(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.execute("stop")?;
+        Ok(())
+    }
+
+    pub fn resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.execute("cont")?;
+        Ok(())
+    }
+
     pub fn quit(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(self.writer, "{{\"execute\":\"quit\"}}")?;
         self.writer.flush()?;
@@ -185,6 +195,34 @@ mod tests {
         });
         let mut qmp = QmpClient::from_stream(client).expect("QMP should negotiate");
         assert_eq!(qmp.status().expect("status should parse"), "running");
+        server_thread.join().expect("server fixture should finish");
+    }
+
+    #[test]
+    fn qmp_client_sends_pause_and_resume_commands() {
+        let (client, mut server) = UnixStream::pair().expect("socket pair should be created");
+        let server_thread = thread::spawn(move || {
+            writeln!(server, "{{\"QMP\":{{\"version\":{{}}}}}}").expect("greeting should be sent");
+            let mut reader = BufReader::new(server.try_clone().expect("server should clone"));
+            let mut command = String::new();
+            reader
+                .read_line(&mut command)
+                .expect("capabilities should be read");
+            assert!(command.contains("qmp_capabilities"));
+            writeln!(server, "{{\"return\":{{}}}}").expect("capabilities response should be sent");
+
+            for expected in ["stop", "cont"] {
+                command.clear();
+                reader
+                    .read_line(&mut command)
+                    .expect("lifecycle command should be read");
+                assert!(command.contains(&format!("\"execute\":\"{expected}\"")));
+                writeln!(server, "{{\"return\":{{}}}}").expect("lifecycle response should be sent");
+            }
+        });
+        let mut qmp = QmpClient::from_stream(client).expect("QMP should negotiate");
+        qmp.pause().expect("pause should succeed");
+        qmp.resume().expect("resume should succeed");
         server_thread.join().expect("server fixture should finish");
     }
 }

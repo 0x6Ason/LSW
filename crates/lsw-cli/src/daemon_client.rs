@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lsw_core::StateStore;
+use lsw_core::{StateStore, DAEMON_PROTOCOL_VERSION};
 
 const RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,10 +32,7 @@ impl<'a> DaemonClient<'a> {
     pub fn ensure_running(&self) -> Result<(), Box<dyn std::error::Error>> {
         if self
             .request("PING")
-            .map(|lines| {
-                lines.iter().any(|line| line == "PONG")
-                    && lines.iter().any(|line| line == "PROTOCOL=1")
-            })
+            .map(|lines| daemon_protocol_matches(&lines))
             .unwrap_or(false)
         {
             return Ok(());
@@ -62,7 +59,7 @@ impl<'a> DaemonClient<'a> {
             .open(&log_path)?;
         let stderr = stdout.try_clone()?;
         let daemon = daemon_program()?;
-        let mut child = Command::new(&daemon)
+        let mut child = Command::new(daemon)
             .env("LSW_STATE_DIR", self.store.root())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
@@ -73,7 +70,7 @@ impl<'a> DaemonClient<'a> {
         loop {
             if self
                 .request("PING")
-                .map(|lines| lines.iter().any(|line| line == "PROTOCOL=1"))
+                .map(|lines| daemon_protocol_matches(&lines))
                 .unwrap_or(false)
             {
                 return Ok(());
@@ -154,6 +151,11 @@ impl<'a> DaemonClient<'a> {
     }
 }
 
+fn daemon_protocol_matches(lines: &[String]) -> bool {
+    let expected_protocol = format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}");
+    lines.iter().any(|line| line == "PONG") && lines.iter().any(|line| line == &expected_protocol)
+}
+
 fn daemon_program() -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(configured) = env::var_os("LSW_DAEMON") {
         return Ok(PathBuf::from(configured));
@@ -185,5 +187,25 @@ mod tests {
     fn response_unescaping_reverses_daemon_encoding_order() {
         assert_eq!(percent_decode("a%09b%0Ac%25"), "a\tb\nc%");
         assert_eq!(percent_decode("literal%2Fvalue"), "literal%2Fvalue");
+    }
+
+    #[test]
+    fn daemon_compatibility_uses_the_shared_protocol_version() {
+        let compatible = vec![
+            "PONG".to_owned(),
+            format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
+        ];
+        assert!(daemon_protocol_matches(&compatible));
+
+        let previous_version = DAEMON_PROTOCOL_VERSION
+            .checked_sub(1)
+            .expect("daemon protocol version must be positive");
+        assert!(!daemon_protocol_matches(&[
+            "PONG".to_owned(),
+            format!("PROTOCOL={previous_version}"),
+        ]));
+        assert!(!daemon_protocol_matches(&[format!(
+            "PROTOCOL={DAEMON_PROTOCOL_VERSION}"
+        )]));
     }
 }

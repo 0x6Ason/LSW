@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 
-bundle_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+bundle_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 install_prefix=${LSW_INSTALL_PREFIX:-"${HOME:?HOME is not set}/.local"}
 binary_directory="$install_prefix/bin"
 agent_directory="$install_prefix/libexec/lsw"
@@ -20,11 +20,11 @@ for required_file in lsw lswd lsw-agent.exe LICENSE; do
     fi
 done
 
-install -d -m 0755 "$binary_directory" "$agent_directory" "$documentation_directory"
-install -m 0755 "$bundle_directory/lsw" "$binary_directory/lsw"
-install -m 0755 "$bundle_directory/lswd" "$binary_directory/lswd"
-install -m 0644 "$bundle_directory/lsw-agent.exe" "$agent_directory/lsw-agent.exe"
-install -m 0644 "$bundle_directory/LICENSE" "$documentation_directory/LICENSE"
+install -d -m 0755 -- "$binary_directory" "$agent_directory" "$documentation_directory"
+install -m 0755 -- "$bundle_directory/lsw" "$binary_directory/lsw"
+install -m 0755 -- "$bundle_directory/lswd" "$binary_directory/lswd"
+install -m 0644 -- "$bundle_directory/lsw-agent.exe" "$agent_directory/lsw-agent.exe"
+install -m 0644 -- "$bundle_directory/LICENSE" "$documentation_directory/LICENSE"
 
 echo "Installed LSW into $install_prefix"
 echo "Ensure $binary_directory is on PATH, then run: lsw doctor"

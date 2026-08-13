@@ -10,6 +10,7 @@ mod daemon_client;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,8 +21,9 @@ use agent_client::AgentClient;
 use daemon_client::DaemonClient;
 use lsw_core::{
     CustomizationPlan, HostCapabilities, InstallSeedBuilder, InstallSeedOptions, InstanceManifest,
-    InstanceSpec, InstanceState, LaunchPhase, LswError, NetworkMode, Provisioner, QemuPlanner,
-    SessionKind, StartRequest, StateStore, WindowsProfile,
+    InstanceSpec, InstanceState, LaunchPhase, LswError, NetworkMode, PeImage, PeImportSymbol,
+    PortForward, Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest, StateStore,
+    VmAccelerator, WindowsProfile,
 };
 
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -37,18 +39,36 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
-    let store = StateStore::new(state_root()?);
     if arguments.is_empty() {
+        let store = StateStore::new(state_root()?);
         return shell(&store, &[]);
     }
     let command = arguments[0].to_str().ok_or("command must be valid UTF-8")?;
     let remaining = &arguments[1..];
 
     match command {
-        "help" | "--help" | "-h" => print_help(),
-        "version" | "--version" | "-V" => println!("lsw {}", env!("CARGO_PKG_VERSION")),
+        "help" | "--help" | "-h" => {
+            print_help();
+            return Ok(0);
+        }
+        "version" | "--version" | "-V" => {
+            println!("lsw {}", env!("CARGO_PKG_VERSION"));
+            return Ok(0);
+        }
+        "inspect" => {
+            inspect_pe(remaining)?;
+            return Ok(0);
+        }
+        "profile" => {
+            profile(remaining)?;
+            return Ok(0);
+        }
+        _ => {}
+    }
+
+    let store = StateStore::new(state_root()?);
+    match command {
         "doctor" => doctor(&store),
-        "profile" => profile(remaining)?,
         "create" => create(&store, remaining)?,
         "prepare" => prepare(&store, remaining)?,
         "seed" => seed(&store, remaining)?,
@@ -60,6 +80,8 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "install" => install_instance(&store, remaining)?,
         "start" => start_instance(&store, remaining, LaunchPhase::Run)?,
         "status" => status(&store, remaining)?,
+        "suspend" => suspend(&store, remaining)?,
+        "resume" => resume(&store, remaining)?,
         "stop" => stop(&store, remaining)?,
         "shell" => return shell(&store, remaining),
         "exec" => return guest_command(&store, remaining, SessionKind::Exec),
@@ -130,9 +152,23 @@ fn seed(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
 
 fn doctor(store: &StateStore) {
     let capabilities = HostCapabilities::detect();
+    let backend = QemuBackend::select(&capabilities);
     println!("LSW host capability report");
     println!("  state root:  {}", store.root().display());
-    println!("  KVM:         {}", yes_no(capabilities.kvm));
+    println!("  platform:    {}", capabilities.platform);
+    println!("  accelerator: {}", backend.accelerator());
+    println!(
+        "  KVM:         {}",
+        yes_no(capabilities.accelerators.supports(VmAccelerator::Kvm))
+    );
+    println!(
+        "  HVF:         {}",
+        yes_no(capabilities.accelerators.supports(VmAccelerator::Hvf))
+    );
+    println!(
+        "  WHPX:        {}",
+        yes_no(capabilities.accelerators.supports(VmAccelerator::Whpx))
+    );
     println!(
         "  QEMU:        {}",
         display_optional(&capabilities.qemu_system)
@@ -175,9 +211,233 @@ fn doctor(store: &StateStore) {
         }
         println!("Planning and state commands still work on this headless host.");
     }
-    if !capabilities.kvm {
-        println!("KVM acceleration is unavailable; QEMU would use its slow TCG fallback.");
+    if backend.accelerator() == VmAccelerator::Tcg {
+        if let Some(native) = capabilities.platform.native_accelerator() {
+            println!(
+                "{} is unavailable; QEMU would use its slow TCG fallback.",
+                native.capability_name()
+            );
+        } else {
+            println!("No native accelerator is defined; QEMU would use its slow TCG fallback.");
+        }
     }
+}
+
+fn inspect_pe(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut path = None;
+    let mut json = false;
+    let mut show_imports = false;
+
+    for argument in arguments {
+        let value = argument
+            .to_str()
+            .ok_or("inspect arguments must be valid UTF-8")?;
+        match value {
+            "--json" => {
+                if json {
+                    return Err("--json was supplied more than once".into());
+                }
+                json = true;
+            }
+            "--imports" => {
+                if show_imports {
+                    return Err("--imports was supplied more than once".into());
+                }
+                show_imports = true;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown inspect option {option:?}").into())
+            }
+            _ => {
+                if path.replace(PathBuf::from(argument)).is_some() {
+                    return Err("usage: lsw inspect FILE [--imports] [--json]".into());
+                }
+            }
+        }
+    }
+
+    let path = path.ok_or("usage: lsw inspect FILE [--imports] [--json]")?;
+    let image = PeImage::read(&path)?;
+    if json {
+        println!("{}", pe_json(&path, &image));
+    } else {
+        print_pe_report(&path, &image, show_imports);
+    }
+    Ok(())
+}
+
+fn print_pe_report(path: &Path, image: &PeImage, show_imports: bool) {
+    let assessment = image.assess_for_beta();
+    println!("LSW PE inspection");
+    println!("  file:              {}", path.display());
+    println!("  format:            {}", image.kind);
+    println!("  machine:           {}", image.machine);
+    println!("  subsystem:         {}", image.subsystem);
+    println!("  image base:        0x{:016x}", image.image_base);
+    println!("  entry point RVA:   0x{:08x}", image.entry_point_rva);
+    println!("  image size:        {} bytes", image.size_of_image);
+    println!("  DLL:               {}", yes_no(image.is_dll));
+    println!("  managed (.NET):    {}", yes_no(image.is_managed));
+    println!(
+        "  certificate table: {}",
+        if image.has_certificate_table {
+            "present (signature not cryptographically verified)"
+        } else {
+            "absent"
+        }
+    );
+    println!("  sections:          {}", image.sections.len());
+    println!("  imported DLLs:     {}", image.imports.len());
+    println!("  imported symbols:  {}", image.imported_symbol_count());
+    println!("  beta assessment:   {}", assessment.level);
+    for note in assessment.notes {
+        println!("  note: {note}");
+    }
+
+    if image.imports.is_empty() {
+        return;
+    }
+    println!("\nImports:");
+    for import in &image.imports {
+        println!("  {} ({} symbols)", import.dll, import.symbols.len());
+        if show_imports {
+            for symbol in &import.symbols {
+                match symbol {
+                    PeImportSymbol::Name { hint, name } => {
+                        println!("    {name} (hint {hint})");
+                    }
+                    PeImportSymbol::Ordinal(value) => println!("    #{value}"),
+                }
+            }
+        }
+    }
+    if !show_imports {
+        println!("Pass --imports to list every imported symbol.");
+    }
+}
+
+fn pe_json(path: &Path, image: &PeImage) -> String {
+    let assessment = image.assess_for_beta();
+    let mut output = String::new();
+    output.push('{');
+    push_json_field(&mut output, "file", &path.to_string_lossy(), false);
+    push_json_field(&mut output, "format", &image.kind.to_string(), true);
+    push_json_field(&mut output, "machine", &image.machine.to_string(), true);
+    push_json_field(
+        &mut output,
+        "machine_code",
+        &format!("0x{:04x}", image.machine.raw()),
+        true,
+    );
+    push_json_field(&mut output, "subsystem", &image.subsystem.to_string(), true);
+    write!(
+        output,
+        ",\"subsystem_code\":{},\"timestamp\":{},\"characteristics\":{},\"entry_point_rva\":{},\"image_base\":{},\"size_of_image\":{},\"is_dll\":{},\"is_managed\":{},\"has_certificate_table\":{}",
+        image.subsystem.raw(),
+        image.timestamp,
+        image.characteristics,
+        image.entry_point_rva,
+        image.image_base,
+        image.size_of_image,
+        image.is_dll,
+        image.is_managed,
+        image.has_certificate_table
+    )
+    .expect("writing JSON to a String cannot fail");
+
+    output.push_str(",\"assessment\":{");
+    push_json_field(&mut output, "level", &assessment.level.to_string(), false);
+    output.push_str(",\"notes\":[");
+    for (index, note) in assessment.notes.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        push_json_string(&mut output, note);
+    }
+    output.push_str("]}");
+
+    output.push_str(",\"sections\":[");
+    for (index, section) in image.sections.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_field(&mut output, "name", &section.name, false);
+        write!(
+            output,
+            ",\"virtual_address\":{},\"virtual_size\":{},\"raw_offset\":{},\"raw_size\":{},\"characteristics\":{}",
+            section.virtual_address,
+            section.virtual_size,
+            section.raw_offset,
+            section.raw_size,
+            section.characteristics
+        )
+        .expect("writing JSON to a String cannot fail");
+        output.push('}');
+    }
+    output.push(']');
+
+    output.push_str(",\"imports\":[");
+    for (import_index, import) in image.imports.iter().enumerate() {
+        if import_index != 0 {
+            output.push(',');
+        }
+        output.push('{');
+        push_json_field(&mut output, "dll", &import.dll, false);
+        output.push_str(",\"symbols\":[");
+        for (symbol_index, symbol) in import.symbols.iter().enumerate() {
+            if symbol_index != 0 {
+                output.push(',');
+            }
+            match symbol {
+                PeImportSymbol::Name { hint, name } => {
+                    output.push('{');
+                    push_json_field(&mut output, "kind", "name", false);
+                    push_json_field(&mut output, "name", name, true);
+                    write!(output, ",\"hint\":{hint}")
+                        .expect("writing JSON to a String cannot fail");
+                    output.push('}');
+                }
+                PeImportSymbol::Ordinal(value) => {
+                    write!(output, "{{\"kind\":\"ordinal\",\"ordinal\":{value}}}")
+                        .expect("writing JSON to a String cannot fail");
+                }
+            }
+        }
+        output.push_str("]}");
+    }
+    output.push_str("]}");
+    output
+}
+
+fn push_json_field(output: &mut String, name: &str, value: &str, comma: bool) {
+    if comma {
+        output.push(',');
+    }
+    push_json_string(output, name);
+    output.push(':');
+    push_json_string(output, value);
+}
+
+fn push_json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            control if control <= '\u{1f}' => {
+                write!(output, "\\u{:04x}", control as u32)
+                    .expect("writing JSON to a String cannot fail");
+            }
+            other => output.push(other),
+        }
+    }
+    output.push('"');
 }
 
 fn create(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
@@ -193,6 +453,7 @@ fn create(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
             .disk_gib
             .unwrap_or_else(|| profile.default_disk_gib()),
         network: parsed.network,
+        port_forwards: parsed.port_forwards,
         license_accepted: parsed.accept_license,
         allow_unsupported_requirements: parsed.allow_unsupported_requirements,
     };
@@ -442,6 +703,26 @@ fn stop(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
+fn suspend(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = optional_name(arguments, "suspend")?;
+    let name = resolve_name(store, requested)?;
+    let client = DaemonClient::new(store);
+    for line in client.request_checked(&format!("SUSPEND {name}"))? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn resume(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = optional_name(arguments, "resume")?;
+    let name = resolve_name(store, requested)?;
+    let client = DaemonClient::new(store);
+    for line in client.request_checked(&format!("RESUME {name}"))? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn shell(store: &StateStore, arguments: &[OsString]) -> Result<u8, Box<dyn std::error::Error>> {
     let requested = optional_name(arguments, "shell")?;
     let name = resolve_name(store, requested)?;
@@ -571,7 +852,11 @@ fn connect_agent(
             }
         }
         InstanceState::Suspended => {
-            return Err("resume is not implemented in the beta supervisor".into())
+            println!("Resuming {name:?}...");
+            let daemon = DaemonClient::new(store);
+            for line in daemon.request_checked(&format!("RESUME {name}"))? {
+                println!("{line}");
+            }
         }
         InstanceState::Installing | InstanceState::Running => {}
     }
@@ -744,6 +1029,17 @@ fn show(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
     println!("memory:               {} MiB", manifest.spec.memory_mib);
     println!("disk:                 {} GiB", manifest.spec.disk_gib);
     println!("network:              {}", manifest.spec.network);
+    if manifest.spec.port_forwards.is_empty() {
+        println!("published TCP ports:  none");
+    } else {
+        println!("published TCP ports:");
+        for forward in &manifest.spec.port_forwards {
+            println!(
+                "  127.0.0.1:{} -> guest:{}",
+                forward.host_port, forward.guest_port
+            );
+        }
+    }
     println!("UEFI:                 {}", security.uefi);
     println!("guest Secure Boot:    {}", security.secure_boot);
     println!("vTPM:                 {}", security.vtpm);
@@ -861,6 +1157,7 @@ fn print_help() {
         "LSW - local Windows development runtime\n\n",
         "USAGE:\n",
         "  lsw doctor\n",
+        "  lsw inspect FILE [--imports] [--json]\n",
         "  lsw profile PROFILE\n",
         "  lsw create NAME --iso PATH --accept-license [OPTIONS]\n",
         "  lsw prepare NAME [--execute]\n",
@@ -873,6 +1170,8 @@ fn print_help() {
         "              [--unattended-index N] [--without-agent]\n",
         "  lsw start [NAME]\n",
         "  lsw status [NAME]\n",
+        "  lsw suspend [NAME]\n",
+        "  lsw resume [NAME]\n",
         "  lsw stop [NAME] [--force]\n",
         "  lsw shell [NAME]\n",
         "  lsw exec [NAME] -- COMMAND [ARG ...]\n",
@@ -887,6 +1186,7 @@ fn print_help() {
         "  --memory MIB         guest memory (default: 4096)\n",
         "  --disk GIB           virtual disk size (profile default: 64)\n",
         "  --network MODE       nat (default) or offline\n",
+        "  --publish HOST:GUEST publish a TCP guest port on host loopback; repeatable\n",
         "  --accept-license     confirm acceptance of the supplied media's license\n",
         "  --allow-unsupported-requirements\n",
         "                       permit an explicitly unsupported small VM\n\n",
@@ -912,6 +1212,7 @@ struct CreateArguments {
     memory_mib: u32,
     disk_gib: Option<u32>,
     network: NetworkMode,
+    port_forwards: Vec<PortForward>,
     accept_license: bool,
     allow_unsupported_requirements: bool,
 }
@@ -929,6 +1230,7 @@ impl CreateArguments {
         let mut memory_mib = 4096;
         let mut disk_gib = None;
         let mut network = NetworkMode::Nat;
+        let mut port_forwards = Vec::new();
         let mut accept_license = false;
         let mut allow_unsupported_requirements = false;
         let mut index = 1;
@@ -948,6 +1250,9 @@ impl CreateArguments {
                 "--memory" => memory_mib = parse_number(arguments, &mut index, option)?,
                 "--disk" => disk_gib = Some(parse_number(arguments, &mut index, option)?),
                 "--network" => network = next_value(arguments, &mut index, option)?.parse()?,
+                "--publish" => {
+                    port_forwards.push(next_value(arguments, &mut index, option)?.parse()?);
+                }
                 "--accept-license" => accept_license = true,
                 "--allow-unsupported-requirements" => allow_unsupported_requirements = true,
                 unknown => return Err(format!("unknown create option {unknown:?}").into()),
@@ -963,6 +1268,7 @@ impl CreateArguments {
             memory_mib,
             disk_gib,
             network,
+            port_forwards,
             accept_license,
             allow_unsupported_requirements,
         })
@@ -994,4 +1300,63 @@ where
     value
         .parse::<T>()
         .map_err(|error| format!("invalid value for {option}: {error}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_accepts_repeated_tcp_publish_options() {
+        let arguments = [
+            "win-dev",
+            "--iso",
+            "windows.iso",
+            "--accept-license",
+            "--publish",
+            "8080:80",
+            "--publish",
+            "8443:443",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let parsed = CreateArguments::parse(&arguments).expect("create options should parse");
+        assert_eq!(
+            parsed.port_forwards,
+            vec![
+                PortForward::new(8080, 80).expect("ports should be valid"),
+                PortForward::new(8443, 443).expect("ports should be valid"),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_rejects_malformed_tcp_publish_option() {
+        let arguments = [
+            "win-dev",
+            "--iso",
+            "windows.iso",
+            "--accept-license",
+            "--publish",
+            "8080",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        assert!(CreateArguments::parse(&arguments).is_err());
+    }
+
+    #[test]
+    fn pe_json_strings_escape_protocol_sensitive_characters() {
+        let mut output = String::new();
+        push_json_string(
+            &mut output,
+            "quote=\" slash=\\ line=\n tab=\t control=\u{0001} 中文",
+        );
+        assert_eq!(
+            output,
+            "\"quote=\\\" slash=\\\\ line=\\n tab=\\t control=\\u0001 中文\""
+        );
+    }
 }

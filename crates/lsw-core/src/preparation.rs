@@ -311,6 +311,7 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -319,16 +320,7 @@ mod tests {
     }
 
     fn headless_capabilities() -> HostCapabilities {
-        HostCapabilities {
-            kvm: false,
-            qemu_system: None,
-            qemu_img: None,
-            swtpm: None,
-            ovmf_code: None,
-            ovmf_vars: None,
-            ovmf_secure_code: None,
-            ovmf_secure_vars: None,
-        }
+        HostCapabilities::unavailable(crate::HostPlatform::Linux)
     }
 
     #[test]
@@ -360,16 +352,9 @@ mod tests {
         fs::write(&qemu_img, b"#!/bin/sh\n: > \"$4\"\n").expect("fake qemu-img should be written");
         fs::set_permissions(&qemu_img, fs::Permissions::from_mode(0o700))
             .expect("fake qemu-img should be executable");
-        let capabilities = HostCapabilities {
-            kvm: false,
-            qemu_system: None,
-            qemu_img: Some(qemu_img),
-            swtpm: None,
-            ovmf_code: None,
-            ovmf_vars: Some(firmware),
-            ovmf_secure_code: None,
-            ovmf_secure_vars: None,
-        };
+        let mut capabilities = headless_capabilities();
+        capabilities.qemu_img = Some(qemu_img);
+        capabilities.ovmf_vars = Some(firmware);
         let provisioner = Provisioner::new(capabilities);
         let plan = provisioner
             .plan(&manifest, &root)

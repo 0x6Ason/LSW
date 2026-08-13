@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use lsw_core::{HostCapabilities, LaunchPhase, QemuPlanner, StateStore};
+use lsw_core::{HostCapabilities, LaunchPhase, QemuPlanner, StateStore, DAEMON_PROTOCOL_VERSION};
 use supervisor::Supervisor;
 
 const MAX_REQUEST_BYTES: u64 = 4096;
@@ -135,7 +135,11 @@ fn dispatch(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let parts = request.split_ascii_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
-        ["PING"] => Ok(vec!["PONG".to_owned(), "PROTOCOL=1".to_owned()]),
+        ["PING"] => Ok(vec![
+            "PONG".to_owned(),
+            format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
+            "FEATURES=suspend,resume".to_owned(),
+        ]),
         ["LIST"] => Ok(supervisor
             .store()
             .list()?
@@ -157,10 +161,15 @@ fn dispatch(
         ["PLAN", name, phase] => plan(supervisor, name, phase),
         ["START", name, phase] => supervisor.start(name, parse_phase(phase)?),
         ["STATUS", name] => supervisor.status(name),
+        ["SUSPEND", name] => supervisor.suspend(name),
+        ["RESUME", name] => supervisor.resume(name),
         ["STOP", name, "graceful"] => supervisor.stop(name, false),
         ["STOP", name, "force"] => supervisor.stop(name, true),
         [] => Err("empty request".into()),
-        _ => Err("unknown request; expected PING, LIST, SHOW, PLAN, START, STATUS, or STOP".into()),
+        _ => Err(
+            "unknown request; expected PING, LIST, SHOW, PLAN, START, STATUS, SUSPEND, RESUME, or STOP"
+                .into(),
+        ),
     }
 }
 
@@ -227,16 +236,7 @@ mod tests {
     fn supervisor() -> Supervisor {
         Supervisor::new(
             StateStore::new(std::env::temp_dir().join("lswd-dispatch-test")),
-            HostCapabilities {
-                kvm: false,
-                qemu_system: None,
-                qemu_img: None,
-                swtpm: None,
-                ovmf_code: None,
-                ovmf_vars: None,
-                ovmf_secure_code: None,
-                ovmf_secure_vars: None,
-            },
+            HostCapabilities::unavailable(lsw_core::HostPlatform::Linux),
         )
     }
 
@@ -244,7 +244,11 @@ mod tests {
     fn ping_protocol_is_versioned() {
         assert_eq!(
             dispatch("PING", &mut supervisor()).expect("ping should work"),
-            vec!["PONG".to_owned(), "PROTOCOL=1".to_owned()]
+            vec![
+                "PONG".to_owned(),
+                format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
+                "FEATURES=suspend,resume".to_owned()
+            ]
         );
     }
 
@@ -257,5 +261,7 @@ mod tests {
     fn mutating_commands_are_strictly_parsed() {
         assert!(dispatch("STOP everything now", &mut supervisor()).is_err());
         assert!(dispatch("START x invalid", &mut supervisor()).is_err());
+        assert!(dispatch("SUSPEND x now", &mut supervisor()).is_err());
+        assert!(dispatch("RESUME", &mut supervisor()).is_err());
     }
 }

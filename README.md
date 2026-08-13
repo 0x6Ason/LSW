@@ -4,14 +4,15 @@ LSW 是 Linux 上的本機 Windows 開發執行環境。操作方式接近容器
 instance 後，可直接進入 PowerShell／CMD、執行 Windows 程式及傳輸檔案；實際隔離
 邊界則是 QEMU/KVM microVM，因為 Windows 核心不能與 Linux host 共用。
 
-目前版本為 `1.0.0-beta.1`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
-檔案傳輸及 ephemeral overlay 已可用；逐視窗 Wayland/X11 整合與 ConPTY 尚未完成，
-因此 GUI 安裝／救援暫時使用 private Unix-socket VNC，shell 在 beta 中採用 pipe I/O。
-詳見 [beta 狀態](docs/BETA.md)。
+目前版本為 `1.0.0-beta.2`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
+檔案傳輸、ConPTY 終端機與 ephemeral overlay 已實作。逐視窗 Wayland/X11 整合尚未
+完成，因此 GUI 安裝／救援暫時使用 private Unix-socket VNC。ConPTY 及真正的
+Windows/KVM 開機路徑仍需在實機完成 E2E gate；詳見 [beta 狀態](docs/BETA.md)。
 
 ## 支援範圍
 
-- Host：Linux x86_64；KVM 建議使用，TCG 只適合診斷。
+- Host runtime：Linux x86_64；KVM 建議使用，TCG 只適合診斷。程式碼已分離 backend
+  選擇，並能產生 HVF／WHPX 參數，但 macOS／Windows host 尚未成為可交付 runtime。
 - Guest：使用者自行提供及授權的 Windows 11 x64 安裝 ISO。
 - Runtime：QEMU、`qemu-img`、OVMF 及 swtpm。
 - LSW 不下載或散布 Windows、產品金鑰、啟用資料、預先啟用磁碟或 Tiny11 image。
@@ -36,6 +37,20 @@ lsw create win-dev \
   --profile slim \
   --accept-license
 ```
+
+若需要把 guest TCP service 發布給 host，可重複使用 `--publish HOST:GUEST`：
+
+```bash
+lsw create win-web \
+  --iso /absolute/path/Windows11.iso \
+  --publish 8080:80 \
+  --publish 8443:443 \
+  --accept-license
+```
+
+這些 port 只綁定 host 的 `127.0.0.1`，不會建立 LAN listener；`offline` network 不允許
+額外 port publishing。LSW 會拒絕重複、已由其他 instance 使用、目前無法在 loopback
+綁定，或與 agent control port 衝突的 host port。
 
 啟動安裝：
 
@@ -67,11 +82,30 @@ lsw run -- notepad.exe
 lsw push ./main.rs 'C:\Users\you\src\main.rs'
 lsw pull 'C:\build\app.exe' ./app.exe
 lsw status
+lsw suspend                  # QMP stop；VM 仍留在記憶體
+lsw resume
 lsw stop
 ```
 
+在互動式 host TTY 上，`lsw shell` 會與支援 capability 的 agent 協商 ConPTY，轉送
+console input/output 並同步 terminal resize；舊版或不支援 ConPTY 的 agent 仍使用 pipe
+session。此實作已通過編譯及協定測試，但 beta.2 尚未在登入後的真 Windows guest
+完成 E2E 驗收。
+
 `lsw run` 已能在登入中的 Windows session 啟動程式，但 beta 尚未把個別 HWND 映射成
-Linux native window；GUI 仍只能從安裝／救援 display 看到。
+Linux native window；GUI 仍只能從安裝／救援 display 看到。`lsw suspend` 只是暫停目前
+QEMU process 的 in-memory VM，不是休眠或磁碟 snapshot；QEMU／host 結束後不能靠它復原。
+
+若要在建立 VM 前檢查 Windows binary，可直接分析 PE，不需要 state directory：
+
+```bash
+lsw inspect ./app.exe
+lsw inspect ./app.exe --imports
+lsw inspect ./app.exe --json
+```
+
+inspector 會報告 machine、subsystem、sections、imports、CLR/certificate table 與 beta
+相容性提示；「certificate table present」不等於已完成 Authenticode 密碼學驗證。
 
 ## Profiles
 
@@ -87,7 +121,8 @@ Linux native window；GUI 仍只能從安裝／救援 display 看到。
 
 ## 從 source 建置
 
-Host binaries 不含第三方 Rust crate dependency：
+Host binaries 不含第三方 Rust crate dependency。專案的 MSRV 是 Rust 1.76，CI 也固定以
+1.76 執行 source gate：
 
 ```bash
 cargo build --workspace
@@ -126,5 +161,6 @@ QEMU、OVMF、swtpm 或使用者自行提供的媒體；它們各自適用原權
 - [Beta 驗收範圍與已知限制](docs/BETA.md)
 - [架構](docs/ARCHITECTURE.md)
 - [安全模型](docs/SECURITY.md)
+- [開發與 release gate](docs/DEVELOPMENT.md)
 - [授權與散布邊界](docs/LEGAL_BOUNDARIES.md)
 - [主要設計參考資料](docs/REFERENCES.md)

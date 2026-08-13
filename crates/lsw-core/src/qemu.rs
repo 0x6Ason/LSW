@@ -6,7 +6,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{HostCapabilities, InstanceManifest, NetworkMode, Result, AGENT_GUEST_PORT};
+use crate::{
+    HostCapabilities, InstanceManifest, NetworkMode, QemuBackend, Result, AGENT_GUEST_PORT,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchPhase {
@@ -37,6 +39,7 @@ impl CommandInvocation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandPlan {
+    pub backend: QemuBackend,
     pub program: OsString,
     pub arguments: Vec<OsString>,
     pub helper_commands: Vec<CommandInvocation>,
@@ -53,11 +56,28 @@ impl CommandPlan {
 #[derive(Clone, Debug)]
 pub struct QemuPlanner {
     capabilities: HostCapabilities,
+    backend: QemuBackend,
 }
 
 impl QemuPlanner {
     pub fn new(capabilities: HostCapabilities) -> Self {
-        Self { capabilities }
+        let backend = QemuBackend::select(&capabilities);
+        Self {
+            capabilities,
+            backend,
+        }
+    }
+
+    pub fn with_backend(capabilities: HostCapabilities, backend: QemuBackend) -> Result<Self> {
+        backend.validate(&capabilities)?;
+        Ok(Self {
+            capabilities,
+            backend,
+        })
+    }
+
+    pub const fn backend(&self) -> QemuBackend {
+        self.backend
     }
 
     pub fn plan(
@@ -99,16 +119,14 @@ impl QemuPlanner {
             format!("{}M", manifest.spec.memory_mib),
         );
 
-        if self.capabilities.kvm {
-            arguments.push("-enable-kvm".into());
-            push_pair(&mut arguments, "-cpu", "host");
-        } else {
-            push_pair(&mut arguments, "-accel", "tcg,thread=multi");
-            push_pair(&mut arguments, "-cpu", "max");
-            notes.push(
-                "KVM is unavailable; this dry-run falls back to TCG and will be much slower"
-                    .to_owned(),
-            );
+        arguments.extend(
+            self.backend
+                .acceleration_arguments()
+                .iter()
+                .map(OsString::from),
+        );
+        if let Some(note) = self.backend.fallback_note() {
+            notes.push(note);
         }
 
         let firmware_code = self
@@ -160,7 +178,7 @@ impl QemuPlanner {
             "-device",
             "nvme,drive=system,serial=lsw-system",
         );
-        let network = match manifest.spec.network {
+        let mut network = match manifest.spec.network {
             NetworkMode::Nat => format!(
                 "user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:{}-:{}",
                 manifest.control_port, AGENT_GUEST_PORT
@@ -170,11 +188,21 @@ impl QemuPlanner {
                 manifest.control_port, AGENT_GUEST_PORT
             ),
         };
+        for forward in &manifest.spec.port_forwards {
+            network.push_str(&format!(
+                ",hostfwd=tcp:127.0.0.1:{}-:{}",
+                forward.host_port, forward.guest_port
+            ));
+        }
         push_pair(&mut arguments, "-netdev", network);
         push_pair(&mut arguments, "-device", "e1000e,netdev=net0");
         notes.push(match manifest.spec.network {
-            NetworkMode::Nat => {
+            NetworkMode::Nat if manifest.spec.port_forwards.is_empty() => {
                 "network policy: user-mode NAT permits guest egress and exposes only the agent port on host loopback"
+                    .to_owned()
+            }
+            NetworkMode::Nat => {
+                "network policy: user-mode NAT permits guest egress; the agent and explicitly published TCP ports bind only to host loopback"
                     .to_owned()
             }
             NetworkMode::Offline => {
@@ -182,6 +210,12 @@ impl QemuPlanner {
                     .to_owned()
             }
         });
+        for forward in &manifest.spec.port_forwards {
+            notes.push(format!(
+                "published TCP port: 127.0.0.1:{} forwards to guest port {}",
+                forward.host_port, forward.guest_port
+            ));
+        }
         push_pair(&mut arguments, "-device", "qemu-xhci");
         push_pair(&mut arguments, "-device", "usb-kbd");
         push_pair(&mut arguments, "-device", "usb-tablet");
@@ -348,6 +382,7 @@ impl QemuPlanner {
         }
 
         Ok(CommandPlan {
+            backend: self.backend,
             program,
             arguments,
             helper_commands,
@@ -413,6 +448,7 @@ mod tests {
             memory_mib: 8192,
             disk_gib: 64,
             network: NetworkMode::Offline,
+            port_forwards: Vec::new(),
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -421,16 +457,7 @@ mod tests {
     }
 
     fn headless_capabilities() -> HostCapabilities {
-        HostCapabilities {
-            kvm: false,
-            qemu_system: None,
-            qemu_img: None,
-            swtpm: None,
-            ovmf_code: None,
-            ovmf_vars: None,
-            ovmf_secure_code: None,
-            ovmf_secure_vars: None,
-        }
+        HostCapabilities::unavailable(crate::HostPlatform::Linux)
     }
 
     #[test]
@@ -446,11 +473,32 @@ mod tests {
         assert!(command.contains("-device VGA"));
         assert!(command.contains("-boot once=d,menu=on"));
         assert!(command.contains("-accel tcg,thread=multi"));
+        assert_eq!(plan.backend.accelerator(), crate::VmAccelerator::Tcg);
         assert!(command.contains("restrict=on"));
         assert_eq!(plan.helper_commands.len(), 1);
         assert!(plan.helper_commands[0]
             .display_command()
             .contains("swtpm socket --tpm2"));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn planner_uses_an_explicit_validated_accelerator_selection() {
+        let (manifest, iso) = test_manifest(WindowsProfile::Standard);
+        let mut capabilities = headless_capabilities();
+        capabilities.accelerators =
+            crate::AcceleratorCapabilities::none().with_available(crate::VmAccelerator::Kvm);
+        let backend = QemuBackend::require(&capabilities, crate::VmAccelerator::Kvm)
+            .expect("advertised KVM should be selectable");
+        let planner = QemuPlanner::with_backend(capabilities, backend)
+            .expect("the backend should match its capabilities");
+        let plan = planner
+            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
+            .expect("plan should be built");
+        assert_eq!(planner.backend(), backend);
+        assert_eq!(plan.backend, backend);
+        assert!(plan.display_command().contains("-enable-kvm -cpu host"));
+        assert!(!plan.display_command().contains("-accel tcg"));
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 
@@ -472,6 +520,28 @@ mod tests {
         assert!(plan
             .missing_capabilities
             .contains(&"Secure Boot OVMF code firmware"));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn nat_network_publishes_requested_tcp_ports_on_loopback() {
+        let (mut manifest, iso) = test_manifest(WindowsProfile::Standard);
+        manifest.spec.network = NetworkMode::Nat;
+        manifest.spec.port_forwards = vec![
+            crate::PortForward::new(8080, 80).expect("ports should be valid"),
+            crate::PortForward::new(8443, 443).expect("ports should be valid"),
+        ];
+        let plan = QemuPlanner::new(headless_capabilities())
+            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
+            .expect("plan should be built");
+        let command = plan.display_command();
+        assert!(command.contains("hostfwd=tcp:127.0.0.1:8080-:80"));
+        assert!(command.contains("hostfwd=tcp:127.0.0.1:8443-:443"));
+        assert!(!command.contains("0.0.0.0:8080"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("127.0.0.1:8080")));
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 }

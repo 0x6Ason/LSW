@@ -7,10 +7,12 @@ whose kernel cannot be shared with the host. Windows-on-Linux therefore uses a
 QEMU/KVM microVM as its isolation boundary. No component claims that Windows is
 running as a Linux namespace container.
 
-The beta supports a Linux x86_64 host and a Windows 11 x64 guest. Host backends
-remain separated from guest protocols so WHPX, Hypervisor.framework, or another
-OS can be added later without treating Windows boot and licensing rules as
-universal policy.
+The delivered beta runtime supports a Linux x86_64 host and a Windows 11 x64
+guest. Host platform and accelerator selection are separated from guest
+protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
+and QEMU argument generation exist as planner-level work only. There are no
+macOS or Windows host-side binaries, daemon IPC integrations, or runtime
+validation claims in beta.2.
 
 ## Components
 
@@ -18,16 +20,19 @@ universal policy.
 | --- | --- | --- |
 | `lsw` | Implemented | Instance management, installer seed, default shell, process and file commands |
 | `lswd` | Implemented | User-private Unix API, QEMU/swtpm supervision, QMP reconciliation and shutdown |
-| QEMU/KVM backend | Implemented | UEFI/vTPM microVM with private storage, loopback forwarding and recovery display |
-| `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe process sessions and file transfer |
-| ConPTY transport | Not in beta | Terminal resize, console modes and full interactive TTY behavior |
-| Host compositor bridge | Not in beta | One guest top-level HWND per Wayland/X11 host window |
-| Fast graphics transport | Not in beta | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
+| QEMU backend | Linux runtime implemented | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
+| Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
+| `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY process sessions and file transfer |
+| ConPTY transport | Implemented; E2E gated | Capability negotiation, console I/O and terminal resize; real installed-Windows validation remains |
+| PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
+| Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
+| Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
 ## Lifecycle
 
-1. `lsw create` validates the requested shape and stores manifest v2 plus a
-   random 256-bit per-instance agent token. It does not copy the ISO.
+1. `lsw create` validates the requested shape and stores manifest v3 plus a
+   random 256-bit per-instance agent token. It does not copy the ISO. Version 1
+   and 2 manifests migrate with no published ports.
 2. `lsw install` creates a read-only Setup seed if one does not exist, prepares
    qcow2 storage and a private OVMF variable store, starts swtpm, then starts
    QEMU in install mode. Guided installation is the default.
@@ -41,7 +46,12 @@ universal policy.
    user's session and registers a per-user startup entry. This avoids placing
    GUI work in Windows Session 0.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
-   Windows PowerShell, then `cmd.exe`/`cmd` in order.
+   Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
+   ConPTY and host stdin is a terminal, the host enters raw mode and forwards
+   resize events; otherwise the established pipe session remains available.
+7. `lsw suspend` sends QMP `stop` and records `suspended`; `lsw resume` requires
+   the same live QEMU process in QMP `paused` state and sends `cont`. This is
+   deliberately not a RAM snapshot, hibernation, or migration mechanism.
 
 Instance state is stored under `$LSW_STATE_DIR` or, by default,
 `$HOME/.local/share/lsw`:
@@ -61,14 +71,36 @@ instances/NAME/
 
 The daemon protocol is newline-delimited, versioned by `PING`, bounded, and
 available only on a mode-0600 socket in a mode-0700 directory. Mutations are
-strict commands (`START`, `STOP`) rather than shell strings. QEMU state is read
-and changed through negotiated QMP commands, never by trusting a PID file.
+strict commands (`START`, `SUSPEND`, `RESUME`, `STOP`) rather than shell strings.
+QEMU state is read and changed through negotiated QMP commands, never by
+trusting a PID file.
 
 The agent protocol uses a five-byte binary frame header, an 8 MiB frame limit,
 explicit UTF-8 string lengths, a protocol version, and constant-time comparison
-of the per-instance token. Host forwarding binds to `127.0.0.1`; commands and
-file payloads are binary-safe. Upload and download destinations are never
-overwritten implicitly.
+of the per-instance token. Capability strings negotiate ConPTY and terminal
+resize without breaking older pipe-only agents. Host forwarding binds to
+`127.0.0.1`; commands and file payloads are binary-safe. Upload and download
+destinations are never overwritten implicitly.
+
+## Network publishing
+
+QEMU user networking always forwards the private per-instance agent port to
+host loopback. A manifest may additionally contain repeatable TCP mappings from
+`--publish HOST:GUEST`; these are rendered as loopback-only QEMU `hostfwd`
+entries. Validation rejects port zero, duplicate host ports, the instance's
+reserved agent port, collisions with another instance or an already-bound local
+listener at creation time, and publishing in `offline` mode. This feature does
+not expose UDP, bind a LAN address, or provide transport authentication for the
+guest application.
+
+## PE inspection
+
+`lsw inspect` is a host-side parser and does not execute the inspected file. It
+caps input at 512 MiB and bounds PE headers, section-backed RVAs, import tables,
+and strings before reporting architecture, subsystem, CLR and certificate-table
+presence, sections, and imports. Its assessment is advisory: certificate-table
+presence is not Authenticode verification, and compatibility still depends on
+the installed guest and application dependencies.
 
 ## Display design
 

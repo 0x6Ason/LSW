@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     decode_exit, decode_file_length, encode_file_length, read_frame, write_frame, ClientHello,
     FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest, ServerHello, StartRequest,
-    AGENT_PROTOCOL_VERSION,
+    TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
+    CAPABILITY_TERMINAL_RESIZE_V1,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -76,46 +81,98 @@ impl AgentClient {
         request: &StartRequest,
         connect_stdin: bool,
     ) -> Result<i32, Box<dyn std::error::Error>> {
-        if matches!(request.kind, lsw_core::SessionKind::Shell)
-            && !self
-                .capabilities
-                .iter()
-                .any(|capability| capability == "conpty-v1")
-        {
+        let shell_session = matches!(request.kind, lsw_core::SessionKind::Shell);
+        let conpty_available = self.has_capability(CAPABILITY_CONPTY_V1);
+        if shell_session && !conpty_available {
             eprintln!(
                 "lsw: note: this agent provides a pipe shell; ConPTY is not available in this beta build"
             );
         }
-        write_frame(
-            &mut self.stream,
-            &Frame::new(FrameKind::Start, request.encode()?),
-        )?;
 
-        if connect_stdin {
-            let writer = self.stream.try_clone()?;
-            thread::spawn(move || forward_stdin(writer));
+        let terminal = if shell_session && conpty_available && connect_stdin {
+            TerminalModeGuard::enter()?
+        } else {
+            None
+        };
+        let initial_size = terminal
+            .as_ref()
+            .and_then(TerminalModeGuard::size)
+            .unwrap_or_default();
+        if terminal.is_some() {
+            let terminal_request = TerminalStartRequest {
+                size: initial_size,
+                request: request.clone(),
+            };
+            write_frame(
+                &mut self.stream,
+                &Frame::new(FrameKind::TerminalStart, terminal_request.encode()?),
+            )?;
+        } else {
+            write_frame(
+                &mut self.stream,
+                &Frame::new(FrameKind::Start, request.encode()?),
+            )?;
         }
 
-        loop {
-            let frame = read_frame(&mut self.stream)?;
-            match frame.kind {
-                FrameKind::Stdout => {
-                    io::stdout().write_all(&frame.payload)?;
-                    io::stdout().flush()?;
+        let terminal_active = terminal.is_some();
+        let outbound = Arc::new(Mutex::new(self.stream.try_clone()?));
+        let session_stop = Arc::new(AtomicBool::new(false));
+        let input_thread = if connect_stdin {
+            let writer = Arc::clone(&outbound);
+            let stop = Arc::clone(&session_stop);
+            Some(thread::spawn(move || {
+                forward_stdin(writer, stop, terminal_active)
+            }))
+        } else {
+            None
+        };
+
+        let resize_thread =
+            if terminal.is_some() && self.has_capability(CAPABILITY_TERMINAL_RESIZE_V1) {
+                Some(spawn_resize_bridge(
+                    Arc::clone(&outbound),
+                    Arc::clone(&session_stop),
+                    initial_size,
+                ))
+            } else {
+                None
+            };
+
+        let result = (|| -> Result<i32, Box<dyn std::error::Error>> {
+            loop {
+                let frame = read_frame(&mut self.stream)?;
+                match frame.kind {
+                    FrameKind::Stdout => {
+                        io::stdout().write_all(&frame.payload)?;
+                        io::stdout().flush()?;
+                    }
+                    FrameKind::Stderr => {
+                        io::stderr().write_all(&frame.payload)?;
+                        io::stderr().flush()?;
+                    }
+                    FrameKind::Exit => return Ok(decode_exit(&frame.payload)?),
+                    FrameKind::Error => {
+                        return Err(format!(
+                            "guest agent: {}",
+                            String::from_utf8_lossy(&frame.payload)
+                        )
+                        .into())
+                    }
+                    other => return Err(format!("unexpected agent frame {other:?}").into()),
                 }
-                FrameKind::Stderr => {
-                    io::stderr().write_all(&frame.payload)?;
-                    io::stderr().flush()?;
-                }
-                FrameKind::Exit => return Ok(decode_exit(&frame.payload)?),
-                FrameKind::Error => {
-                    return Err(
-                        format!("guest agent: {}", String::from_utf8_lossy(&frame.payload)).into(),
-                    )
-                }
-                other => return Err(format!("unexpected agent frame {other:?}").into()),
+            }
+        })();
+        session_stop.store(true, Ordering::Release);
+        if let Some(resize_thread) = resize_thread {
+            let _ = resize_thread.join();
+        }
+        if terminal_active {
+            if let Some(input_thread) = input_thread {
+                let _ = input_thread.join();
             }
         }
+        drop(terminal);
+        result
     }
 
     pub fn put_file(
@@ -234,30 +291,43 @@ impl AgentClient {
     }
 
     fn require_capability(&self, capability: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if self
-            .capabilities
-            .iter()
-            .any(|available| available == capability)
-        {
+        if self.has_capability(capability) {
             Ok(())
         } else {
             Err(format!("guest agent does not support {capability}").into())
         }
     }
+
+    fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|available| available == capability)
+    }
 }
 
-fn forward_stdin(mut stream: TcpStream) {
+fn forward_stdin(stream: Arc<Mutex<TcpStream>>, stop: Arc<AtomicBool>, terminal_session: bool) {
     let mut stdin = io::stdin().lock();
     let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
     loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
         match stdin.read(&mut buffer) {
+            Ok(0) if terminal_session => {
+                // Unix VMIN=0/VTIME=1 makes an idle terminal read return zero,
+                // allowing this thread to observe session shutdown promptly.
+                continue;
+            }
             Ok(0) => {
-                let _ = stream.shutdown(Shutdown::Write);
+                shutdown_outbound(&stream);
                 return;
             }
             Ok(length) => {
-                if write_frame(
-                    &mut stream,
+                if stop.load(Ordering::Acquire) {
+                    return;
+                }
+                if send_outbound(
+                    &stream,
                     &Frame::new(FrameKind::Stdin, buffer[..length].to_vec()),
                 )
                 .is_err()
@@ -266,11 +336,152 @@ fn forward_stdin(mut stream: TcpStream) {
                 }
             }
             Err(_) => {
-                let _ = stream.shutdown(Shutdown::Write);
+                shutdown_outbound(&stream);
                 return;
             }
         }
     }
+}
+
+fn send_outbound(writer: &Arc<Mutex<TcpStream>>, frame: &Frame) -> io::Result<()> {
+    let mut stream = writer.lock().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "agent stream writer lock was poisoned",
+        )
+    })?;
+    write_frame(&mut *stream, frame).map_err(|error| match error {
+        lsw_core::LswError::Io(error) => error,
+        other => io::Error::new(io::ErrorKind::Other, other.to_string()),
+    })
+}
+
+fn shutdown_outbound(writer: &Arc<Mutex<TcpStream>>) {
+    if let Ok(stream) = writer.lock() {
+        let _ = stream.shutdown(Shutdown::Write);
+    }
+}
+
+fn spawn_resize_bridge(
+    writer: Arc<Mutex<TcpStream>>,
+    stop: Arc<AtomicBool>,
+    initial_size: TerminalSize,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut state = ResizeState::new(initial_size);
+        while !stop.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(150));
+            let Some(size) = terminal_size() else {
+                continue;
+            };
+            if let Some(size) = state.update(size) {
+                if send_outbound(&writer, &Frame::new(FrameKind::Resize, size.encode())).is_err() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+#[derive(Debug)]
+struct ResizeState {
+    last: TerminalSize,
+}
+
+impl ResizeState {
+    fn new(initial: TerminalSize) -> Self {
+        Self { last: initial }
+    }
+
+    fn update(&mut self, current: TerminalSize) -> Option<TerminalSize> {
+        if current == self.last {
+            None
+        } else {
+            self.last = current;
+            Some(current)
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TerminalModeGuard {
+    saved_mode: String,
+}
+
+#[cfg(unix)]
+impl TerminalModeGuard {
+    fn enter() -> io::Result<Option<Self>> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(None);
+        }
+        let saved_mode = run_stty(&["-g"])?;
+        if let Err(error) = run_stty(&["raw", "-echo", "min", "0", "time", "1"]) {
+            let _ = run_stty(&[saved_mode.as_str()]);
+            return Err(error);
+        }
+        Ok(Some(Self { saved_mode }))
+    }
+
+    fn size(&self) -> Option<TerminalSize> {
+        terminal_size()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        let _ = run_stty(&[self.saved_mode.as_str()]);
+    }
+}
+
+#[cfg(not(unix))]
+struct TerminalModeGuard;
+
+#[cfg(not(unix))]
+impl TerminalModeGuard {
+    fn enter() -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+
+    fn size(&self) -> Option<TerminalSize> {
+        None
+    }
+}
+
+#[cfg(unix)]
+fn run_stty(arguments: &[&str]) -> io::Result<String> {
+    let output = Command::new("stty")
+        .args(arguments)
+        // The input bridge reads fd 0, so configure that exact terminal rather
+        // than an independently opened controlling terminal such as /dev/tty.
+        .stdin(Stdio::inherit())
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("stty {} failed with {}", arguments.join(" "), output.status),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "stty returned non-UTF-8 output"))
+}
+
+#[cfg(unix)]
+fn terminal_size() -> Option<TerminalSize> {
+    let output = run_stty(&["size"]).ok()?;
+    let mut dimensions = output.split_whitespace();
+    let rows = dimensions.next()?.parse().ok()?;
+    let columns = dimensions.next()?.parse().ok()?;
+    if dimensions.next().is_some() {
+        return None;
+    }
+    TerminalSize::new(rows, columns).ok()
+}
+
+#[cfg(not(unix))]
+fn terminal_size() -> Option<TerminalSize> {
+    None
 }
 
 pub fn address(manifest: &InstanceManifest) -> SocketAddrV4 {
@@ -301,5 +512,16 @@ mod tests {
     fn agent_address_is_always_loopback() {
         let _ = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5040);
         assert!(Ipv4Addr::LOCALHOST.is_loopback());
+    }
+
+    #[test]
+    fn resize_state_emits_only_real_changes() {
+        let initial = TerminalSize::new(24, 80).expect("initial size should be valid");
+        let changed = TerminalSize::new(40, 120).expect("changed size should be valid");
+        let mut state = ResizeState::new(initial);
+        assert_eq!(state.update(initial), None);
+        assert_eq!(state.update(changed), Some(changed));
+        assert_eq!(state.update(changed), None);
+        assert_eq!(state.last, changed);
     }
 }

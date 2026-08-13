@@ -95,7 +95,14 @@ impl Supervisor {
         phase: LaunchPhase,
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         self.poll();
-        if self.qmp_status(name).is_ok() {
+        if let Ok(qmp_state) = self.qmp_status(name) {
+            let manifest = self.store.load(name)?;
+            if phase == LaunchPhase::Run
+                && manifest.state == InstanceState::Suspended
+                && qmp_state == "paused"
+            {
+                return self.resume(name);
+            }
             return Ok(vec![format!("instance {name} is already running")]);
         }
 
@@ -201,7 +208,7 @@ impl Supervisor {
     ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         self.poll();
         let instance_dir = self.store.instance_dir(name)?;
-        self.store.load(name)?;
+        let manifest = self.store.load(name)?;
         let qmp_path = instance_dir.join("run/qmp.sock");
 
         let mut requested_qmp_quit = false;
@@ -211,6 +218,18 @@ impl Supervisor {
                 requested_qmp_quit = true;
             }
             Ok(mut qmp) => {
+                let status = qmp.status()?;
+                if status == "paused" {
+                    qmp.resume()?;
+                    let resumed_status = qmp.status()?;
+                    if resumed_status != "running" {
+                        return Err(format!(
+                            "QEMU accepted resume before shutdown for {name} but reported unexpected state {resumed_status:?}"
+                        )
+                        .into());
+                    }
+                    self.set_state(name, InstanceState::Running)?;
+                }
                 qmp.system_powerdown()?;
                 write_shutdown_marker(&instance_dir)?;
                 return Ok(vec![format!("graceful shutdown requested for {name}")]);
@@ -220,6 +239,14 @@ impl Supervisor {
             }
             Err(_) => {}
         }
+
+        refuse_unproven_external_force_stop(
+            force,
+            requested_qmp_quit,
+            self.processes.contains_key(name),
+            manifest.state,
+            name,
+        )?;
 
         if let Some(managed) = self.processes.get_mut(name) {
             wait_or_kill(&mut managed.qemu, FORCE_STOP_TIMEOUT)?;
@@ -239,15 +266,25 @@ impl Supervisor {
         self.poll();
         let manifest = self.store.load(name)?;
         match self.qmp_status(name) {
-            Ok(qmp) => Ok(vec![
-                format!("STATE={}", manifest.state),
-                format!("QMP={qmp}"),
-                "ACTIVE=true".to_owned(),
-            ]),
+            Ok(qmp) => {
+                let reconciled = match (manifest.state, qmp.as_str()) {
+                    (InstanceState::Running, "paused") => InstanceState::Suspended,
+                    (InstanceState::Suspended, "running") => InstanceState::Running,
+                    (state, _) => state,
+                };
+                if reconciled != manifest.state {
+                    self.set_state(name, reconciled)?;
+                }
+                Ok(vec![
+                    format!("STATE={reconciled}"),
+                    format!("QMP={qmp}"),
+                    "ACTIVE=true".to_owned(),
+                ])
+            }
             Err(_) => {
                 let state = if matches!(
                     manifest.state,
-                    InstanceState::Running | InstanceState::Installing
+                    InstanceState::Running | InstanceState::Installing | InstanceState::Suspended
                 ) {
                     let requested = self
                         .store
@@ -273,6 +310,73 @@ impl Supervisor {
                 ])
             }
         }
+    }
+
+    pub fn suspend(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        self.poll();
+        let manifest = self.store.load(name)?;
+        if manifest.state == InstanceState::Suspended {
+            if matches!(self.qmp_status(name).as_deref(), Ok("paused")) {
+                return Ok(vec![format!("instance {name} is already suspended")]);
+            }
+            return Err("manifest says the instance is suspended but QMP is not paused".into());
+        }
+        if manifest.state != InstanceState::Running {
+            return Err(format!(
+                "instance {name} cannot be suspended from state {}",
+                manifest.state
+            )
+            .into());
+        }
+
+        let qmp_path = self.store.instance_dir(name)?.join("run/qmp.sock");
+        let mut qmp = QmpClient::connect(&qmp_path)?;
+        let status = qmp.status()?;
+        if status != "running" {
+            return Err(format!(
+                "instance {name} cannot be suspended while QMP reports {status:?}"
+            )
+            .into());
+        }
+        qmp.pause()?;
+        let status = qmp.status()?;
+        if status != "paused" {
+            return Err(format!(
+                "QEMU accepted suspend for {name} but reported unexpected state {status:?}"
+            )
+            .into());
+        }
+        self.set_state(name, InstanceState::Suspended)?;
+        Ok(vec![format!("instance {name} suspended in memory")])
+    }
+
+    pub fn resume(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        self.poll();
+        let manifest = self.store.load(name)?;
+        let qmp_path = self.store.instance_dir(name)?.join("run/qmp.sock");
+        let mut qmp = QmpClient::connect(&qmp_path)?;
+        let status = qmp.status()?;
+
+        if manifest.state == InstanceState::Running && status == "running" {
+            return Ok(vec![format!("instance {name} is already running")]);
+        }
+        if manifest.state != InstanceState::Suspended || status != "paused" {
+            return Err(format!(
+                "instance {name} cannot be resumed from manifest state {} and QMP state {status:?}",
+                manifest.state
+            )
+            .into());
+        }
+        qmp.resume()?;
+        let status = qmp.status()?;
+        if status != "running" {
+            return Err(format!(
+                "QEMU accepted resume for {name} but reported unexpected state {status:?}"
+            )
+            .into());
+        }
+        self.set_state(name, InstanceState::Running)?;
+        Ok(vec![format!("instance {name} resumed")])
     }
 
     pub fn qmp_status(&self, name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -514,6 +618,29 @@ fn wait_for_qmp_disconnect(
     .into())
 }
 
+fn refuse_unproven_external_force_stop(
+    force: bool,
+    requested_qmp_quit: bool,
+    owns_process: bool,
+    state: InstanceState,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if force
+        && !requested_qmp_quit
+        && !owns_process
+        && matches!(
+            state,
+            InstanceState::Running | InstanceState::Installing | InstanceState::Suspended
+        )
+    {
+        return Err(format!(
+            "cannot prove active instance {name} stopped: QMP is unavailable and this daemon does not own its QEMU process; verify or terminate QEMU before changing the manifest"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn stop_helpers(helpers: &mut [Child]) {
     for helper in helpers {
         if helper.try_wait().ok().flatten().is_none() {
@@ -539,5 +666,26 @@ mod tests {
             b"do not remove"
         );
         fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn external_force_stop_requires_proof_that_an_active_vm_stopped() {
+        for state in [
+            InstanceState::Running,
+            InstanceState::Installing,
+            InstanceState::Suspended,
+        ] {
+            assert!(refuse_unproven_external_force_stop(true, false, false, state, "win").is_err());
+            assert!(refuse_unproven_external_force_stop(true, true, false, state, "win").is_ok());
+            assert!(refuse_unproven_external_force_stop(true, false, true, state, "win").is_ok());
+        }
+        assert!(refuse_unproven_external_force_stop(
+            true,
+            false,
+            false,
+            InstanceState::Stopped,
+            "win"
+        )
+        .is_ok());
     }
 }
