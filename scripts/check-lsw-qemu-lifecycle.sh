@@ -65,16 +65,16 @@ cleanup_lifecycle() {
         # lswd is a private session leader. QEMU and swtpm inherit this process
         # group, so cleanup remains exact even if lswd dies before supervising
         # its children. Never discover cleanup targets by name or a broad glob.
-        kill -TERM -- "-$daemon_pid" 2>/dev/null || :
+        kill -TERM "-$daemon_pid" 2>/dev/null || :
         cleanup_attempt=0
-        while kill -0 -- "-$daemon_pid" 2>/dev/null \
+        while kill -0 "-$daemon_pid" 2>/dev/null \
             && [ "$cleanup_attempt" -lt 50 ]
         do
             cleanup_attempt=$((cleanup_attempt + 1))
             sleep 0.1
         done
-        if kill -0 -- "-$daemon_pid" 2>/dev/null; then
-            kill -KILL -- "-$daemon_pid" 2>/dev/null || :
+        if kill -0 "-$daemon_pid" 2>/dev/null; then
+            kill -KILL "-$daemon_pid" 2>/dev/null || :
         fi
         wait "$daemon_pid" 2>/dev/null || :
     fi
