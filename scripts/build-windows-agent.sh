@@ -12,7 +12,7 @@ case "$cargo_target_directory" in
 esac
 export CARGO_TARGET_DIR="$cargo_target_directory"
 
-for required_command in cargo grep mkdir rustc; do
+for required_command in cargo grep mkdir python3 rustc; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "error: required command $required_command was not found" >&2
         exit 1
@@ -85,4 +85,5 @@ if [ ! -f "$agent" ]; then
     echo "error: Cargo completed without producing $agent" >&2
     exit 1
 fi
+python3 "$workspace_root/scripts/normalize-pe-timestamp.py" "$agent"
 echo "$agent"

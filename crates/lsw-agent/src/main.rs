@@ -9,17 +9,18 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind,
-    ServerHello, SessionKind, SessionOptions, StartRequest, TerminalStartRequest, AGENT_GUEST_PORT,
-    AGENT_PROTOCOL_VERSION, CAPABILITY_SESSION_CONTROL_V1, SESSION_CANCEL_EXIT_CODE,
+    ServerHello, SessionKind, SessionLease, SessionLeaseState, SessionOptions, StartRequest,
+    TerminalStartRequest, AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_SESSION_CONTROL_V1,
+    CAPABILITY_SESSION_LEASE_V1, SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
 use lsw_core::{TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_TERMINAL_RESIZE_V1};
@@ -98,18 +99,28 @@ impl Drop for SessionSlot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionMode {
     Legacy,
-    Controlled(SessionOptions),
+    Controlled {
+        options: SessionOptions,
+        lease: Option<SessionLease>,
+    },
 }
 
 impl SessionMode {
     fn is_controlled(self) -> bool {
-        matches!(self, Self::Controlled(_))
+        matches!(self, Self::Controlled { .. })
     }
 
     fn cancel_on_disconnect(self) -> bool {
         match self {
             Self::Legacy => false,
-            Self::Controlled(options) => options.cancel_on_disconnect,
+            Self::Controlled { options, .. } => options.cancel_on_disconnect,
+        }
+    }
+
+    fn lease(self) -> Option<SessionLease> {
+        match self {
+            Self::Legacy => None,
+            Self::Controlled { lease, .. } => lease,
         }
     }
 }
@@ -118,6 +129,7 @@ impl SessionMode {
 enum SessionControlEvent {
     Cancel,
     Disconnect,
+    Heartbeat(Instant),
     ProtocolError(String),
 }
 
@@ -126,7 +138,44 @@ enum SessionEnd {
     Normal,
     Cancelled,
     Disconnected,
+    LeaseExpired,
     ProtocolError(String),
+}
+
+struct SessionLeaseMonitor {
+    origin: Instant,
+    state: SessionLeaseState,
+}
+
+impl SessionLeaseMonitor {
+    fn new(lease: SessionLease) -> Self {
+        Self {
+            origin: Instant::now(),
+            state: SessionLeaseState::new(lease, 0),
+        }
+    }
+
+    fn millis_at(&self, instant: Instant) -> u64 {
+        u64::try_from(instant.saturating_duration_since(self.origin).as_millis())
+            .unwrap_or(u64::MAX)
+    }
+
+    fn observe_heartbeat(&mut self, observed_at: Instant) -> bool {
+        let elapsed = self.millis_at(observed_at);
+        self.state.observe_heartbeat(elapsed)
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        self.state.is_expired(self.millis_at(now))
+    }
+
+    fn wait_duration(&self, now: Instant) -> Duration {
+        let remaining = self
+            .state
+            .deadline_millis()
+            .saturating_sub(self.millis_at(now));
+        PROCESS_POLL_INTERVAL.min(Duration::from_millis(remaining))
+    }
 }
 
 fn handle_connection(
@@ -182,18 +231,31 @@ fn handle_connection(
                 return Err(error.into());
             }
         };
-        let request_frame = read_frame(&mut stream)?;
+        let mut request_frame = read_frame(&mut stream)?;
+        let lease = if request_frame.kind == FrameKind::SessionLease {
+            let lease = match SessionLease::decode(&request_frame.payload) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    send_error(&mut stream, &error.to_string())?;
+                    return Err(error.into());
+                }
+            };
+            request_frame = read_frame(&mut stream)?;
+            Some(lease)
+        } else {
+            None
+        };
         if !matches!(
             request_frame.kind,
             FrameKind::Start | FrameKind::TerminalStart
         ) {
             send_error(
                 &mut stream,
-                "SESSION_OPTIONS must be followed by START or TERMINAL_START",
+                "SESSION_OPTIONS may be followed by one SESSION_LEASE, then must be followed by START or TERMINAL_START",
             )?;
             return Err("client sent an invalid controlled-session request".into());
         }
-        (request_frame, SessionMode::Controlled(options))
+        (request_frame, SessionMode::Controlled { options, lease })
     } else {
         (request_frame, SessionMode::Legacy)
     };
@@ -218,6 +280,7 @@ fn agent_capabilities() -> Vec<String> {
         "stderr-v1".to_owned(),
         "file-transfer-v1".to_owned(),
         CAPABILITY_SESSION_CONTROL_V1.to_owned(),
+        CAPABILITY_SESSION_LEASE_V1.to_owned(),
     ];
     #[cfg(windows)]
     let capabilities = {
@@ -418,7 +481,477 @@ fn upload_temporary_path(destination: &Path) -> Result<PathBuf, Box<dyn std::err
     )))
 }
 
-fn spawn_request(request: &StartRequest) -> Result<Child, Box<dyn std::error::Error>> {
+/// A process whose ordinary descendants share one agent-session owner.
+///
+/// The platform owner is established before user code can run: Unix children
+/// enter a fresh process group in `Command`'s pre-exec path, while Windows
+/// children start suspended and are resumed only after assignment to a Job
+/// Object. Unix process groups are lifecycle bookkeeping, not a sandbox: a
+/// process with sufficient permission can deliberately leave its group. Tree
+/// teardown also happens after a normal leader exit, because an ordinary
+/// descendant may otherwise keep the session's stdout/stderr pipes open.
+struct SessionChild {
+    process: Child,
+    tree: Option<process_tree::Owner>,
+}
+
+impl SessionChild {
+    fn spawn(command: &mut Command) -> io::Result<Self> {
+        let prepared = process_tree::Prepared::new(command)?;
+        let mut process = command.spawn()?;
+        match prepared.attach_and_start(&process) {
+            Ok(tree) => Ok(Self {
+                process,
+                tree: Some(tree),
+            }),
+            Err(error) => {
+                // A Windows child is still suspended if Job assignment or
+                // primary-thread resume failed. Do not leave it behind.
+                let _ = process.kill();
+                let _ = process.wait();
+                Err(error)
+            }
+        }
+    }
+
+    fn try_wait_and_cleanup(&mut self) -> io::Result<Option<ExitStatus>> {
+        let Some(status) = self.process.try_wait()? else {
+            return Ok(None);
+        };
+        self.terminate_tree()?;
+        Ok(Some(status))
+    }
+
+    fn wait_and_cleanup(&mut self) -> io::Result<ExitStatus> {
+        let status = self.process.wait()?;
+        self.terminate_tree()?;
+        Ok(status)
+    }
+
+    /// Returns the leader status and whether this call won the race to issue
+    /// process-tree termination.
+    fn terminate(&mut self) -> io::Result<(ExitStatus, bool)> {
+        if let Some(status) = self.process.try_wait()? {
+            self.terminate_tree()?;
+            return Ok((status, false));
+        }
+        self.terminate_tree()?;
+        Ok((self.process.wait()?, true))
+    }
+
+    /// Process-tree ownership is one-shot. A Unix process-group id may be
+    /// reused after its last member exits, so a later signal from Drop could
+    /// otherwise target an unrelated group. A successful cleanup disarms it;
+    /// a failed cleanup restores it only so Drop can make one best-effort retry.
+    fn terminate_tree(&mut self) -> io::Result<()> {
+        let Some(tree) = self.tree.take() else {
+            return Ok(());
+        };
+        match tree.terminate(SESSION_CANCEL_EXIT_CODE) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.tree = Some(tree);
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn kill(&mut self) -> io::Result<()> {
+        self.terminate_tree()
+    }
+
+    #[cfg(all(test, unix))]
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.wait_and_cleanup()
+    }
+}
+
+impl Drop for SessionChild {
+    fn drop(&mut self) {
+        // This guard covers bridge setup errors and panics. Explicit lifecycle
+        // paths report failures; Drop is deliberately best-effort. Once the
+        // owner is disarmed an explicit path has already terminated the group;
+        // do not signal the leader PID again because Unix may have reused it.
+        if self.tree.is_none() {
+            return;
+        }
+        if self.terminate_tree().is_ok() {
+            let _ = self.process.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod process_tree {
+    use std::io;
+    use std::os::raw::c_int;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+
+    const SIGKILL: c_int = 9;
+    // ESRCH is 3 on the Unix platforms supported by Rust. It means the group
+    // is already empty, which is a successful teardown outcome.
+    const ESRCH: i32 = 3;
+
+    extern "C" {
+        fn kill(pid: c_int, signal: c_int) -> c_int;
+    }
+
+    pub(super) struct Prepared;
+
+    impl Prepared {
+        pub(super) fn new(command: &mut Command) -> io::Result<Self> {
+            // `process_group(0)` arranges setpgid(0, 0) after fork and before
+            // exec. This closes the ordinary spawn-before-ownership race, but
+            // does not prevent guest code from later creating a new session or
+            // process group; process-group ownership is not a sandbox.
+            command.process_group(0);
+            Ok(Self)
+        }
+
+        pub(super) fn attach_and_start(self, child: &Child) -> io::Result<Owner> {
+            let process_group = c_int::try_from(child.id()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "child process id exceeds pid_t")
+            })?;
+            Ok(Owner { process_group })
+        }
+    }
+
+    pub(super) struct Owner {
+        process_group: c_int,
+    }
+
+    impl Owner {
+        pub(super) fn terminate(&self, _exit_code: i32) -> io::Result<()> {
+            // A negative pid addresses the process group. process_group is a
+            // validated positive child pid, so negation cannot overflow.
+            if unsafe { kill(-self.process_group, SIGKILL) } == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod process_tree {
+    use std::ffi::c_void;
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command};
+    use std::ptr;
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
+    const RESUME_THREAD_FAILED: u32 = u32::MAX;
+    #[cfg(test)]
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    #[cfg(test)]
+    const WAIT_OBJECT_0: u32 = 0;
+    #[cfg(test)]
+    const WAIT_TIMEOUT: u32 = 258;
+    #[cfg(test)]
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+
+    type Handle = RawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectBasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct IoCounters {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectExtendedLimitInformation {
+        basic_limit_information: JobObjectBasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    #[repr(C)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    impl ThreadEntry32 {
+        fn empty() -> io::Result<Self> {
+            Ok(Self {
+                size: u32::try_from(size_of::<Self>()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "THREADENTRY32 is too large")
+                })?,
+                usage: 0,
+                thread_id: 0,
+                owner_process_id: 0,
+                base_priority: 0,
+                delta_priority: 0,
+                flags: 0,
+            })
+        }
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "AssignProcessToJobObject"]
+        fn assign_process_to_job_object(job: Handle, process: Handle) -> i32;
+        #[link_name = "CreateJobObjectW"]
+        fn create_job_object_w(attributes: *mut c_void, name: *const u16) -> Handle;
+        #[link_name = "CreateToolhelp32Snapshot"]
+        fn create_toolhelp32_snapshot(flags: u32, process_id: u32) -> Handle;
+        #[link_name = "OpenThread"]
+        fn open_thread(access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
+        #[cfg(test)]
+        #[link_name = "OpenProcess"]
+        fn open_process(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        #[link_name = "ResumeThread"]
+        fn resume_thread(thread: Handle) -> u32;
+        #[link_name = "SetInformationJobObject"]
+        fn set_information_job_object(
+            job: Handle,
+            information_class: u32,
+            information: *const c_void,
+            information_length: u32,
+        ) -> i32;
+        #[link_name = "TerminateJobObject"]
+        fn terminate_job_object(job: Handle, exit_code: u32) -> i32;
+        #[link_name = "Thread32First"]
+        fn thread32_first(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        #[link_name = "Thread32Next"]
+        fn thread32_next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        #[cfg(test)]
+        #[link_name = "WaitForSingleObject"]
+        fn wait_for_single_object(handle: Handle, milliseconds: u32) -> u32;
+    }
+
+    pub(super) struct Prepared {
+        job: Job,
+    }
+
+    impl Prepared {
+        pub(super) fn new(command: &mut Command) -> io::Result<Self> {
+            let job = Job::new()?;
+            command.creation_flags(CREATE_SUSPENDED);
+            Ok(Self { job })
+        }
+
+        pub(super) fn attach_and_start(self, child: &Child) -> io::Result<Owner> {
+            self.job.assign(child.as_raw_handle())?;
+            resume_only_suspended_thread(child.id())?;
+            Ok(Owner { job: self.job })
+        }
+    }
+
+    pub(super) struct Owner {
+        job: Job,
+    }
+
+    impl Owner {
+        pub(super) fn terminate(&self, exit_code: i32) -> io::Result<()> {
+            self.job.terminate(exit_code)
+        }
+    }
+
+    pub(super) struct Job {
+        handle: OwnedHandle,
+    }
+
+    impl Job {
+        pub(super) fn new() -> io::Result<Self> {
+            let handle = unsafe { create_job_object_w(ptr::null_mut(), ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+            let mut information = JobObjectExtendedLimitInformation::default();
+            information.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let information_length = u32::try_from(size_of::<JobObjectExtendedLimitInformation>())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "Job information is too large")
+                })?;
+            if unsafe {
+                set_information_job_object(
+                    handle.as_raw_handle(),
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+                    (&information as *const JobObjectExtendedLimitInformation).cast::<c_void>(),
+                    information_length,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { handle })
+        }
+
+        pub(super) fn assign(&self, process: RawHandle) -> io::Result<()> {
+            if unsafe { assign_process_to_job_object(self.handle.as_raw_handle(), process) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+
+        pub(super) fn terminate(&self, exit_code: i32) -> io::Result<()> {
+            let exit_code = u32::try_from(exit_code).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Job exit code must be non-negative",
+                )
+            })?;
+            if unsafe { terminate_job_object(self.handle.as_raw_handle(), exit_code) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// `std::process::Child` does not expose the primary thread handle. A
+    /// CREATE_SUSPENDED process has exactly one thread before any guest code
+    /// runs, so identify it by owner PID and fail closed if the snapshot shows
+    /// zero or multiple candidates.
+    fn resume_only_suspended_thread(process_id: u32) -> io::Result<()> {
+        let snapshot = unsafe { create_toolhelp32_snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == (-1_isize as RawHandle) {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+        let mut entry = ThreadEntry32::empty()?;
+        if unsafe { thread32_first(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut suspended_thread_id = None;
+        loop {
+            if entry.owner_process_id == process_id
+                && suspended_thread_id.replace(entry.thread_id).is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "suspended process unexpectedly has more than one thread",
+                ));
+            }
+            if unsafe { thread32_next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+                break;
+            }
+        }
+        let thread_id = suspended_thread_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not find the suspended process primary thread",
+            )
+        })?;
+        let thread = unsafe { open_thread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+        if thread.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+        resume_thread_handle(thread.as_raw_handle())
+    }
+
+    pub(super) fn resume_thread_handle(thread: RawHandle) -> io::Result<()> {
+        if unsafe { resume_thread(thread) } == RESUME_THREAD_FAILED {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_for_process_id_exit(process_id: u32, milliseconds: u32) -> io::Result<bool> {
+        let process = unsafe { open_process(SYNCHRONIZE, 0, process_id) };
+        if process.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                Ok(true)
+            } else {
+                Err(error)
+            };
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        match unsafe { wait_for_single_object(process.as_raw_handle(), milliseconds) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn ffi_layout_sizes() -> (usize, usize, usize) {
+        (
+            size_of::<JobObjectBasicLimitInformation>(),
+            size_of::<JobObjectExtendedLimitInformation>(),
+            size_of::<ThreadEntry32>(),
+        )
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+mod process_tree {
+    use std::io;
+    use std::process::{Child, Command};
+
+    pub(super) struct Prepared;
+
+    impl Prepared {
+        pub(super) fn new(_command: &mut Command) -> io::Result<Self> {
+            Ok(Self)
+        }
+
+        pub(super) fn attach_and_start(self, _child: &Child) -> io::Result<Owner> {
+            Ok(Owner)
+        }
+    }
+
+    pub(super) struct Owner;
+
+    impl Owner {
+        pub(super) fn terminate(&self, _exit_code: i32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+fn spawn_request(request: &StartRequest) -> Result<SessionChild, Box<dyn std::error::Error>> {
     match request.kind {
         SessionKind::Shell => spawn_shell(request),
         SessionKind::Exec | SessionKind::Run => {
@@ -432,7 +965,7 @@ fn spawn_request(request: &StartRequest) -> Result<Child, Box<dyn std::error::Er
     }
 }
 
-fn spawn_shell(request: &StartRequest) -> Result<Child, Box<dyn std::error::Error>> {
+fn spawn_shell(request: &StartRequest) -> Result<SessionChild, Box<dyn std::error::Error>> {
     let mut last_not_found = None;
     for candidate in &request.argv {
         let shell_arguments = match candidate.to_ascii_lowercase().as_str() {
@@ -460,7 +993,7 @@ fn spawn_program(
     program: &str,
     arguments: &[impl AsRef<std::ffi::OsStr>],
     working_directory: Option<&str>,
-) -> io::Result<Child> {
+) -> io::Result<SessionChild> {
     let mut command = Command::new(program);
     command
         .args(arguments)
@@ -470,31 +1003,53 @@ fn spawn_program(
     if let Some(directory) = working_directory {
         command.current_dir(directory);
     }
-    command.spawn()
+    SessionChild::spawn(&mut command)
 }
 
 fn bridge_process(
-    child: &mut Child,
+    child: &mut SessionChild,
     stream: TcpStream,
     session_mode: SessionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let child_stdin = child.stdin.take().ok_or("child stdin was not piped")?;
-    let child_stdout = child.stdout.take().ok_or("child stdout was not piped")?;
-    let child_stderr = child.stderr.take().ok_or("child stderr was not piped")?;
+    let child_stdin = child
+        .process
+        .stdin
+        .take()
+        .ok_or("child stdin was not piped")?;
+    let child_stdout = child
+        .process
+        .stdout
+        .take()
+        .ok_or("child stdout was not piped")?;
+    let child_stderr = child
+        .process
+        .stderr
+        .take()
+        .ok_or("child stderr was not piped")?;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let input_shutdown = stream.try_clone()?;
-    let (control_sender, control_receiver) = mpsc::channel();
+    // A one-event queue applies backpressure to authenticated heartbeat floods
+    // without allowing them to delay cancellation by an unbounded amount.
+    let (control_sender, control_receiver) = mpsc::sync_channel(1);
 
     let stdout_thread = spawn_output_bridge(child_stdout, Arc::clone(&writer), FrameKind::Stdout);
     let stderr_thread = spawn_output_bridge(child_stderr, Arc::clone(&writer), FrameKind::Stderr);
     let input_thread = spawn_input_bridge(stream, child_stdin, session_mode, control_sender);
 
-    let (status, session_end) = wait_for_child(child, &control_receiver)?;
-    let _ = input_shutdown.shutdown(Shutdown::Read);
+    let (status, session_end) = wait_for_child(child, &control_receiver, session_mode)?;
+    drop(control_receiver);
+    let peer_unavailable = matches!(
+        session_end,
+        SessionEnd::Disconnected | SessionEnd::LeaseExpired
+    );
+    let _ = input_shutdown.shutdown(if session_end == SessionEnd::LeaseExpired {
+        Shutdown::Both
+    } else {
+        Shutdown::Read
+    });
     join_input_bridge(input_thread)?;
-    let peer_disconnected = session_end == SessionEnd::Disconnected;
-    join_bridge(stdout_thread, peer_disconnected)?;
-    join_bridge(stderr_thread, peer_disconnected)?;
+    join_bridge(stdout_thread, peer_unavailable)?;
+    join_bridge(stderr_thread, peer_unavailable)?;
     finish_session(&writer, session_end, status.code().unwrap_or(255))
 }
 
@@ -509,10 +1064,11 @@ fn bridge_terminal(
         input,
         output,
         console,
+        job,
     } = process;
     let writer = Arc::new(Mutex::new(stream.try_clone()?));
     let input_shutdown = stream.try_clone()?;
-    let (control_sender, control_receiver) = mpsc::channel();
+    let (control_sender, control_receiver) = mpsc::sync_channel(1);
     let output_thread = spawn_output_bridge(output, Arc::clone(&writer), FrameKind::Stdout);
     let input_thread = spawn_terminal_input_bridge(
         stream,
@@ -522,23 +1078,50 @@ fn bridge_terminal(
         control_sender,
     );
 
-    let (code, session_end) = wait_for_terminal_process(&process, &control_receiver)?;
-    let _ = input_shutdown.shutdown(Shutdown::Read);
+    let (code, session_end) =
+        wait_for_terminal_process(&process, &job, &control_receiver, session_mode)?;
+    drop(control_receiver);
+    let peer_unavailable = matches!(
+        session_end,
+        SessionEnd::Disconnected | SessionEnd::LeaseExpired
+    );
+    let _ = input_shutdown.shutdown(if session_end == SessionEnd::LeaseExpired {
+        Shutdown::Both
+    } else {
+        Shutdown::Read
+    });
     join_terminal_input(input_thread)?;
     drop(console);
-    join_bridge(output_thread, session_end == SessionEnd::Disconnected)?;
+    join_bridge(output_thread, peer_unavailable)?;
     finish_session(&writer, session_end, code)
 }
 
 fn wait_for_child(
-    child: &mut Child,
+    child: &mut SessionChild,
     controls: &Receiver<SessionControlEvent>,
+    session_mode: SessionMode,
 ) -> Result<(ExitStatus, SessionEnd), Box<dyn std::error::Error>> {
+    let mut lease = session_mode.lease().map(SessionLeaseMonitor::new);
+    let mut controls_connected = true;
     loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.try_wait_and_cleanup()? {
             return Ok((status, SessionEnd::Normal));
         }
-        match controls.recv_timeout(PROCESS_POLL_INTERVAL) {
+        let wait_duration = lease.as_ref().map_or(PROCESS_POLL_INTERVAL, |lease| {
+            lease.wait_duration(Instant::now())
+        });
+        if !controls_connected {
+            thread::sleep(wait_duration);
+            if lease
+                .as_ref()
+                .is_some_and(|lease| lease.is_expired(Instant::now()))
+            {
+                let (status, terminated) = terminate_child(child)?;
+                return Ok((status, lease_session_end(terminated)));
+            }
+            continue;
+        }
+        match controls.recv_timeout(wait_duration) {
             Ok(SessionControlEvent::Cancel) => {
                 let (status, terminated) = terminate_child(child)?;
                 return Ok((status, cancel_session_end(terminated)));
@@ -552,8 +1135,35 @@ fn wait_for_child(
                     SessionEnd::ProtocolError(message),
                 ))
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Ok((child.wait()?, SessionEnd::Normal)),
+            Ok(SessionControlEvent::Heartbeat(observed_at)) => {
+                let Some(lease) = lease.as_mut() else {
+                    return Ok((
+                        terminate_child(child)?.0,
+                        SessionEnd::ProtocolError(
+                            "heartbeat was reported for a session without a lease".to_owned(),
+                        ),
+                    ));
+                };
+                if !lease.observe_heartbeat(observed_at) {
+                    let (status, terminated) = terminate_child(child)?;
+                    return Ok((status, lease_session_end(terminated)));
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.is_expired(Instant::now()))
+                {
+                    let (status, terminated) = terminate_child(child)?;
+                    return Ok((status, lease_session_end(terminated)));
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if lease.is_none() {
+                    return Ok((child.wait_and_cleanup()?, SessionEnd::Normal));
+                }
+                controls_connected = false;
+            }
         }
     }
 }
@@ -566,49 +1176,93 @@ fn cancel_session_end(process_was_terminated: bool) -> SessionEnd {
     }
 }
 
+fn lease_session_end(process_was_terminated: bool) -> SessionEnd {
+    if process_was_terminated {
+        SessionEnd::LeaseExpired
+    } else {
+        SessionEnd::Normal
+    }
+}
+
 /// Returns the exit status and whether this call actually issued a kill.
-fn terminate_child(child: &mut Child) -> io::Result<(ExitStatus, bool)> {
-    if let Some(status) = child.try_wait()? {
-        return Ok((status, false));
-    }
-    if let Err(error) = child.kill() {
-        if let Some(status) = child.try_wait()? {
-            return Ok((status, false));
-        }
-        return Err(error);
-    }
-    Ok((child.wait()?, true))
+fn terminate_child(child: &mut SessionChild) -> io::Result<(ExitStatus, bool)> {
+    child.terminate()
 }
 
 #[cfg(windows)]
 fn wait_for_terminal_process(
     process: &std::os::windows::io::OwnedHandle,
+    job: &process_tree::Job,
     controls: &Receiver<SessionControlEvent>,
+    session_mode: SessionMode,
 ) -> Result<(i32, SessionEnd), Box<dyn std::error::Error>> {
-    let poll_milliseconds = u32::try_from(PROCESS_POLL_INTERVAL.as_millis())
-        .expect("the process poll interval fits in a u32");
+    let mut lease = session_mode.lease().map(SessionLeaseMonitor::new);
+    let mut controls_connected = true;
     loop {
+        let wait_duration = lease.as_ref().map_or(PROCESS_POLL_INTERVAL, |lease| {
+            lease.wait_duration(Instant::now())
+        });
+        let poll_milliseconds = u32::try_from(wait_duration.as_millis())
+            .expect("the process poll interval fits in a u32");
         if let Some(code) = windows_conpty::wait_for_process_timeout(process, poll_milliseconds)? {
+            job.terminate(SESSION_CANCEL_EXIT_CODE)?;
             return Ok((code, SessionEnd::Normal));
+        }
+        if !controls_connected {
+            if lease
+                .as_ref()
+                .is_some_and(|lease| lease.is_expired(Instant::now()))
+            {
+                if let Some(code) = windows_conpty::wait_for_process_timeout(process, 0)? {
+                    job.terminate(SESSION_CANCEL_EXIT_CODE)?;
+                    return Ok((code, SessionEnd::Normal));
+                }
+                job.terminate(SESSION_CANCEL_EXIT_CODE)?;
+                return Ok((
+                    windows_conpty::wait_for_process(process)?,
+                    SessionEnd::LeaseExpired,
+                ));
+            }
+            continue;
         }
         let session_end = match controls.try_recv() {
             Ok(SessionControlEvent::Cancel) => SessionEnd::Cancelled,
             Ok(SessionControlEvent::Disconnect) => SessionEnd::Disconnected,
             Ok(SessionControlEvent::ProtocolError(message)) => SessionEnd::ProtocolError(message),
-            Err(mpsc::TryRecvError::Empty) => continue,
+            Ok(SessionControlEvent::Heartbeat(observed_at)) => {
+                let Some(lease) = lease.as_mut() else {
+                    return Err("heartbeat was reported for a session without a lease".into());
+                };
+                if lease.observe_heartbeat(observed_at) {
+                    continue;
+                }
+                SessionEnd::LeaseExpired
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.is_expired(Instant::now()))
+                {
+                    SessionEnd::LeaseExpired
+                } else {
+                    continue;
+                }
+            }
             Err(mpsc::TryRecvError::Disconnected) => {
-                return Ok((
-                    windows_conpty::wait_for_process(process)?,
-                    SessionEnd::Normal,
-                ))
+                if lease.is_none() {
+                    let code = windows_conpty::wait_for_process(process)?;
+                    job.terminate(SESSION_CANCEL_EXIT_CODE)?;
+                    return Ok((code, SessionEnd::Normal));
+                }
+                controls_connected = false;
+                continue;
             }
         };
         if let Some(code) = windows_conpty::wait_for_process_timeout(process, 0)? {
+            job.terminate(SESSION_CANCEL_EXIT_CODE)?;
             return Ok((code, SessionEnd::Normal));
         }
-        let cancel_exit_code = u32::try_from(SESSION_CANCEL_EXIT_CODE)
-            .expect("the session cancel exit code is non-negative");
-        if let Err(error) = windows_conpty::terminate_process(process, cancel_exit_code) {
+        if let Err(error) = job.terminate(SESSION_CANCEL_EXIT_CODE) {
             if let Some(code) = windows_conpty::wait_for_process_timeout(process, 0)? {
                 return Ok((code, SessionEnd::Normal));
             }
@@ -640,7 +1294,7 @@ fn spawn_input_bridge(
     mut stream: TcpStream,
     child_stdin: impl Write + Send + 'static,
     session_mode: SessionMode,
-    control_sender: Sender<SessionControlEvent>,
+    control_sender: SyncSender<SessionControlEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut child_stdin = Some(child_stdin);
@@ -704,6 +1358,22 @@ fn spawn_input_bridge(
                     let _ = control_sender.send(SessionControlEvent::Cancel);
                     return;
                 }
+                Ok(frame) if frame.kind == FrameKind::SessionHeartbeat => {
+                    if session_mode.lease().is_none() || !frame.payload.is_empty() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "SESSION_HEARTBEAT requires a leased session and an empty payload",
+                        );
+                        return;
+                    }
+                    if control_sender
+                        .send(SessionControlEvent::Heartbeat(Instant::now()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
                 Ok(frame) => {
                     report_protocol_error(
                         &control_sender,
@@ -734,7 +1404,7 @@ fn spawn_terminal_input_bridge(
     input: impl Write + Send + 'static,
     console: Arc<windows_conpty::PseudoConsole>,
     session_mode: SessionMode,
-    control_sender: Sender<SessionControlEvent>,
+    control_sender: SyncSender<SessionControlEvent>,
 ) -> thread::JoinHandle<Result<(), String>> {
     thread::spawn(move || {
         let mut input = Some(input);
@@ -808,6 +1478,22 @@ fn spawn_terminal_input_bridge(
                     let _ = control_sender.send(SessionControlEvent::Cancel);
                     return Ok(());
                 }
+                Ok(frame) if frame.kind == FrameKind::SessionHeartbeat => {
+                    if session_mode.lease().is_none() || !frame.payload.is_empty() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "SESSION_HEARTBEAT requires a leased session and an empty payload",
+                        );
+                        return Ok(());
+                    }
+                    if control_sender
+                        .send(SessionControlEvent::Heartbeat(Instant::now()))
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
                 Ok(frame) => {
                     let message = format!("unexpected {:?} frame in terminal session", frame.kind);
                     if session_mode.is_controlled() {
@@ -838,7 +1524,7 @@ fn spawn_terminal_input_bridge(
 
 #[cfg(windows)]
 fn terminal_bridge_failure(
-    sender: &Sender<SessionControlEvent>,
+    sender: &SyncSender<SessionControlEvent>,
     session_mode: SessionMode,
     message: String,
 ) -> Result<(), String> {
@@ -851,7 +1537,7 @@ fn terminal_bridge_failure(
 }
 
 fn report_protocol_error(
-    sender: &Sender<SessionControlEvent>,
+    sender: &SyncSender<SessionControlEvent>,
     session_mode: SessionMode,
     message: &str,
 ) {
@@ -904,6 +1590,10 @@ fn finish_session(
             &Frame::new(FrameKind::Exit, encode_exit(SESSION_CANCEL_EXIT_CODE)),
         ),
         SessionEnd::Disconnected => Ok(()),
+        // The socket was shut down before joining the output bridges so a
+        // half-open peer that stopped reading cannot retain this session slot.
+        // Do not try to reacquire the possibly contended writer mutex here.
+        SessionEnd::LeaseExpired => Err("session heartbeat lease expired".into()),
         SessionEnd::ProtocolError(message) => {
             send_shared(
                 writer,
@@ -1006,6 +1696,7 @@ mod windows_conpty {
     type PseudoConsoleHandle = RawHandle;
 
     const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
     const INFINITE: u32 = u32::MAX;
     const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
     const WAIT_OBJECT_0: u32 = 0;
@@ -1240,6 +1931,7 @@ mod windows_conpty {
         pub(super) input: File,
         pub(super) output: File,
         pub(super) console: Arc<PseudoConsole>,
+        pub(super) job: super::process_tree::Job,
     }
 
     pub(super) fn spawn_shell(
@@ -1286,6 +1978,7 @@ mod windows_conpty {
     ) -> io::Result<ConPtyProcess> {
         let (pseudo_input, input) = new_pipe()?;
         let (output, pseudo_output) = new_pipe()?;
+        let job = super::process_tree::Job::new()?;
         let console = Arc::new(PseudoConsole::create(
             size,
             pseudo_input.as_raw_handle(),
@@ -1329,7 +2022,7 @@ mod windows_conpty {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 ptr::null_mut(),
                 current_directory_pointer,
                 &mut startup.startup_info,
@@ -1343,12 +2036,24 @@ mod windows_conpty {
         }
         let process = unsafe { OwnedHandle::from_raw_handle(information.process) };
         let thread = unsafe { OwnedHandle::from_raw_handle(information.thread) };
+        if let Err(error) = job.assign(process.as_raw_handle()) {
+            let cleanup = terminate_process(&process, super::SESSION_CANCEL_EXIT_CODE as u32)
+                .and_then(|()| wait_for_process(&process).map(|_| ()));
+            return Err(process_setup_error("Job assignment", error, cleanup));
+        }
+        if let Err(error) = super::process_tree::resume_thread_handle(thread.as_raw_handle()) {
+            let cleanup = job
+                .terminate(super::SESSION_CANCEL_EXIT_CODE)
+                .and_then(|()| wait_for_process(&process).map(|_| ()));
+            return Err(process_setup_error("primary-thread resume", error, cleanup));
+        }
         drop(thread);
         Ok(ConPtyProcess {
             process,
             input,
             output,
             console,
+            job,
         })
     }
 
@@ -1384,6 +2089,22 @@ mod windows_conpty {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
+        }
+    }
+
+    fn process_setup_error(
+        operation: &str,
+        error: io::Error,
+        cleanup: io::Result<()>,
+    ) -> io::Error {
+        match cleanup {
+            Ok(()) => error,
+            Err(cleanup_error) => io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "{operation} failed: {error}; suspended process cleanup also failed: {cleanup_error}"
+                ),
+            ),
         }
     }
 
@@ -1493,6 +2214,7 @@ impl Configuration {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn shell_fallback_reaches_a_known_program() {
         let request = StartRequest {
@@ -1502,7 +2224,21 @@ mod tests {
         };
         let mut child = spawn_request(&request).expect("sh fallback should start");
         child.kill().expect("fixture process should stop");
+        assert!(
+            child.tree.is_none(),
+            "successful teardown must disarm owner"
+        );
+        child
+            .kill()
+            .expect("a repeated cleanup request must be a no-op");
         child.wait().expect("fixture process should be reaped");
+        assert!(
+            child.tree.is_none(),
+            "wait and Drop must not re-signal PGID"
+        );
+        // Exercise Drop with an already-reaped leader and disarmed owner. It
+        // must not call Child::kill on a potentially reused Unix PID.
+        drop(child);
     }
 
     #[test]
@@ -1542,6 +2278,12 @@ mod tests {
     }
 
     #[test]
+    fn normal_exit_wins_a_lease_expiry_race() {
+        assert_eq!(lease_session_end(false), SessionEnd::Normal);
+        assert_eq!(lease_session_end(true), SessionEnd::LeaseExpired);
+    }
+
+    #[test]
     fn windows_command_line_quotes_empty_and_space_containing_arguments() {
         assert_eq!(windows_command_line("", &[]), "\"\"");
         assert_eq!(
@@ -1566,6 +2308,88 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_pipe_job_terminates_a_spawned_descendant() {
+        use std::io::{BufRead, BufReader};
+
+        let script = r#"$p = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList @('-n','30','127.0.0.1') -PassThru; [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush(); Wait-Process -Id $p.Id"#;
+        let mut child = spawn_program(
+            "powershell.exe",
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ],
+            None,
+        )
+        .expect("PowerShell should start inside a Job Object");
+        let stdout = child
+            .process
+            .stdout
+            .take()
+            .expect("PowerShell stdout should be piped");
+        let (line_sender, line_receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
+            let _ = line_sender.send(result);
+        });
+        let descendant = line_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("PowerShell should report its descendant promptly")
+            .expect("PowerShell descendant output should be readable")
+            .trim()
+            .parse::<u32>()
+            .expect("PowerShell should report a numeric descendant PID");
+
+        let (_, terminated) = child
+            .terminate()
+            .expect("Job Object termination should succeed");
+        assert!(terminated);
+        reader.join().expect("stdout reader should not panic");
+        assert!(
+            process_tree::wait_for_process_id_exit(descendant, 2_000)
+                .expect("descendant state should be queryable"),
+            "the Job Object descendant was still running after session cancellation"
+        );
+    }
+
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn windows_job_ffi_layout_matches_the_x64_sdk_abi() {
+        assert_eq!(process_tree::ffi_layout_sizes(), (64, 144, 28));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_process_starts_inside_a_job() {
+        let request = StartRequest {
+            kind: SessionKind::Shell,
+            argv: vec!["cmd.exe".to_owned()],
+            working_directory: None,
+        };
+        let process = windows_conpty::spawn_shell(
+            &request,
+            TerminalSize {
+                columns: 80,
+                rows: 25,
+            },
+        )
+        .expect("ConPTY shell should start suspended, join its Job, and resume");
+        process
+            .job
+            .terminate(SESSION_CANCEL_EXIT_CODE)
+            .expect("ConPTY Job termination should succeed");
+        assert_eq!(
+            windows_conpty::wait_for_process(&process.process)
+                .expect("ConPTY process should become signalled"),
+            SESSION_CANCEL_EXIT_CODE
+        );
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn non_windows_agent_does_not_advertise_conpty() {
@@ -1579,6 +2403,9 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|capability| capability == lsw_core::CAPABILITY_SESSION_CONTROL_V1));
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability == lsw_core::CAPABILITY_SESSION_LEASE_V1));
     }
 
     #[cfg(unix)]
@@ -1622,6 +2449,10 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability == CAPABILITY_SESSION_CONTROL_V1));
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_SESSION_LEASE_V1));
         (stream, done_receiver, active_sessions)
     }
 
@@ -1638,6 +2469,13 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn send_session_lease(stream: &mut TcpStream, timeout_millis: u32) {
+        let lease = SessionLease::new(timeout_millis).expect("test lease should be valid");
+        write_frame(stream, &Frame::new(FrameKind::SessionLease, lease.encode()))
+            .expect("session lease should be sent");
+    }
+
+    #[cfg(unix)]
     fn send_exec(stream: &mut TcpStream, argv: &[&str]) {
         let request = StartRequest {
             kind: SessionKind::Exec,
@@ -1649,6 +2487,24 @@ mod tests {
             &Frame::new(FrameKind::Start, request.encode().unwrap()),
         )
         .expect("start should be sent");
+    }
+
+    #[cfg(unix)]
+    fn send_waiting_descendant_tree(stream: &mut TcpStream) {
+        // outer sh -> inner sh -> sleep. Every process inherits the session
+        // output pipes; killing only the outer process would make bridge joins
+        // and the session slot hang until sleep exits.
+        send_exec(
+            stream,
+            &[
+                "sh",
+                "-c",
+                "sh -c 'sleep 30 & printf tree-ready; wait' & wait",
+            ],
+        );
+        let ready = read_frame(stream).expect("descendant readiness should arrive");
+        assert_eq!(ready.kind, FrameKind::Stdout);
+        assert_eq!(ready.payload, b"tree-ready");
     }
 
     #[cfg(unix)]
@@ -1681,7 +2537,7 @@ mod tests {
     fn authenticated_cancel_terminates_a_controlled_process() {
         let (mut stream, done, active_sessions) = controlled_test_connection("d".repeat(64));
         send_session_options(&mut stream);
-        send_exec(&mut stream, &["sleep", "5"]);
+        send_waiting_descendant_tree(&mut stream);
         write_frame(
             &mut stream,
             &Frame::new(FrameKind::SessionCancel, Vec::new()),
@@ -1733,7 +2589,7 @@ mod tests {
     fn controlled_disconnect_terminates_process_and_releases_slot() {
         let (mut stream, done, active_sessions) = controlled_test_connection("e".repeat(64));
         send_session_options(&mut stream);
-        send_exec(&mut stream, &["sleep", "5"]);
+        send_waiting_descendant_tree(&mut stream);
         drop(stream);
 
         assert_session_released(done, active_sessions);
@@ -1741,10 +2597,137 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn leased_session_expires_and_releases_its_process_tree() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("4".repeat(64));
+        send_session_options(&mut stream);
+        send_session_lease(&mut stream, 1_000);
+        send_waiting_descendant_tree(&mut stream);
+
+        assert!(
+            read_frame(&mut stream).is_err(),
+            "lease expiry closes the half-open transport instead of risking a blocking error write"
+        );
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("leased server session should finish promptly")
+            .expect_err("lease expiry should fail the session")
+            .contains("lease expired"));
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_expiry_unblocks_output_backpressure_and_releases_slot() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("8".repeat(64));
+        send_session_options(&mut stream);
+        send_session_lease(&mut stream, 1_000);
+        send_exec(&mut stream, &["sh", "-c", "exec yes lsw-lease-output"]);
+
+        // Deliberately never read process output. The agent output bridge will
+        // eventually block in TCP write while holding its shared writer lock.
+        // Lease expiry must use socket shutdown, not that lock, to free it.
+        assert!(done
+            .recv_timeout(Duration::from_secs(3))
+            .expect("backpressured leased session should finish promptly")
+            .expect_err("lease expiry should fail the session")
+            .contains("lease expired"));
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+        drop(stream);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timely_heartbeats_keep_an_idle_leased_session_alive() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("5".repeat(64));
+        send_session_options(&mut stream);
+        send_session_lease(&mut stream, 2_000);
+        send_waiting_descendant_tree(&mut stream);
+
+        // The total duration exceeds one lease, while every individual gap is
+        // comfortably below it. This proves idle-but-healthy sessions survive.
+        for _ in 0..9 {
+            thread::sleep(Duration::from_millis(250));
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::SessionHeartbeat, Vec::new()),
+            )
+            .expect("heartbeat should be sent");
+        }
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::SessionCancel, Vec::new()),
+        )
+        .expect("cancel should be sent");
+        assert_eq!(
+            collect_process(&mut stream),
+            (Vec::new(), SESSION_CANCEL_EXIT_CODE)
+        );
+        drop(stream);
+        assert_session_released(done, active_sessions);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn heartbeat_requires_a_leased_session_and_empty_payload() {
+        for (token, with_lease, payload) in [("a", false, Vec::new()), ("b", true, vec![1])] {
+            let (mut stream, done, active_sessions) = controlled_test_connection(token.repeat(64));
+            send_session_options(&mut stream);
+            if with_lease {
+                send_session_lease(&mut stream, 5_000);
+            }
+            send_waiting_descendant_tree(&mut stream);
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::SessionHeartbeat, payload),
+            )
+            .expect("invalid heartbeat should be sent");
+
+            let response = read_frame(&mut stream).expect("protocol error should arrive");
+            assert_eq!(response.kind, FrameKind::Error);
+            assert!(String::from_utf8_lossy(&response.payload).contains("requires a leased"));
+            assert!(done
+                .recv_timeout(Duration::from_secs(2))
+                .expect("server session should finish promptly")
+                .is_err());
+            assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_requires_options_and_can_appear_only_once_before_start() {
+        let (mut legacy, legacy_done, legacy_sessions) = controlled_test_connection("c".repeat(64));
+        send_session_lease(&mut legacy, 5_000);
+        let response = read_frame(&mut legacy).expect("legacy lease should be rejected");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("unsupported request"));
+        assert!(legacy_done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("legacy request should finish promptly")
+            .is_err());
+        assert_eq!(legacy_sessions.load(Ordering::Acquire), 0);
+
+        let (mut duplicate, duplicate_done, duplicate_sessions) =
+            controlled_test_connection("d".repeat(64));
+        send_session_options(&mut duplicate);
+        send_session_lease(&mut duplicate, 5_000);
+        send_session_lease(&mut duplicate, 5_000);
+        let response = read_frame(&mut duplicate).expect("duplicate lease should be rejected");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("one SESSION_LEASE"));
+        assert!(duplicate_done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("duplicate request should finish promptly")
+            .is_err());
+        assert_eq!(duplicate_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn controlled_frames_reject_nonempty_cancel_payloads() {
         let (mut stream, done, active_sessions) = controlled_test_connection("9".repeat(64));
         send_session_options(&mut stream);
-        send_exec(&mut stream, &["sleep", "5"]);
+        send_waiting_descendant_tree(&mut stream);
         write_frame(&mut stream, &Frame::new(FrameKind::SessionCancel, [1]))
             .expect("malformed cancel should be sent");
 
@@ -1756,6 +2739,21 @@ mod tests {
             .expect("server session should finish promptly")
             .is_err());
         assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_leader_exit_cleans_background_descendants_and_releases_slot() {
+        let (mut stream, done, active_sessions) = controlled_test_connection("6".repeat(64));
+        send_session_options(&mut stream);
+        // The shell exits normally without waiting for this background sleep.
+        // The sleep inherits stdout/stderr, so an agent that owns only the
+        // leader blocks in its output bridge instead of sending EXIT.
+        send_exec(&mut stream, &["sh", "-c", "sleep 30 & printf normal-tree"]);
+
+        assert_eq!(collect_process(&mut stream), (b"normal-tree".to_vec(), 0));
+        drop(stream);
+        assert_session_released(done, active_sessions);
     }
 
     #[cfg(unix)]

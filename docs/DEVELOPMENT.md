@@ -2,14 +2,14 @@
 
 LSW's automated checks deliberately separate source and firmware-level
 confidence from hardware and guest validation. A green pull request means that
-the Rust code, shell tooling, Windows guest-agent PE cross-build, and headless
-QEMU/OVMF TCG smoke passed. It does **not** mean that GitHub-hosted runners used
-KVM or installed Windows.
+the Rust code, shell tooling, Windows guest-agent PE build/native agent tests,
+and headless QEMU/OVMF TCG gates passed. It does **not** mean that GitHub-hosted
+runners used KVM or installed Windows.
 
 ## Local checks
 
 Use the Rust version declared by `rust-version` in the workspace manifest. The
-beta.3 workflows pin Rust 1.76.0 instead of treating the moving `stable`
+beta.4 workflows pin Rust 1.76.0 instead of treating the moving `stable`
 toolchain as the MSRV gate:
 
 ```sh
@@ -47,6 +47,21 @@ after quit and both QEMU and swtpm exited with status zero. `/dev/kvm` and a
 Windows ISO were unavailable, so Windows Setup, agent login, and ConPTY were
 not exercised.
 
+CI also builds `lsw` and `lswd` and runs:
+
+```sh
+LSW_QEMU_LIFECYCLE_REQUIRE=1 scripts/check-lsw-qemu-lifecycle.sh
+```
+
+This second gate does not replace Windows media validation. It uses placeholder
+media to drive the real manifest, storage preparation, `QemuPlanner`, and daemon
+lifecycle, asserting OVMF, NVMe, e1000e, vTPM, loopback agent/published ports,
+install, start, status, suspend, resume, forced stop, and port release. Setting
+`LSW_QEMU_LIFECYCLE_REQUIRE=1` makes unavailable pathname sockets a failure
+rather than a skip. This VPS returns `EPERM` for pathname AF_UNIX `bind`, so only
+the lower-level smoke was run here and this product gate remains CI-only in this
+environment.
+
 ## Windows guest-agent cross-build
 
 Install the Rust GNU target and either Zig or the MinGW-w64 compiler:
@@ -60,14 +75,17 @@ LSW_WINDOWS_LINKER=mingw scripts/build-windows-agent.sh
 `LSW_WINDOWS_LINKER=auto` prefers Zig and then tries
 `x86_64-w64-mingw32-gcc`. `LSW_ZIG` and `LSW_MINGW_CC` override the executable
 used by each backend. CI cross-builds the agent and inspects its PE machine
-type. A separate Windows runner builds the MSVC target and loads the resulting
-executable with `--help`; neither gate exercises a managed guest session.
+type. A separate Windows runner builds the MSVC target, runs the native agent
+tests serially (including Job Object descendant cleanup and ConPTY setup), and
+loads the resulting executable with `--help`. The Linux VPS performed only the
+GNU cross-build. Neither gate exercises a managed guest session or a logged-in
+Windows ConPTY session.
 
 ## Release bundle
 
-The release builder supports Linux x86_64 and GNU tar. It builds the Linux
-CLI/daemon and Windows x86_64 agent from the checked-out source; it never
-downloads an operating-system installer or guest image.
+The release builder supports Linux x86_64 and requires GNU tar and Python 3.
+It builds the Linux CLI/daemon and Windows x86_64 agent from the checked-out
+source; it never downloads an operating-system installer or guest image.
 
 ```sh
 LSW_WINDOWS_LINKER=mingw scripts/build-release.sh
@@ -80,40 +98,42 @@ Useful controls are:
 - `CARGO_TARGET_DIR`: isolate Cargo artifacts; relative paths are resolved from
   the workspace root and are respected by both host and guest-agent builders.
 - `LSW_EXPECT_VERSION`: require the binary version to match a tag such as
-  `v1.0.0-beta.3`.
-- `SOURCE_DATE_EPOCH`: set all archive member timestamps. The default is a
-  fixed epoch. Archive ownership and modes are normalized, and gzip timestamps
-  are disabled.
-- `scripts/check-release-reproducibility.sh`: package the same compiled
-  artifacts twice and require byte-for-byte identical archives. This is a
-  packaging determinism check, not a claim that separate compiler toolchains
-  produce identical binaries.
+  `v1.0.0-beta.4`.
+- `SOURCE_DATE_EPOCH`: set the reproducible build environment and all archive
+  member timestamps. The default is a fixed epoch. Archive ownership and modes
+  are normalized, and gzip timestamps are disabled.
+- `scripts/check-release-reproducibility.sh`: perform two complete builds in
+  separate, initially empty Cargo target directories and require
+  byte-for-byte identical archives. This tests clean-build reproducibility for
+  the selected compiler and linker; it does not claim that different
+  toolchains produce identical binaries.
 
 The verifier checks the SHA-256 sidecar before extraction, rejects unsafe or
 multi-root archives and links/special files, validates executable formats and
-metadata, smoke-tests the Linux binaries when possible, and rejects common OS
-media and VM disk-image formats. On Linux x86_64 it also installs into an
-isolated temporary prefix and compares the installed binaries with the bundle.
-`SOURCE-MANIFEST.sha256` records every packaged build/source file and is
-checked before the embedded corresponding source is accepted.
+metadata, requires the Windows agent's PE/COFF TimeDateStamp to be zero,
+smoke-tests the Linux binaries when possible, and rejects common OS media and
+VM disk-image formats. On Linux x86_64 it also installs into an isolated
+temporary prefix and compares the installed binaries with the bundle.
+`SOURCE-MANIFEST.sha256` records every packaged build/source file and is checked
+before the embedded corresponding source is accepted.
 
 ## GitHub Actions boundary
 
 `.github/workflows/ci.yml` runs formatting, unit tests, Clippy, shell checks,
-the MinGW agent cross-build plus PE-format inspection, and a Windows-native MSVC
-load smoke test on ordinary pushes and pull requests. It also installs
-distribution QEMU/OVMF/swtpm packages and runs the timeout-bounded TCG firmware
-smoke described above. All Rust jobs use the declared 1.76.0 MSRV. The native
-Windows smoke test invokes only `lsw-agent.exe --help`; neither that job nor the
-QEMU job exercises ConPTY, login sessions, or a managed Windows guest. CI also
-builds, installs, and verifies a disposable release bundle without publishing
-it.
+the MinGW agent cross-build plus PE-format inspection, and Windows-native MSVC
+Job/ConPTY setup tests plus an executable load smoke on ordinary pushes and pull
+requests. It also installs distribution QEMU/OVMF/swtpm packages and runs both
+the timeout-bounded TCG firmware smoke and the non-skippable product-lifecycle
+gate described above. All Rust jobs use the declared 1.76.0 MSRV. The native
+Windows job does not boot a managed guest or exercise a logged-in ConPTY shell;
+the QEMU jobs use no Windows ISO. CI also builds, installs, and verifies a
+disposable release bundle without publishing it.
 
 `.github/workflows/release.yml` runs only for version tags or a manual
 dispatch. It repeats the source gates, checks package determinism, verifies the
 finished bundle, and uploads a short-lived workflow artifact. A version tag
 also creates a GitHub Release with `GITHUB_TOKEN`; no repository secret is
-required. Tags containing a prerelease suffix such as `-beta.3` are published
+required. Tags containing a prerelease suffix such as `-beta.4` are published
 as prereleases.
 
 Before describing a build as runtime-validated, a maintainer must separately

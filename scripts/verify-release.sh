@@ -7,7 +7,7 @@ if [ "$#" -ne 1 ]; then
     exit 1
 fi
 
-for required_command in awk basename cmp file find gzip grep mktemp rm sed sha256sum sort tar uname uniq; do
+for required_command in awk basename cmp file find gzip grep mktemp python3 rm sed sha256sum sort tar uname uniq; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "error: required command $required_command was not found" >&2
         exit 1
@@ -138,6 +138,7 @@ for required_file in \
     source/crates/lsw-core/Cargo.toml source/crates/lsw-core/src/lib.rs \
     source/crates/lsw-daemon/Cargo.toml source/crates/lsw-daemon/src/main.rs \
     source/scripts/build-release.sh source/scripts/build-windows-agent.sh \
+    source/scripts/normalize-pe-timestamp.py \
     source/scripts/zig-windows-linker.sh; do
     if [ ! -f "$bundle/$required_file" ]; then
         echo "error: archive is missing $required_file" >&2
@@ -206,6 +207,8 @@ if ! file "$bundle/lsw-agent.exe" | grep -E 'PE32\+ executable.*x86-64' >/dev/nu
     echo "error: archive guest agent is not a Windows x86_64 PE executable" >&2
     exit 1
 fi
+python3 "$bundle/source/scripts/normalize-pe-timestamp.py" \
+    --check "$bundle/lsw-agent.exe"
 
 # Legal media boundaries are also enforced at package verification time. The
 # source and release bundle must not acquire an OS installer or VM disk image.

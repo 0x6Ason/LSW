@@ -4,8 +4,8 @@ LSW 是 Linux 上的本機 Windows 開發執行環境。操作方式接近容器
 instance 後，可直接進入 PowerShell／CMD、執行 Windows 程式及傳輸檔案；實際隔離
 邊界則是 QEMU/KVM microVM，因為 Windows 核心不能與 Linux host 共用。
 
-目前版本為 `1.0.0-beta.3`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
-檔案傳輸、ConPTY 終端機、受控 session 與 ephemeral overlay 已實作。逐視窗
+目前版本為 `1.0.0-beta.4`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
+檔案傳輸、ConPTY 終端機、具 lease 的受控 session 與 ephemeral overlay 已實作。逐視窗
 Wayland/X11 整合尚未完成，因此 GUI 安裝／救援暫時使用 private Unix-socket VNC。
 ConPTY 及真正的 Windows/KVM 開機路徑仍需在實機完成 E2E gate；詳見
 [beta 狀態](docs/BETA.md)。
@@ -28,6 +28,12 @@ host forwarding endpoint；QEMU 結束後兩個 host port 亦已釋放。QEMU �
 都正常結束。
 這項 firmware-level smoke test 證明基礎 VM 組合能啟動，不代表 Windows Setup、
 登入後 agent 或 ConPTY 已完成 E2E 驗收。
+
+CI 另有一個不允許 skip 的 product-lifecycle gate：它透過真正的 `lsw create`／
+`prepare`／planner 與 `lswd`，以無 Windows 內容的 placeholder media 驗證 OVMF、NVMe、
+e1000e、vTPM、agent 與 published loopback hostfwd，以及 install、start、status、
+suspend、resume、forced stop。這台 VPS 的 sandbox 對 pathname AF_UNIX `bind` 回傳
+`EPERM`，因此這項產品 gate 只在 CI 執行；它同樣不代表 Windows guest 已開機。
 
 ## 快速開始
 
@@ -98,11 +104,18 @@ lsw stop
 
 在互動式 host TTY 上，`lsw shell` 會與支援 capability 的 agent 協商 ConPTY，轉送
 console input/output 並同步 terminal resize；舊版或不支援 ConPTY 的 agent 仍使用 pipe
-session。beta.3 另以 `session-control-v1` capability 協商受控 session：stdin EOF 會以
-明確 frame 關閉輸入但讓程式正常結束；已驗證的 client 取消可終止 direct child 並回報
-exit code 130，而啟用選項後的連線中斷也會釋放 direct-child session。舊 agent 保留原有
-TCP half-close 相容行為。這些語義已通過 loopback protocol tests，但尚未在登入後的真
-Windows ConPTY session 完成 E2E 驗收。
+session。`session-control-v1` capability 讓 stdin EOF 以明確 frame 關閉輸入但讓程式
+正常結束；取消回報 exit code 130，連線中斷則依協商選項清理 session。beta.4 另以
+`session-lease-v1` capability 協商 1–300 秒的有界 heartbeat lease；預設為 120 秒，client
+每 30 秒送一次 heartbeat，逾時會關閉 socket 並清理由該 session 擁有的 processes。只有
+同時支援 control 與 lease 的雙方才啟用，舊 agent 保留原有 TCP half-close 行為。
+
+在 Unix，child 會在執行前進入獨立 process group，正常 leader 結束、取消、斷線、協定
+錯誤或 lease 到期時都會清掉仍留在該 group 的 processes；自行呼叫 `setsid`／`setpgid`
+的程式仍可逃離，因此這不是安全 sandbox。Windows 端會先 suspended-create，再於 resume
+前加入 kill-on-close Job Object，失敗就不讓 child 執行。Windows-native CI 測試涵蓋
+Job descendant cleanup 與 ConPTY setup；這台 Linux VPS 只有 cross-build，且仍未在登入
+後的真 Windows ConPTY session 完成 E2E 驗收。
 
 `lsw run` 已能在登入中的 Windows session 啟動程式，但 beta 尚未把個別 HWND 映射成
 Linux native window；GUI 仍只能從安裝／救援 display 看到。`lsw suspend` 只是暫停目前
@@ -157,9 +170,10 @@ LSW_ZIG=/path/to/zig scripts/build-windows-agent.sh
 LSW_ZIG=/path/to/zig scripts/build-release.sh
 ```
 
-release script 會產生 Linux x86_64 bundle、SHA-256 檔及 Windows PE agent。專案本身不
-會自動下載 Zig、Rust target 或作業系統媒體。發行包也包含該 binary 對應的完整
-source snapshot 與 build scripts。
+release script 需要 Python 3，會產生 Linux x86_64 bundle、SHA-256 檔及 Windows PE
+agent；PE/COFF build timestamp 會在嚴格檢查 header 後正規化為零。專案本身不會自動
+下載 Zig、Rust target 或作業系統媒體。發行包也包含該 binary 對應的完整 source
+snapshot 與 build scripts。
 
 ## 授權
 

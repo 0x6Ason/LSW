@@ -40,6 +40,8 @@ case "$release_epoch" in
         exit 1
         ;;
 esac
+SOURCE_DATE_EPOCH=$release_epoch
+export SOURCE_DATE_EPOCH
 
 cargo build --locked --release --bin lsw --bin lswd
 windows_agent=$("$workspace_root/scripts/build-windows-agent.sh")

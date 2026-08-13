@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.0-beta.4
+
+- Added per-session process ownership. Unix children enter a new process group
+  before `exec`, and LSW cleans up every process that remains in that group on
+  normal leader exit, cancellation, disconnect, protocol failure, or lease
+  expiry. Windows children start suspended and fail closed unless they can be
+  assigned to a kill-on-close Job Object before resuming. The Windows-native CI
+  gate exercises Job descendant cleanup and ConPTY setup; this Linux VPS ran
+  only the Windows GNU cross-build. A Unix child can deliberately escape its
+  group with `setsid`/`setpgid`, so this is lifecycle ownership rather than a
+  security sandbox.
+- Added the capability-gated `session-lease-v1` extension for controlled
+  sessions. Leases are strictly bounded to 1–300 seconds; the standard client
+  requests 120 seconds and sends a heartbeat every 30 seconds. Expiry closes
+  the transport and reclaims the session's owned processes, while peers that do
+  not advertise both control and lease capabilities retain the beta.3 behavior.
+- Added a non-skippable CI product-lifecycle QEMU gate that uses the real `lsw`
+  manifest/preparation/planner path and `lswd` to exercise OVMF, NVMe, e1000e,
+  vTPM, loopback agent/published ports, install, start, status, suspend, resume,
+  and forced stop. The lower-level TCG/OVMF smoke again passed on the Codex VPS;
+  its sandbox rejects pathname Unix sockets, so the product gate runs only in
+  CI. No Windows ISO was available, and Windows Setup, logged-in agent, and
+  ConPTY guest E2E remain unverified.
+- Strengthened the release reproducibility gate to compare two complete builds
+  from separate clean Cargo target directories. Windows agent builds now
+  validate the MZ/PE headers and normalize the COFF TimeDateStamp to zero; the
+  bundle verifier enforces that invariant.
+
 ## 1.0.0-beta.3
 
 - Added the capability-gated `session-control-v1` process-session extension

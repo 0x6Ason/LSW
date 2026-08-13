@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use crate::{LswError, Result};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
 pub const CAPABILITY_CONPTY_V1: &str = "conpty-v1";
 pub const CAPABILITY_SESSION_CONTROL_V1: &str = "session-control-v1";
+pub const CAPABILITY_SESSION_LEASE_V1: &str = "session-lease-v1";
 pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
+pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
+pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
+pub const MAX_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 300_000;
 pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 1024;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
@@ -36,6 +41,8 @@ pub enum FrameKind {
     FileGet = 21,
     FileData = 22,
     FileDone = 23,
+    SessionLease = 24,
+    SessionHeartbeat = 25,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -62,6 +69,8 @@ impl TryFrom<u8> for FrameKind {
             21 => Ok(Self::FileGet),
             22 => Ok(Self::FileData),
             23 => Ok(Self::FileDone),
+            24 => Ok(Self::SessionLease),
+            25 => Ok(Self::SessionHeartbeat),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -230,6 +239,101 @@ impl SessionOptions {
         Ok(Self {
             cancel_on_disconnect: flags & Self::CANCEL_ON_DISCONNECT != 0,
         })
+    }
+}
+
+/// Opts one controlled process session into a bounded client heartbeat lease.
+///
+/// The timeout is negotiated per session so future clients can choose a more
+/// conservative value without changing protocol version one. The agent caps
+/// it to keep every opted-in half-open session bounded. Extremely short values
+/// are rejected to avoid timer churn and sessions that cannot survive ordinary
+/// scheduler jitter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionLease {
+    timeout_millis: u32,
+}
+
+impl SessionLease {
+    pub fn new(timeout_millis: u32) -> Result<Self> {
+        if !(MIN_SESSION_LEASE_TIMEOUT_MILLIS..=MAX_SESSION_LEASE_TIMEOUT_MILLIS)
+            .contains(&timeout_millis)
+        {
+            return Err(LswError::Protocol(format!(
+                "session lease timeout must be between {MIN_SESSION_LEASE_TIMEOUT_MILLIS} and {MAX_SESSION_LEASE_TIMEOUT_MILLIS} milliseconds"
+            )));
+        }
+        Ok(Self { timeout_millis })
+    }
+
+    pub fn standard() -> Self {
+        Self {
+            timeout_millis: DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS,
+        }
+    }
+
+    pub const fn timeout_millis(self) -> u32 {
+        self.timeout_millis
+    }
+
+    /// Four heartbeat opportunities per lease balance prompt cleanup with
+    /// tolerance for a temporarily busy VM.
+    pub fn heartbeat_interval(self) -> Duration {
+        Duration::from_millis(u64::from((self.timeout_millis / 4).max(1)))
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        self.timeout_millis.to_be_bytes().to_vec()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let bytes: [u8; 4] = payload.try_into().map_err(|_| {
+            LswError::Protocol("session lease payload must contain four bytes".to_owned())
+        })?;
+        Self::new(u32::from_be_bytes(bytes))
+    }
+}
+
+impl Default for SessionLease {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
+
+/// Clock-independent lease state. Callers supply elapsed monotonic
+/// milliseconds, which keeps expiry behavior deterministic in tests and avoids
+/// tying the wire protocol to a platform clock implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionLeaseState {
+    timeout_millis: u64,
+    deadline_millis: u64,
+}
+
+impl SessionLeaseState {
+    pub fn new(lease: SessionLease, now_millis: u64) -> Self {
+        let timeout_millis = u64::from(lease.timeout_millis());
+        Self {
+            timeout_millis,
+            deadline_millis: now_millis.saturating_add(timeout_millis),
+        }
+    }
+
+    pub const fn deadline_millis(self) -> u64 {
+        self.deadline_millis
+    }
+
+    pub fn is_expired(self, now_millis: u64) -> bool {
+        now_millis >= self.deadline_millis
+    }
+
+    /// Extends a live lease. A heartbeat observed at or after the deadline
+    /// cannot resurrect an already expired session.
+    pub fn observe_heartbeat(&mut self, now_millis: u64) -> bool {
+        if self.is_expired(now_millis) {
+            return false;
+        }
+        self.deadline_millis = now_millis.saturating_add(self.timeout_millis);
+        true
     }
 }
 
@@ -663,6 +767,49 @@ mod tests {
         assert!(SessionOptions::decode(&[]).is_err());
         assert!(SessionOptions::decode(&[0, 0]).is_err());
         assert!(SessionOptions::decode(&[2]).is_err());
+    }
+
+    #[test]
+    fn session_lease_is_append_only_bounded_and_strictly_encoded() {
+        assert_eq!(
+            FrameKind::try_from(24).expect("lease kind should decode"),
+            FrameKind::SessionLease
+        );
+        assert_eq!(
+            FrameKind::try_from(25).expect("heartbeat kind should decode"),
+            FrameKind::SessionHeartbeat
+        );
+
+        let lease = SessionLease::standard();
+        assert_eq!(
+            SessionLease::decode(&lease.encode()).expect("lease should decode"),
+            lease
+        );
+        assert_eq!(lease.heartbeat_interval(), Duration::from_secs(30));
+        assert!(SessionLease::decode(&[]).is_err());
+        assert!(SessionLease::decode(&[0, 0, 0, 0]).is_err());
+        assert!(SessionLease::new(MIN_SESSION_LEASE_TIMEOUT_MILLIS - 1).is_err());
+        assert!(SessionLease::new(MIN_SESSION_LEASE_TIMEOUT_MILLIS).is_ok());
+        assert!(SessionLease::new(MAX_SESSION_LEASE_TIMEOUT_MILLIS).is_ok());
+        assert!(SessionLease::new(MAX_SESSION_LEASE_TIMEOUT_MILLIS + 1).is_err());
+    }
+
+    #[test]
+    fn session_lease_state_uses_monotonic_input_and_never_resurrects() {
+        let lease = SessionLease::new(MIN_SESSION_LEASE_TIMEOUT_MILLIS)
+            .expect("minimum lease should be valid");
+        let mut state = SessionLeaseState::new(lease, 1_000);
+        assert_eq!(state.deadline_millis(), 2_000);
+        assert!(!state.is_expired(1_999));
+        assert!(state.observe_heartbeat(1_500));
+        assert_eq!(state.deadline_millis(), 2_500);
+        assert!(!state.is_expired(2_499));
+        assert!(state.is_expired(2_500));
+        assert!(!state.observe_heartbeat(2_500));
+        assert_eq!(state.deadline_millis(), 2_500);
+
+        let saturated = SessionLeaseState::new(lease, u64::MAX - 10);
+        assert_eq!(saturated.deadline_millis(), u64::MAX);
     }
 
     #[test]

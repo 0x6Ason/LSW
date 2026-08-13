@@ -4,25 +4,25 @@ version = 3
 
 [[package]]
 name = "lsw-agent"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "lsw-core",
 ]
 
 [[package]]
 name = "lsw-cli"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "lsw-core",
 ]
 
 [[package]]
 name = "lsw-core"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 
 [[package]]
 name = "lsw-daemon"
-version = "1.0.0-beta.3"
+version = "1.0.0-beta.4"
 dependencies = [
  "lsw-core",
 ]

@@ -49,20 +49,34 @@ encryption and peer identity rather than relying on this token protocol alone.
 
 After authentication, peers advertising `session-control-v1` can opt a process
 session into explicit control semantics. `STDIN_CLOSE` delivers EOF without
-termination; `SESSION_CANCEL` terminates the direct child and returns exit code
-130; `cancel-on-disconnect` releases that direct child when a disconnect is
-observed. Before a process starts, an unprefixed control request, an invalid
+termination; `SESSION_CANCEL` terminates the session-owned process group/Job and
+returns exit code 130; `cancel-on-disconnect` releases that owned set when a
+disconnect is observed. Before a process starts, an unprefixed control request, an invalid
 options payload, or any request sent before authentication is rejected. Once a
 legacy process has started, it keeps the version-one behavior rather than
 gaining the new control semantics, including TCP half-close as stdin EOF.
 
-This is not yet process-tree containment. beta.3 does not assign Windows
-descendants to a Job Object or host-side descendants to a process group, and a
-half-open TCP peer may remain indistinguishable from an idle connection without
-a lease/heartbeat. Descendants can therefore survive direct-child cancellation
-or keep inherited output handles open. Do not treat session cancellation as a
-guest workload kill boundary until tree ownership and bounded liveness are
-implemented.
+Peers that additionally advertise `session-lease-v1` may send exactly one lease
+between session options and the start frame. Timeouts are bounded to 1–300
+seconds; the standard client requests 120 seconds and sends a heartbeat every
+30 seconds. A heartbeat cannot revive an expired lease. Expiry shuts down the
+socket in both directions before waiting for I/O bridges, then reclaims the
+session-owned process group/Job. Peers without both capabilities retain legacy
+behavior.
+
+On Unix, LSW places the child in a fresh process group before `exec` and cleans
+every process still in that group after normal leader exit, cancellation,
+disconnect, protocol error, or lease expiry. A guest process can deliberately
+escape with `setsid` or `setpgid`; process-group ownership is therefore not a
+security sandbox or an absolute descendant boundary. This beta uses portable
+`std::process` waits rather than Linux-specific pidfds/cgroups; after a normally
+exited leader is reaped, group cleanup also has a very small numeric-PGID reuse
+race. Do not treat Unix group cleanup as an adversarial containment boundary.
+On Windows, pipe and
+ConPTY children start suspended and must enter a kill-on-close Job Object before
+they resume. Assignment failure, including an incompatible nested-job policy,
+fails closed. The Windows behavior has a native CI gate, but was only
+cross-built—not executed—on this Linux VPS.
 
 Agent powers are intentionally broad after authentication: it can execute as the
 logged-in Windows user and read or create files that user can access. Protect the
@@ -119,8 +133,9 @@ of shared images, and retain a driverless secure profile.
 
 - Run QEMU/swtpm with a reduced host privilege and platform sandbox policy.
 - Add encrypted transport before supporting any non-local agent connection.
-- Own each process tree with a Windows Job Object or host process group, and add
-  a bounded lease/heartbeat for half-open session cleanup.
+- Harden Unix containment against deliberate process-group/session escape, and
+  exercise both Unix groups and Windows Job Objects with longer-running native
+  stress tests.
 - Threat-model clipboard, host folders, USB and per-HWND input before enabling
   those integrations.
 - Fuzz PE parsing and the ConPTY/resize/session-control protocol in addition to

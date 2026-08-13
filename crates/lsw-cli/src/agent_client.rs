@@ -7,15 +7,17 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     decode_exit, decode_file_length, encode_file_length, read_frame, write_frame, ClientHello,
-    FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest, ServerHello,
+    FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest, ServerHello, SessionLease,
     SessionOptions, StartRequest, TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_CONPTY_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    CAPABILITY_CONPTY_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
+    CAPABILITY_TERMINAL_RESIZE_V1,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -84,6 +86,12 @@ impl AgentClient {
         let shell_session = matches!(request.kind, lsw_core::SessionKind::Shell);
         let conpty_available = self.has_capability(CAPABILITY_CONPTY_V1);
         let controlled_session = self.has_capability(CAPABILITY_SESSION_CONTROL_V1);
+        let session_lease =
+            if controlled_session && self.has_capability(CAPABILITY_SESSION_LEASE_V1) {
+                Some(SessionLease::standard())
+            } else {
+                None
+            };
         if shell_session && !conpty_available {
             eprintln!(
                 "lsw: note: this agent provides a pipe shell; ConPTY is not available in this beta build"
@@ -107,6 +115,12 @@ impl AgentClient {
                 &mut self.stream,
                 &Frame::new(FrameKind::SessionOptions, options.encode()),
             )?;
+            if let Some(lease) = session_lease {
+                write_frame(
+                    &mut self.stream,
+                    &Frame::new(FrameKind::SessionLease, lease.encode()),
+                )?;
+            }
         }
         if terminal.is_some() {
             let terminal_request = TerminalStartRequest {
@@ -127,6 +141,8 @@ impl AgentClient {
         let terminal_active = terminal.is_some();
         let outbound = Arc::new(Mutex::new(self.stream.try_clone()?));
         let session_stop = Arc::new(AtomicBool::new(false));
+        let heartbeat_bridge = session_lease
+            .map(|lease| spawn_heartbeat_bridge(Arc::clone(&outbound), lease.heartbeat_interval()));
         let input_thread = if connect_stdin {
             let writer = Arc::clone(&outbound);
             let stop = Arc::clone(&session_stop);
@@ -181,6 +197,10 @@ impl AgentClient {
             let _ = send_outbound(&outbound, &Frame::new(FrameKind::SessionCancel, Vec::new()));
         }
         session_stop.store(true, Ordering::Release);
+        if let Some((stop, heartbeat_thread)) = heartbeat_bridge {
+            let _ = stop.send(());
+            let _ = heartbeat_thread.join();
+        }
         if let Some(resize_thread) = resize_thread {
             let _ = resize_thread.join();
         }
@@ -394,6 +414,32 @@ fn shutdown_outbound(writer: &Arc<Mutex<TcpStream>>) {
     }
 }
 
+fn spawn_heartbeat_bridge(
+    writer: Arc<Mutex<TcpStream>>,
+    interval: Duration,
+) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (stop_sender, stop_receiver) = mpsc::channel();
+    let bridge = thread::spawn(move || loop {
+        match stop_receiver.recv_timeout(interval) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {
+                if send_outbound(
+                    &writer,
+                    &Frame::new(FrameKind::SessionHeartbeat, Vec::new()),
+                )
+                .is_err()
+                {
+                    if let Ok(stream) = writer.lock() {
+                        let _ = stream.shutdown(Shutdown::Both);
+                    }
+                    return;
+                }
+            }
+        }
+    });
+    (stop_sender, bridge)
+}
+
 fn spawn_resize_bridge(
     writer: Arc<Mutex<TcpStream>>,
     stop: Arc<AtomicBool>,
@@ -604,6 +650,78 @@ mod tests {
     }
 
     #[test]
+    fn leased_run_sends_lease_between_options_and_start() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            assert_eq!(
+                read_frame(&mut stream).expect("options should arrive").kind,
+                FrameKind::SessionOptions
+            );
+            let lease_frame = read_frame(&mut stream).expect("lease should arrive");
+            assert_eq!(lease_frame.kind, FrameKind::SessionLease);
+            assert_eq!(
+                SessionLease::decode(&lease_frame.payload).expect("lease should decode"),
+                SessionLease::standard()
+            );
+            assert_eq!(
+                read_frame(&mut stream).expect("start should arrive").kind,
+                FrameKind::Start
+            );
+            assert_eq!(
+                read_frame(&mut stream)
+                    .expect("stdin close should arrive")
+                    .kind,
+                FrameKind::StdinClose
+            );
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            )
+            .expect("exit should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let client = AgentClient {
+            stream,
+            capabilities: vec![
+                CAPABILITY_SESSION_CONTROL_V1.to_owned(),
+                CAPABILITY_SESSION_LEASE_V1.to_owned(),
+            ],
+        };
+        let request = StartRequest {
+            kind: lsw_core::SessionKind::Exec,
+            argv: vec!["fixture-command".to_owned()],
+            working_directory: None,
+        };
+        assert_eq!(client.run(&request, false).expect("run should succeed"), 0);
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn heartbeat_bridge_emits_frames_and_stops_promptly() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout should configure");
+            let heartbeat = read_frame(&mut stream).expect("heartbeat should arrive");
+            assert_eq!(heartbeat.kind, FrameKind::SessionHeartbeat);
+            assert!(heartbeat.payload.is_empty());
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let writer = Arc::new(Mutex::new(stream));
+        let (stop, bridge) = spawn_heartbeat_bridge(writer, Duration::from_millis(10));
+        server.join().expect("fixture should not panic");
+        // The peer may close between the first successful heartbeat and this
+        // signal, in which case the bridge has already stopped itself.
+        let _ = stop.send(());
+        bridge.join().expect("bridge should not panic");
+    }
+
+    #[test]
     fn legacy_run_still_starts_without_session_options() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
         let address = listener.local_addr().expect("listener should have address");
@@ -620,7 +738,9 @@ mod tests {
         let stream = TcpStream::connect(address).expect("fixture should connect");
         let client = AgentClient {
             stream,
-            capabilities: Vec::new(),
+            // An inconsistent peer advertising only the lease capability must
+            // still get version-one legacy framing.
+            capabilities: vec![CAPABILITY_SESSION_LEASE_V1.to_owned()],
         };
         let request = StartRequest {
             kind: lsw_core::SessionKind::Exec,

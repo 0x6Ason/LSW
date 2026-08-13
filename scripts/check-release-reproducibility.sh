@@ -18,11 +18,12 @@ cleanup_release_repro() {
 }
 trap cleanup_release_repro EXIT HUP INT TERM
 mkdir -p -- "$repro_root/first" "$repro_root/second"
-repro_target="$repro_root/cargo-target"
+first_target="$repro_root/first-target"
+second_target="$repro_root/second-target"
 
-CARGO_TARGET_DIR="$repro_target" LSW_DIST_DIR="$repro_root/first" \
+CARGO_TARGET_DIR="$first_target" LSW_DIST_DIR="$repro_root/first" \
     scripts/build-release.sh >"$repro_root/first.out"
-CARGO_TARGET_DIR="$repro_target" LSW_DIST_DIR="$repro_root/second" \
+CARGO_TARGET_DIR="$second_target" LSW_DIST_DIR="$repro_root/second" \
     scripts/build-release.sh >"$repro_root/second.out"
 first_archive=$(sed -n '1p' "$repro_root/first.out")
 second_archive=$(sed -n '1p' "$repro_root/second.out")
@@ -32,12 +33,12 @@ if [ ! -f "$first_archive" ] || [ ! -f "$second_archive" ]; then
 fi
 
 if ! cmp -s "$first_archive" "$second_archive"; then
-    echo "error: repeated packaging from the same build artifacts was not byte-for-byte deterministic" >&2
+    echo "error: two independent clean release builds were not byte-for-byte deterministic" >&2
     sha256sum "$first_archive" "$second_archive" >&2
     exit 1
 fi
 
 scripts/verify-release.sh "$first_archive" >/dev/null
 scripts/verify-release.sh "$second_archive" >/dev/null
-echo "Release packaging is deterministic for the current build artifacts."
+echo "Two independent clean release builds are byte-for-byte deterministic."
 sha256sum "$first_archive"

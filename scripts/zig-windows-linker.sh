@@ -18,4 +18,7 @@ for argument in "$@"; do
     esac
 done
 
-exec "$zig_binary" cc -target x86_64-windows-gnu -nostdlib "${linker_arguments[@]}" -lunwind
+# Zig's cc driver does not expose LLD's PE timestamp controls. The completed
+# image is therefore validated and normalized by build-windows-agent.sh.
+exec "$zig_binary" cc -target x86_64-windows-gnu -nostdlib \
+    "${linker_arguments[@]}" -lunwind
