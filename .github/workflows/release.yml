@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  bundle:
+    name: Build and verify Linux x86_64 bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust 1.76.0 and the Windows GNU target
+        run: |
+          rustup toolchain install 1.76.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.76.0
+          rustup target add x86_64-pc-windows-gnu
+      - name: Install release tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64 file shellcheck
+      - name: Run source gates
+        run: |
+          scripts/check-shell.sh
+          cargo fmt --all -- --check
+          cargo test --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Check tag and package determinism
+        env:
+          LSW_WINDOWS_LINKER: mingw
+          LSW_EXPECT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: scripts/check-release-reproducibility.sh
+      - name: Build release bundle
+        id: release
+        env:
+          LSW_WINDOWS_LINKER: mingw
+          LSW_EXPECT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+        run: |
+          scripts/build-release.sh
+          archive=$(find dist -maxdepth 1 -type f -name 'lsw-*-linux-x86_64.tar.gz' -print -quit)
+          if [ -z "$archive" ]; then
+            echo "release archive was not produced" >&2
+            exit 1
+          fi
+          echo "archive=$archive" >>"$GITHUB_OUTPUT"
+      - name: Verify release bundle
+        run: scripts/verify-release.sh "${{ steps.release.outputs.archive }}"
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lsw-linux-x86_64
+          path: |
+            dist/lsw-*-linux-x86_64.tar.gz
+            dist/lsw-*-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_arguments=()
+          release_version=${GITHUB_REF_NAME#v}
+          release_without_build=${release_version%%+*}
+          if [[ "$release_without_build" == *-* ]]; then
+            release_arguments+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            dist/lsw-*-linux-x86_64.tar.gz \
+            dist/lsw-*-linux-x86_64.tar.gz.sha256 \
+            --verify-tag \
+            --generate-notes \
+            --title "LSW $GITHUB_REF_NAME" \
+            "${release_arguments[@]}"

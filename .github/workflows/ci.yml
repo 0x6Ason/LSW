@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes shellcheck
+      - name: Check syntax and lint
+        run: scripts/check-shell.sh
+
+  rust:
+    name: Rust ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - fmt
+          - test
+          - clippy
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.76.0
+        run: |
+          rustup toolchain install 1.76.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.76.0
+      - name: Check formatting
+        if: matrix.check == 'fmt'
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        if: matrix.check == 'test'
+        run: cargo test --workspace --all-targets --locked
+      - name: Run Clippy
+        if: matrix.check == 'clippy'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  windows-agent:
+    name: Windows guest-agent cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.76.0 and the Windows GNU target
+        run: |
+          rustup toolchain install 1.76.0 --profile minimal
+          rustup default 1.76.0
+          rustup target add x86_64-pc-windows-gnu
+      - name: Install the MinGW linker and PE inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64 file
+      - name: Build the guest agent
+        env:
+          LSW_WINDOWS_LINKER: mingw
+        run: scripts/build-windows-agent.sh
+      - name: Inspect the guest-agent artifact
+        run: |
+          file target/x86_64-pc-windows-gnu/release/lsw-agent.exe \
+            | grep -E 'PE32\+ executable.*x86-64'
+          x86_64-w64-mingw32-objdump -f \
+            target/x86_64-pc-windows-gnu/release/lsw-agent.exe \
+            | grep -F 'file format pei-x86-64'
+      - name: Record runtime-test boundary
+        run: |
+          echo "Cross-build and PE inspection passed."
+          echo "This job does not claim to run Windows, KVM, or an installed guest."
+
+  windows-agent-native:
+    name: Windows guest-agent native smoke test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.76.0
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.76.0 --profile minimal
+          rustup default 1.76.0
+      - name: Build the MSVC guest agent
+        shell: pwsh
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin lsw-agent
+      - name: Exercise native process-tree ownership and ConPTY setup
+        shell: pwsh
+        run: cargo test --locked --target x86_64-pc-windows-msvc -p lsw-agent -- --test-threads=1
+      - name: Load the executable and parse its command line
+        shell: pwsh
+        run: |
+          & .\target\x86_64-pc-windows-msvc\release\lsw-agent.exe --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "lsw-agent --help failed with exit code $LASTEXITCODE"
+          }
+      - name: Record runtime-test boundary
+        shell: pwsh
+        run: |
+          Write-Output "The native PE loaded and parsed --help on Windows."
+          Write-Output "This job does not claim to boot a managed Windows guest or test ConPTY end-to-end."
+
+  qemu-smoke:
+    name: Headless QEMU integration smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install QEMU, OVMF, and software TPM
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ovmf python3-minimal qemu-system-x86 qemu-utils swtpm
+      - name: Install Rust 1.76.0
+        run: |
+          rustup toolchain install 1.76.0 --profile minimal
+          rustup default 1.76.0
+      - name: Build the LSW host runtime
+        run: cargo build --locked -p lsw-cli -p lsw-daemon
+      - name: Boot a transport-adapted OVMF and vTPM VM under TCG
+        run: scripts/check-qemu-smoke.sh
+      - name: Exercise the actual LSW planner and daemon lifecycle
+        env:
+          LSW_QEMU_LIFECYCLE_REQUIRE: "1"
+        run: scripts/check-lsw-qemu-lifecycle.sh
+
+  package:
+    name: Release bundle smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.76.0 and the Windows GNU target
+        run: |
+          rustup toolchain install 1.76.0 --profile minimal
+          rustup default 1.76.0
+          rustup target add x86_64-pc-windows-gnu
+      - name: Install release tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64 file
+      - name: Build and verify a disposable bundle
+        env:
+          LSW_WINDOWS_LINKER: mingw
+        run: |
+          dist_directory="$RUNNER_TEMP/lsw-dist"
+          LSW_DIST_DIR="$dist_directory" scripts/build-release.sh
+          archive=$(find "$dist_directory" -maxdepth 1 -type f \
+            -name 'lsw-*-linux-x86_64.tar.gz' -print -quit)
+          if [ -z "$archive" ]; then
+            echo "release archive was not produced" >&2
+            exit 1
+          fi
+          scripts/verify-release.sh "$archive"

@@ -1,0 +1,184 @@
+# LSW architecture
+
+## Product model
+
+LSW exposes a container-like local developer workflow for an operating system
+whose kernel cannot be shared with the host. Windows-on-Linux therefore uses a
+QEMU/KVM microVM as its isolation boundary. No component claims that Windows is
+running as a Linux namespace container.
+
+The delivered beta runtime supports a Linux x86_64 host and a Windows 11 x64
+guest. Host platform and accelerator selection are separated from guest
+protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
+and QEMU argument generation exist as planner-level work only. There are no
+macOS or Windows host-side binaries, daemon IPC integrations, or runtime
+validation claims in beta.4.
+
+## Components
+
+| Component | Beta state | Responsibility |
+| --- | --- | --- |
+| `lsw` | Implemented | Instance management, installer seed, default shell, process and file commands |
+| `lswd` | Implemented | User-private Unix API, QEMU/swtpm supervision, QMP reconciliation and shutdown |
+| QEMU backend | Linux runtime implemented; firmware smoke passed | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
+| Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
+| `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY sessions, capability-gated control/leases, process ownership and file transfer |
+| ConPTY transport | Implemented; E2E gated | Capability negotiation, console I/O and terminal resize; real installed-Windows validation remains |
+| PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
+| Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
+| Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
+
+## Lifecycle
+
+1. `lsw create` validates the requested shape and stores manifest v3 plus a
+   random 256-bit per-instance agent token. It does not copy the ISO. Version 1
+   and 2 manifests migrate with no published ports.
+2. `lsw install` creates a read-only Setup seed if one does not exist, prepares
+   qcow2 storage and a private OVMF variable store, starts swtpm, then starts
+   QEMU in install mode. Guided installation is the default.
+3. `lswd` waits for the swtpm and QMP Unix sockets before reporting success. It
+   owns child handles while running and reconciles a surviving VM through QMP
+   after daemon restart.
+4. A normal guest shutdown leaves the base disk intact. An ephemeral instance
+   uses a fresh qcow2 backing overlay for each run and removes that overlay only
+   after QEMU has stopped.
+5. At first administrative logon, the seed installs the agent in the interactive
+   user's session and registers a per-user startup entry. This avoids placing
+   GUI work in Windows Session 0.
+6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
+   Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
+   ConPTY and host stdin is a terminal, the host enters raw mode and forwards
+   resize events; otherwise the established pipe session remains available.
+   When both ends advertise `session-control-v1`, the host prefixes the start
+   request with per-session options and uses distinct stdin-close and cancel
+   frames. When both ends also advertise `session-lease-v1`, the host then sends
+   a bounded lease before the start request and heartbeats while the process is
+   live. Older peers retain the version-one half-close behavior.
+7. `lsw suspend` sends QMP `stop` and records `suspended`; `lsw resume` requires
+   the same live QEMU process in QMP `paused` state and sends `cont`. This is
+   deliberately not a RAM snapshot, hibernation, or migration mechanism.
+
+Instance state is stored under `$LSW_STATE_DIR` or, by default,
+`$HOME/.local/share/lsw`:
+
+```text
+instances/NAME/
+  instance.lsw          non-secret manifest
+  agent.token           private host copy
+  disk.qcow2            persistent base disk
+  OVMF_VARS.fd          private guest firmware variables
+  seed/                 read-only Setup files attached through QEMU vvfat
+  swtpm-state/          vTPM state
+  run/                  QMP, VNC, swtpm sockets and ephemeral overlay
+```
+
+## Control and guest protocols
+
+The daemon protocol is newline-delimited, versioned by `PING`, bounded, and
+available only on a mode-0600 socket in a mode-0700 directory. Mutations are
+strict commands (`START`, `SUSPEND`, `RESUME`, `STOP`) rather than shell strings.
+QEMU state is read and changed through negotiated QMP commands, never by
+trusting a PID file.
+
+The agent protocol uses a five-byte binary frame header, an 8 MiB frame limit,
+explicit UTF-8 string lengths, a protocol version, and constant-time comparison
+of the per-instance token. Capability strings negotiate ConPTY, terminal resize,
+`session-control-v1`, and `session-lease-v1` without breaking older pipe-only
+agents. Host forwarding binds to `127.0.0.1`; commands and file payloads are
+binary-safe. Upload and download destinations are never overwritten implicitly.
+
+For an opted-in controlled session, `STDIN_CLOSE` drops only the child's input
+handle so it can observe EOF and exit normally. Authenticated `SESSION_CANCEL`
+terminates the owned process group/Job and reports exit code 130; the negotiated
+cancel-on-disconnect option also asks the agent to clean up that set when the
+connection disappears. With a legacy peer, TCP write-half-close continues to
+mean stdin EOF. These additions are append-only frames under protocol version
+one and are advertised by capability.
+
+`session-lease-v1` is valid only after controlled-session options and before the
+start frame. The encoded timeout is strictly bounded to 1–300 seconds. LSW's
+standard client requests 120 seconds and sends a heartbeat every 30 seconds;
+expiry closes both directions of the socket before output bridges are joined
+and reclaims the owned process group/Job. Capability negotiation leaves older
+or inconsistently advertising peers on the legacy path.
+
+On Unix the child enters a new process group in the pre-`exec` path. LSW signals
+that group after a normal leader exit and on cancellation, disconnect, protocol
+failure, or lease expiry, preventing ordinary background descendants that
+inherit output pipes from retaining a session. A process can deliberately use
+`setsid` or `setpgid` to escape, so the group is lifecycle containment, not a
+security boundary. On Windows, both pipe and ConPTY leaders are created
+suspended, assigned to a kill-on-close Job Object, and resumed only after
+successful assignment. A restrictive nested-job policy therefore fails the
+session closed rather than starting an unowned child. Windows-native CI covers
+Job descendant cleanup and ConPTY setup; this Linux VPS covers only the Windows
+GNU cross-build, not execution of those tests.
+
+## Headless runtime smoke boundary
+
+On the Codex VPS, Ubuntu's QEMU 8.2.2, OVMF and swtpm packages were staged in a
+temporary root because they were not preinstalled. With TCG, the test created
+and checked a qcow2 disk, entered OVMF, observed vTPM command traffic, drove TCP
+QMP through `stop`, `cont` and `quit`, and connected to two loopback-only usernet
+host-forward endpoints targeting guest ports 5040 and 8080. Both host ports were
+released after QMP quit, and QEMU and swtpm exited with status zero. CI now
+repeats a timeout-bounded version of this firmware-level smoke with distribution
+packages. A second, non-skippable CI gate uses the actual `lsw`
+manifest/preparation/planner path and `lswd` with placeholder media. It checks
+the planned OVMF, NVMe, e1000e, vTPM and exact loopback hostfwd topology, then
+executes install, start, status, suspend, resume and forced stop through product
+interfaces while checking QMP and port release.
+
+That environment has no `/dev/kvm`, licensed Windows ISO, graphical desktop, or
+pathname Unix sockets (AF_UNIX `bind` returns `EPERM`). The firmware smoke
+therefore validates the QEMU building blocks locally, while the product daemon's
+Unix-socket lifecycle is a CI-only gate in this environment. Neither gate
+validates KVM acceleration, Windows Setup/OOBE, the logged-in agent, or ConPTY
+end to end.
+
+## Network publishing
+
+QEMU user networking always forwards the private per-instance agent port to
+host loopback. A manifest may additionally contain repeatable TCP mappings from
+`--publish HOST:GUEST`; these are rendered as loopback-only QEMU `hostfwd`
+entries. Validation rejects port zero, duplicate host ports, the instance's
+reserved agent port, collisions with another instance or an already-bound local
+listener at creation time, and publishing in `offline` mode. This feature does
+not expose UDP, bind a LAN address, or provide transport authentication for the
+guest application.
+
+## PE inspection
+
+`lsw inspect` is a host-side parser and does not execute the inspected file. It
+caps input at 512 MiB and bounds PE headers, section-backed RVAs, import tables,
+and strings before reporting architecture, subsystem, CLR and certificate-table
+presence, sections, and imports. Its assessment is advisory: certificate-table
+presence is not Authenticode verification, and compatibility still depends on
+the installed guest and application dependencies.
+
+## Display design
+
+The beta explicitly adds standard VGA because `-nodefaults` removes QEMU's
+implicit adapter. A VNC server is bound to a private Unix socket for Windows
+Setup and recovery only; there is no TCP VNC listener and no RDP dependency.
+
+The intended seamless path remains driverless first:
+
+1. A user-session agent discovers eligible top-level HWNDs and captures damaged
+   regions through documented Windows graphics APIs.
+2. An authenticated bulk channel carries per-window metadata and frames.
+3. The Linux client creates native Wayland surfaces, with X11 fallback, and maps
+   focus, input, resize, DPI and clipboard events explicitly.
+4. UIPI, UAC and elevated-window boundaries are reported, not weakened.
+
+An optional guest-only accelerator may later reduce copies. It cannot be a
+requirement for the `secure` profile and would need an independently reviewed
+signing/enrollment workflow.
+
+## Performance priorities
+
+- KVM with host CPU passthrough; TCG is a diagnostic fallback.
+- Windows-inbox NVMe, e1000e and VGA for installability before optional drivers.
+- qcow2 overlays for disposable runs without modifying the base disk.
+- Separate control, process/file, and future graphics data paths.
+- Damage-based window transport rather than full-desktop polling.
