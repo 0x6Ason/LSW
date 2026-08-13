@@ -249,7 +249,7 @@ impl QemuPlanner {
                     &mut arguments,
                     "-drive",
                     format!(
-                        "file=fat:ro:{},format=raw,if=none,id=lsw-seed",
+                        "file=fat:ro:{},format=raw,if=none,id=lsw-seed,snapshot=on",
                         qemu_path(&seed)
                     ),
                 );
