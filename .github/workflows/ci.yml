@@ -114,10 +114,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "lsw-agent --help failed with exit code $LASTEXITCODE"
           }
+      - name: Exercise the Windows service lifecycle
+        shell: powershell
+        timeout-minutes: 5
+        run: .\scripts\check-windows-agent-service.ps1
       - name: Record runtime-test boundary
         shell: pwsh
         run: |
-          Write-Output "The native PE loaded and parsed --help on Windows."
+          Write-Output "The native PE loaded, parsed --help, and completed two SCM start/stop cycles on Windows."
           Write-Output "This job does not claim to boot a managed Windows guest or test ConPTY end-to-end."
 
   qemu-smoke:
