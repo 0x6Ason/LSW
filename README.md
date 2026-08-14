@@ -4,8 +4,8 @@ LSW is a local Windows development runtime for Linux. It provides a WSL-like
 command-line experience while running a real Windows kernel inside one managed
 QEMU/KVM virtual machine per instance.
 
-The current release is `1.0.0-beta.5`. Its focus is daily usability on Linux
-x86_64: one-command installation, automatic host dependency repair, Windows
+The current source candidate is `1.0.0-beta.5`. Its focus is daily usability on
+Linux x86_64: one-command installation, automatic host dependency repair, Windows
 edition selection by name, an automatically opened installation viewer,
 configuration and log commands, redacted diagnostic bundles, safe instance
 removal, all-instance shutdown, and a machine-readable performance baseline.
@@ -256,8 +256,11 @@ scripts/check-windows-kvm-e2e.sh
 ```
 
 The operator completes normal OOBE in the viewer. The harness then verifies
-agent readiness, ConPTY/command execution, exit-code propagation, graceful
-shutdown, and cleanup of processes, sockets, and loopback ports.
+the Windows 11 build and requested edition, agent readiness, ConPTY/command
+execution, exit-code propagation, and graceful shutdown. It closes the viewer,
+uses a bare `lsw` to cold-start the installed guest without installation media,
+requires the agent-backed ConPTY shell to return without another manual login,
+then checks cleanup of QEMU, the daemon, the viewer, sockets, and loopback ports.
 
 ## Roadmap
 
@@ -309,8 +312,12 @@ It does not download Rust targets, Zig, or operating-system media.
 
 ## Current limitations
 
-- A real Windows Setup → OOBE → agent → ConPTY → shutdown run still requires a
-  KVM-capable test host and user-provided ISO.
+- A real Windows Setup → OOBE → agent → ConPTY → shutdown → cold-restart
+  run still requires a KVM-capable test host and user-provided ISO.
+- The guest agent is currently registered in the interactive user's `HKCU` Run
+  key. The beta.5 release gate therefore requires a cold boot to restore the
+  agent-backed shell without another manual sign-in; beta.5 must not be tagged
+  until that succeeds or the startup architecture is corrected.
 - The installation and recovery display uses private Unix-socket VNC internally;
   LSW opens the viewer and does not expose TCP VNC or RDP.
 - `lsw run` can start a GUI process, but per-window Wayland/X11 integration is
@@ -340,5 +347,6 @@ terms.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security model](docs/SECURITY.md)
 - [Development and release gates](docs/DEVELOPMENT.md)
+- [Real Windows/KVM release gate](docs/WINDOWS_KVM_E2E.md)
 - [License and distribution boundaries](docs/LEGAL_BOUNDARIES.md)
 - [Design references](docs/REFERENCES.md)

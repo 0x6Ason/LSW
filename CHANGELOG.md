@@ -15,8 +15,14 @@
   edition aliases such as `pro`, UTF-8/UTF-16 WIM XML handling, and answer-file
   XML escaping. Numeric image indexes remain an advanced compatibility option.
 - Added cleanup of QEMU pid/viewer artifacts and stale runtime sockets after a
-  stopped guest, plus a real Windows/KVM operator harness covering Setup, OOBE,
-  agent readiness, guest output and exit codes, graceful shutdown, and cleanup.
+  stopped guest, plus a guarded real Windows/KVM operator workflow covering
+  Setup, OOBE, Windows build/edition identity, agent readiness, true ConPTY,
+  guest exit codes, graceful shutdown, bare-`lsw` cold restart without install
+  media, and exact daemon/viewer/QEMU/socket/port cleanup. New tagged releases
+  fail closed unless that job passed for the exact commit; beta.1–beta.4 remain
+  grandfathered and untouched.
+- Removed the Windows-native process-tree test's PowerShell startup timing race;
+  it now observes descendant readiness through kernel Job Object membership.
 - Rewrote the README completely in English and documented beta.5 commands,
   measurable performance targets, roadmap order, legal boundaries, and honest
   hardware-validation limits.

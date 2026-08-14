@@ -136,6 +136,17 @@ also creates a GitHub Release with `GITHUB_TOKEN`; no repository secret is
 required. Tags containing a prerelease suffix such as `-beta.4` are published
 as prereleases.
 
+`.github/workflows/windows-kvm-e2e.yml` is the separate, attended beta release
+gate. It can run only by manual dispatch from an exact `master` commit on the
+explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. Windows media is
+pre-provisioned read-only on that runner and is verified by SHA-256; the
+workflow never downloads or uploads it. See
+[`WINDOWS_KVM_E2E.md`](WINDOWS_KVM_E2E.md) for runner isolation, protected
+environment, media provisioning, and operator instructions. Tagged releases
+after the existing beta.1–beta.4 tags fail closed unless this workflow has a
+successful real-KVM job for the exact tag commit; manual untagged bundle builds
+remain available without that hardware attestation.
+
 Before describing a build as runtime-validated, a maintainer must separately
 run the hardware gates documented in `BETA.md` on a Linux x86_64 host with KVM,
 QEMU, suitable OVMF firmware, and user-supplied licensed Windows media.

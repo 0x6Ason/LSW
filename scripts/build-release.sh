@@ -98,7 +98,8 @@ install -m 0644 -- "$windows_agent" "$staged_bundle/lsw-agent.exe"
 install -m 0755 -- scripts/install.sh "$staged_bundle/install.sh"
 install -m 0644 -- README.md CHANGELOG.md LICENSE "$staged_bundle/"
 install -m 0644 -- docs/ARCHITECTURE.md docs/BETA.md docs/LEGAL_BOUNDARIES.md \
-    docs/DEVELOPMENT.md docs/REFERENCES.md docs/SECURITY.md "$staged_bundle/docs/"
+    docs/DEVELOPMENT.md docs/REFERENCES.md docs/SECURITY.md \
+    docs/WINDOWS_KVM_E2E.md "$staged_bundle/docs/"
 (
     printf '%s\000' .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md rustfmt.toml
     find .github crates docs scripts -type f \

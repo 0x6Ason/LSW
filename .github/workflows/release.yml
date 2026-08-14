@@ -20,12 +20,100 @@ jobs:
     name: Build and verify Linux x86_64 bundle
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Require the exact-commit Windows/KVM release gate
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # These version names predate the real Windows/KVM workflow and are
+          # grandfathered so the existing beta.4 release remains untouched.
+          # Every newer tag, including beta.5, needs an exact-commit gate.
+          case "$GITHUB_REF_NAME:$GITHUB_SHA" in
+            v1.0.0-beta.1:8a056d76a99925103a522dbd36bffe46f482898d|\
+            v1.0.0-beta.2:ce7de79df8bad5bada01fd034a31584f299c4169|\
+            v1.0.0-beta.3:19b57a2d44c4ee94303f9cb6604491c9fc672934|\
+            v1.0.0-beta.4:8a6595554c4152359b5c7124fd824d5fe46e6f52)
+              echo "Windows/KVM release gate is not required for grandfathered tag $GITHUB_REF_NAME."
+              exit 0
+              ;;
+            v1.0.0-beta.1:*|v1.0.0-beta.2:*|v1.0.0-beta.3:*|v1.0.0-beta.4:*)
+              echo "error: $GITHUB_REF_NAME is reserved for its original immutable commit" >&2
+              exit 1
+              ;;
+          esac
+
+          workflow_endpoint="repos/$GITHUB_REPOSITORY/actions/workflows/windows-kvm-e2e.yml/runs"
+          candidate_runs=$(
+            gh api --method GET "$workflow_endpoint" \
+              -f event=workflow_dispatch \
+              -f status=completed \
+              -f head_sha="$GITHUB_SHA" \
+              -f per_page=100 \
+              --paginate \
+              --jq '.workflow_runs[] |
+                [.id, .head_sha, .head_branch, .event, .status, .conclusion] |
+                @tsv'
+          )
+
+          if [[ -z "$candidate_runs" ]]; then
+            echo "error: no successful Windows/KVM workflow run exists for commit $GITHUB_SHA" >&2
+            echo "Run the attended Windows/KVM release gate from master before tagging this commit." >&2
+            exit 1
+          fi
+
+          matched_run=
+          while IFS=$'\t' read -r run_id run_sha run_branch run_event run_status run_conclusion; do
+            [[ "$run_id" =~ ^[0-9]+$ ]] || continue
+            [[ "$run_sha" == "$GITHUB_SHA" ]] || continue
+            [[ "$run_branch" == master ]] || continue
+            [[ "$run_event" == workflow_dispatch ]] || continue
+            [[ "$run_status" == completed && "$run_conclusion" == success ]] || continue
+            matching_jobs=$(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] |
+                  select(.name == "Windows 11 Setup, agent, ConPTY, and cold restart") |
+                  select(.status == "completed" and .conclusion == "success") |
+                  select((.labels // []) | index("self-hosted")) |
+                  select((.labels // []) | index("Linux")) |
+                  select((.labels // []) | index("X64")) |
+                  select((.labels // []) | index("lsw-windows-kvm-e2e")) |
+                  select(any(.steps[]?;
+                    .name == "Verify the trusted runner and release candidate" and
+                    .conclusion == "success")) |
+                  select(any(.steps[]?;
+                    .name == "Run the real Windows/KVM gate" and
+                    .conclusion == "success")) |
+                  .id'
+            )
+            if [[ -n "$matching_jobs" ]]; then
+              matched_run=$run_id
+              break
+            fi
+          done <<<"$candidate_runs"
+
+          if [[ -z "$matched_run" ]]; then
+            echo "error: successful workflow metadata exists for $GITHUB_SHA, but no completed KVM runner job passed the real gate" >&2
+            exit 1
+          fi
+
+          gate_url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$matched_run"
+          echo "Validated exact tag commit $GITHUB_SHA with $gate_url"
+          {
+            echo "## Windows/KVM release gate"
+            echo
+            echo "Exact commit \`$GITHUB_SHA\` was validated by [run $matched_run]($gate_url)."
+          } >>"$GITHUB_STEP_SUMMARY"
       - name: Install Rust 1.76.0 and the Windows GNU target
         run: |
           rustup toolchain install 1.76.0 --profile minimal --component rustfmt --component clippy

@@ -49,7 +49,9 @@ automation 串成一條完整路徑。
 與 daemon 的 host-side lifecycle 由 CI 的 pathname-socket product gate 負責，本 VPS 沒有
 執行該 gate；以下 Windows 工作負載仍不能宣稱實機通過：
 
-- KVM cold boot、Windows 11 Setup、OOBE、第一次登入與 HKCU agent autorun
+- KVM cold boot、Windows 11 Setup、OOBE、第一次登入與 HKCU agent autorun；以及
+  完整 shutdown 後，在不再手動登入、不掛載 ISO/seed 的情況下用裸 `lsw`
+  恢復 agent-backed ConPTY shell
 - 各 Linux distribution 的 OVMF/secure-variable 路徑差異
 - Windows firewall rule、QEMU slirp 的 `10.0.2.2` source matching
 - 低階 loopback hostfwd listener 已驗證；`--publish` 對真實 guest TCP service 的資料傳輸
@@ -94,7 +96,8 @@ automation 串成一條完整路徑。
 3. 先測 guided install，再以 disposable instance 測 `--unattended-index`。
 4. 完成 OOBE/first logon，測 ConPTY shell（Unicode、Ctrl、resize、stdin EOF、取消、
    斷線與 lease expiry）、exit-code propagation、descendant cleanup、1 GiB file transfer
-   及並行命令。
+   及並行命令；再完整 shutdown、關閉 viewer，以裸 `lsw` 驗證無第二次
+   手動登入的冷啟動恢復。
 5. 發布 disposable guest TCP service，確認 listener 只在 `127.0.0.1`，並測 port collision。
 6. 測 suspend/resume、graceful stop、guest crash、daemon restart 與 stale-socket recovery。
 7. 分別測 `offline`、`ephemeral` 與 key-enrolled `secure` profile。

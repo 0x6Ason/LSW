@@ -653,6 +653,8 @@ mod process_tree {
 
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
+    #[cfg(test)]
+    const JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS: u32 = 3;
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
     const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
     const THREAD_SUSPEND_RESUME: u32 = 0x0000_0002;
@@ -704,6 +706,15 @@ mod process_tree {
         peak_job_memory_used: usize,
     }
 
+    #[cfg(test)]
+    #[repr(C)]
+    #[derive(Default)]
+    struct JobObjectBasicProcessIdList {
+        number_of_assigned_processes: u32,
+        number_of_process_ids_in_list: u32,
+        process_ids: [usize; 8],
+    }
+
     #[repr(C)]
     struct ThreadEntry32 {
         size: u32,
@@ -744,6 +755,15 @@ mod process_tree {
         #[cfg(test)]
         #[link_name = "OpenProcess"]
         fn open_process(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        #[cfg(test)]
+        #[link_name = "QueryInformationJobObject"]
+        fn query_information_job_object(
+            job: Handle,
+            information_class: u32,
+            information: *mut c_void,
+            information_length: u32,
+            return_length: *mut u32,
+        ) -> i32;
         #[link_name = "ResumeThread"]
         fn resume_thread(thread: Handle) -> u32;
         #[link_name = "SetInformationJobObject"]
@@ -789,6 +809,11 @@ mod process_tree {
     impl Owner {
         pub(super) fn terminate(&self, exit_code: i32) -> io::Result<()> {
             self.job.terminate(exit_code)
+        }
+
+        #[cfg(test)]
+        pub(super) fn process_ids(&self) -> io::Result<Vec<u32>> {
+            self.job.process_ids()
         }
     }
 
@@ -843,6 +868,45 @@ mod process_tree {
             } else {
                 Ok(())
             }
+        }
+
+        #[cfg(test)]
+        fn process_ids(&self) -> io::Result<Vec<u32>> {
+            let mut information = JobObjectBasicProcessIdList::default();
+            let information_length = u32::try_from(size_of::<JobObjectBasicProcessIdList>())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "Job process list is too large")
+                })?;
+            if unsafe {
+                query_information_job_object(
+                    self.handle.as_raw_handle(),
+                    JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS,
+                    (&mut information as *mut JobObjectBasicProcessIdList).cast::<c_void>(),
+                    information_length,
+                    ptr::null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let listed =
+                usize::try_from(information.number_of_process_ids_in_list).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Job process count is invalid")
+                })?;
+            if listed > information.process_ids.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Job process list exceeded its test buffer",
+                ));
+            }
+            information.process_ids[..listed]
+                .iter()
+                .map(|process_id| {
+                    u32::try_from(*process_id).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Job process id exceeds u32")
+                    })
+                })
+                .collect()
         }
     }
 
@@ -2311,45 +2375,41 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_pipe_job_terminates_a_spawned_descendant() {
-        use std::io::{BufRead, BufReader};
-
-        let script = r#"$p = Start-Process -FilePath "$env:SystemRoot\System32\ping.exe" -ArgumentList @('-n','30','127.0.0.1') -PassThru; [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush(); Wait-Process -Id $p.Id"#;
         let mut child = spawn_program(
-            "powershell.exe",
-            &[
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ],
+            "cmd.exe",
+            &["/D", "/Q", "/C", "ping.exe -n 30 127.0.0.1 >NUL"],
             None,
         )
-        .expect("PowerShell should start inside a Job Object");
-        let stdout = child
-            .process
-            .stdout
-            .take()
-            .expect("PowerShell stdout should be piped");
-        let (line_sender, line_receiver) = mpsc::channel();
-        let reader = thread::spawn(move || {
-            let mut line = String::new();
-            let result = BufReader::new(stdout).read_line(&mut line).map(|_| line);
-            let _ = line_sender.send(result);
-        });
-        let descendant = line_receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("PowerShell should report its descendant promptly")
-            .expect("PowerShell descendant output should be readable")
-            .trim()
-            .parse::<u32>()
-            .expect("PowerShell should report a numeric descendant PID");
+        .expect("cmd should start inside a Job Object");
+        let leader = child.process.id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // Observe kernel-owned Job membership instead of treating shell output
+        // as readiness. This keeps the lifecycle assertion independent of
+        // PowerShell cold-start and Start-Process scheduling delays.
+        let descendant = loop {
+            let process_ids = child
+                .tree
+                .as_ref()
+                .expect("spawned process should retain its Job Object")
+                .process_ids()
+                .expect("Job Object process membership should be queryable");
+            if let Some(process_id) = process_ids
+                .into_iter()
+                .find(|process_id| *process_id != leader)
+            {
+                break process_id;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cmd did not start its ping descendant within 10 seconds"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
 
         let (_, terminated) = child
             .terminate()
             .expect("Job Object termination should succeed");
         assert!(terminated);
-        reader.join().expect("stdout reader should not panic");
         assert!(
             process_tree::wait_for_process_id_exit(descendant, 2_000)
                 .expect("descendant state should be queryable"),

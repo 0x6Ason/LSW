@@ -131,7 +131,7 @@ fi
 for required_file in \
     BUILDINFO.txt CHANGELOG.md LICENSE README.md SOURCE-MANIFEST.sha256 \
     install.sh lsw lsw-agent.exe lswd \
-    docs/DEVELOPMENT.md \
+    docs/DEVELOPMENT.md docs/WINDOWS_KVM_E2E.md \
     source/Cargo.lock source/Cargo.toml source/LICENSE source/README.md \
     source/crates/lsw-agent/Cargo.toml source/crates/lsw-agent/src/main.rs \
     source/crates/lsw-cli/Cargo.toml source/crates/lsw-cli/src/main.rs \
