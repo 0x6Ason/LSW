@@ -12,6 +12,9 @@ pub struct HostCapabilities {
     pub qemu_system: Option<PathBuf>,
     pub qemu_img: Option<PathBuf>,
     pub swtpm: Option<PathBuf>,
+    pub wimlib_imagex: Option<PathBuf>,
+    pub xorriso: Option<PathBuf>,
+    pub remote_viewer: Option<PathBuf>,
     pub ovmf_code: Option<PathBuf>,
     pub ovmf_vars: Option<PathBuf>,
     pub ovmf_secure_code: Option<PathBuf>,
@@ -37,6 +40,9 @@ impl HostCapabilities {
             qemu_system: command_in_path("qemu-system-x86_64"),
             qemu_img: command_in_path("qemu-img"),
             swtpm: command_in_path("swtpm"),
+            wimlib_imagex: command_in_path("wimlib-imagex"),
+            xorriso: command_in_path("xorriso"),
+            remote_viewer: command_in_path("remote-viewer"),
             ovmf_code: configured_or_first_existing(
                 "LSW_OVMF_CODE",
                 &[
@@ -83,6 +89,9 @@ impl HostCapabilities {
             qemu_system: None,
             qemu_img: None,
             swtpm: None,
+            wimlib_imagex: None,
+            xorriso: None,
+            remote_viewer: None,
             ovmf_code: None,
             ovmf_vars: None,
             ovmf_secure_code: None,
@@ -112,6 +121,23 @@ impl HostCapabilities {
         if self.ovmf_vars.is_none() {
             missing.push("OVMF variable template");
         }
+        missing
+    }
+
+    pub fn missing_for_install_workflow(&self) -> Vec<&'static str> {
+        let mut missing = self.missing_for_launch();
+        missing.extend(self.missing_for_preparation());
+        if self.wimlib_imagex.is_none() {
+            missing.push("wimlib-imagex");
+        }
+        if self.xorriso.is_none() {
+            missing.push("xorriso");
+        }
+        if self.remote_viewer.is_none() {
+            missing.push("remote-viewer");
+        }
+        missing.sort_unstable();
+        missing.dedup();
         missing
     }
 

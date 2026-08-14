@@ -55,6 +55,7 @@ impl Supervisor {
                 if let Some(mut managed) = self.processes.remove(&name) {
                     stop_helpers(&mut managed.helpers);
                     remove_shutdown_marker(&self.store, &name);
+                    cleanup_stopped_runtime_artifacts(&self.store, &name);
                     self.remove_ephemeral_overlay(&name);
                     let next = if status.success() {
                         InstanceState::Stopped
@@ -81,6 +82,7 @@ impl Supervisor {
                     stop_helpers(&mut managed.helpers);
                 }
                 remove_shutdown_marker(&self.store, &name);
+                cleanup_stopped_runtime_artifacts(&self.store, &name);
                 self.remove_ephemeral_overlay(&name);
                 if let Err(error) = self.set_state(&name, InstanceState::Failed) {
                     eprintln!("lswd: could not mark {name:?} failed after helper exit: {error}");
@@ -124,6 +126,7 @@ impl Supervisor {
         let provisioner = Provisioner::new(self.capabilities.clone());
         let preparation = provisioner.plan(&manifest, &instance_dir)?;
         provisioner.apply(&preparation)?;
+        cleanup_stopped_runtime_artifacts(&self.store, name);
         cleanup_runtime_sockets(&instance_dir)?;
         remove_shutdown_marker(&self.store, name);
         if phase == LaunchPhase::Run && manifest.spec.profile == WindowsProfile::Ephemeral {
@@ -258,6 +261,7 @@ impl Supervisor {
         }
         self.set_state(name, InstanceState::Stopped)?;
         remove_shutdown_marker(&self.store, name);
+        cleanup_stopped_runtime_artifacts(&self.store, name);
         self.remove_ephemeral_overlay(name);
         Ok(vec![format!("instance {name} stopped")])
     }
@@ -298,6 +302,7 @@ impl Supervisor {
                     };
                     self.set_state(name, state)?;
                     remove_shutdown_marker(&self.store, name);
+                    cleanup_stopped_runtime_artifacts(&self.store, name);
                     self.remove_ephemeral_overlay(name);
                     state
                 } else {
@@ -540,6 +545,26 @@ fn remove_shutdown_marker(store: &StateStore, name: &str) {
         }
         _ => {}
     }
+}
+
+fn cleanup_stopped_runtime_artifacts(store: &StateStore, name: &str) {
+    let Ok(instance_dir) = store.instance_dir(name) else {
+        return;
+    };
+    for path in [
+        instance_dir.join("run/qemu.pid"),
+        instance_dir.join("run/installation-viewer.vv"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+            {
+                let _ = fs::remove_file(path);
+            }
+            _ => {}
+        }
+    }
+    let _ = cleanup_runtime_sockets(&instance_dir);
 }
 
 fn wait_for_socket(

@@ -8,7 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{LswError, Result, WindowsProfile};
 
-const MANIFEST_VERSION: u32 = 3;
+const MANIFEST_VERSION: u32 = 4;
+pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkMode {
@@ -255,6 +256,7 @@ pub struct InstanceManifest {
     pub state: InstanceState,
     pub control_port: u16,
     pub created_unix_seconds: u64,
+    pub idle_timeout_seconds: u64,
 }
 
 impl InstanceManifest {
@@ -274,11 +276,13 @@ impl InstanceManifest {
             spec,
             state: InstanceState::Configured,
             created_unix_seconds,
+            idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
         })
     }
 
     pub fn encode(&self) -> Result<String> {
         self.spec.validate()?;
+        validate_idle_timeout(self.idle_timeout_seconds)?;
         let source_iso = self
             .spec
             .source_iso
@@ -310,7 +314,8 @@ impl InstanceManifest {
                 "allow_unsupported_requirements={}\n",
                 "state={}\n",
                 "control_port={}\n",
-                "created_unix_seconds={}\n"
+                "created_unix_seconds={}\n",
+                "idle_timeout_seconds={}\n"
             ),
             MANIFEST_VERSION,
             self.spec.name,
@@ -326,6 +331,7 @@ impl InstanceManifest {
             self.state,
             self.control_port,
             self.created_unix_seconds,
+            self.idle_timeout_seconds,
         ))
     }
 
@@ -346,7 +352,7 @@ impl InstanceManifest {
         }
 
         let version = parse_field::<u32>(&fields, "version")?;
-        if !matches!(version, 1 | 2 | MANIFEST_VERSION) {
+        if !matches!(version, 1 | 2 | 3 | MANIFEST_VERSION) {
             return Err(LswError::InvalidManifest(format!(
                 "unsupported manifest version {version}"
             )));
@@ -383,12 +389,31 @@ impl InstanceManifest {
             )));
         }
 
+        let idle_timeout_seconds = if version >= 4 {
+            parse_field(&fields, "idle_timeout_seconds")?
+        } else {
+            DEFAULT_IDLE_TIMEOUT_SECONDS
+        };
+        validate_idle_timeout(idle_timeout_seconds)?;
+
         Ok(Self {
             version: MANIFEST_VERSION,
             spec,
             state: required_field(&fields, "state")?.parse()?,
             control_port,
             created_unix_seconds: parse_field(&fields, "created_unix_seconds")?,
+            idle_timeout_seconds,
+        })
+    }
+}
+
+fn validate_idle_timeout(seconds: u64) -> Result<()> {
+    if seconds <= 31_536_000 {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "idle timeout",
+            reason: "must be 0 (disabled) or no more than 365 days".to_owned(),
         })
     }
 }
@@ -559,9 +584,10 @@ mod tests {
         let legacy = manifest
             .encode()
             .expect("manifest should encode")
-            .replace("version=3\n", "version=1\n")
+            .replace("version=4\n", "version=1\n")
             .replace("network=nat\n", "")
-            .replace("port_forwards=\n", "");
+            .replace("port_forwards=\n", "")
+            .replace("idle_timeout_seconds=600\n", "");
         let migrated = InstanceManifest::decode(&legacy).expect("v1 manifest should migrate");
         assert_eq!(migrated.version, MANIFEST_VERSION);
         assert_eq!(migrated.spec.network, NetworkMode::Offline);
@@ -588,11 +614,38 @@ mod tests {
         let legacy = manifest
             .encode()
             .expect("manifest should encode")
-            .replace("version=3\n", "version=2\n")
-            .replace("port_forwards=\n", "");
+            .replace("version=4\n", "version=2\n")
+            .replace("port_forwards=\n", "")
+            .replace("idle_timeout_seconds=600\n", "");
         let migrated = InstanceManifest::decode(&legacy).expect("v2 manifest should migrate");
         assert_eq!(migrated.spec.network, NetworkMode::Nat);
         assert!(migrated.spec.port_forwards.is_empty());
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn version_three_manifests_receive_the_default_idle_timeout() {
+        let iso = temporary_iso();
+        let manifest = InstanceManifest::new(InstanceSpec {
+            name: "version-three".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("manifest should be valid");
+        let legacy = manifest
+            .encode()
+            .expect("manifest should encode")
+            .replace("version=4\n", "version=3\n")
+            .replace("idle_timeout_seconds=600\n", "");
+        let migrated = InstanceManifest::decode(&legacy).expect("v3 manifest should migrate");
+        assert_eq!(migrated.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS);
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 

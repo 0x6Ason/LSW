@@ -16,6 +16,7 @@ const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 pub struct InstallSeedOptions {
     pub locale: String,
     pub unattended_image_index: Option<u32>,
+    pub unattended_image_name: Option<String>,
     pub agent_binary: Option<PathBuf>,
 }
 
@@ -24,6 +25,7 @@ impl Default for InstallSeedOptions {
         Self {
             locale: "en-US".to_owned(),
             unattended_image_index: None,
+            unattended_image_name: None,
             agent_binary: None,
         }
     }
@@ -47,7 +49,7 @@ impl InstallSeedPlan {
             .collect::<Vec<_>>();
         if self.wipes_virtual_disk {
             lines.push(
-                "warning: Autounattend.xml will wipe virtual Disk 0 and install the selected image index"
+                "warning: Autounattend.xml will wipe virtual Disk 0 and install the selected Windows edition"
                     .to_owned(),
             );
         }
@@ -86,6 +88,24 @@ impl InstallSeedBuilder {
                 field: "image index",
                 reason: "must be at least 1".to_owned(),
             });
+        }
+        if options.unattended_image_index.is_some() && options.unattended_image_name.is_some() {
+            return Err(LswError::InvalidValue {
+                field: "Windows edition",
+                reason: "image index and edition name cannot both be selected".to_owned(),
+            });
+        }
+        if let Some(name) = &options.unattended_image_name {
+            if name.is_empty()
+                || name.len() > 256
+                || name.contains(['\r', '\n'])
+                || name.chars().any(|character| character.is_control())
+            {
+                return Err(LswError::InvalidValue {
+                    field: "Windows edition",
+                    reason: "the media-provided edition name is invalid".to_owned(),
+                });
+            }
         }
 
         let destination = instance_dir.join("seed");
@@ -157,7 +177,8 @@ impl InstallSeedBuilder {
         Ok(InstallSeedPlan {
             destination,
             files,
-            wipes_virtual_disk: options.unattended_image_index.is_some(),
+            wipes_virtual_disk: options.unattended_image_index.is_some()
+                || options.unattended_image_name.is_some(),
             includes_agent: options.agent_binary.is_some(),
             generated,
         })
@@ -216,9 +237,17 @@ impl InstallSeedBuilder {
 }
 
 fn autounattend(manifest: &InstanceManifest, options: &InstallSeedOptions) -> String {
-    let disk = options
-        .unattended_image_index
-        .map(|index| {
+    let selection = options
+        .unattended_image_name
+        .as_ref()
+        .map(|name| ("/IMAGE/NAME", xml_escape(name)))
+        .or_else(|| {
+            options
+                .unattended_image_index
+                .map(|index| ("/IMAGE/INDEX", index.to_string()))
+        });
+    let disk = selection
+        .map(|(key, value)| {
             format!(
                 r#"
       <DiskConfiguration>
@@ -239,7 +268,7 @@ fn autounattend(manifest: &InstanceManifest, options: &InstallSeedOptions) -> St
       </DiskConfiguration>
       <ImageInstall>
         <OSImage>
-          <InstallFrom><MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>{index}</Value></MetaData></InstallFrom>
+          <InstallFrom><MetaData wcm:action="add"><Key>{key}</Key><Value>{value}</Value></MetaData></InstallFrom>
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
           <WillShowUI>OnError</WillShowUI>
         </OSImage>
@@ -382,6 +411,15 @@ fn validate_locale(locale: &str) -> Result<()> {
     }
 }
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn windows_computer_name(instance: &str) -> String {
     let mut name = format!("LSW-{}", instance.to_ascii_uppercase())
         .chars()
@@ -480,6 +518,7 @@ mod tests {
         let options = InstallSeedOptions {
             locale: "zh-HK".to_owned(),
             unattended_image_index: Some(3),
+            unattended_image_name: None,
             agent_binary: None,
         };
         let plan = InstallSeedBuilder::plan(&manifest, &root, &"b".repeat(64), &options)
@@ -491,6 +530,28 @@ mod tests {
         let profile = fs::read_to_string(root.join("seed/lsw/apply-profile.ps1"))
             .expect("profile should be readable");
         assert!(profile.contains("Remove-AppxProvisionedPackage"));
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn unattended_edition_uses_the_media_name_and_escapes_xml() {
+        let (root, manifest) = fixture();
+        let options = InstallSeedOptions {
+            unattended_image_name: Some("Windows 11 Pro & Development".to_owned()),
+            ..InstallSeedOptions::default()
+        };
+        let plan = InstallSeedBuilder::plan(&manifest, &root, &"c".repeat(64), &options)
+            .expect("edition-name seed should be generated");
+        let answer = String::from_utf8(
+            plan.generated
+                .get(Path::new("Autounattend.xml"))
+                .expect("answer file should exist")
+                .clone(),
+        )
+        .expect("answer file should be UTF-8");
+        assert!(answer.contains("<Key>/IMAGE/NAME</Key>"));
+        assert!(answer.contains("Windows 11 Pro &amp; Development"));
+        assert!(plan.wipes_virtual_disk);
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 

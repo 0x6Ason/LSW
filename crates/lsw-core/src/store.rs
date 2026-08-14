@@ -85,6 +85,39 @@ impl StateStore {
         write_atomic(&instance_dir.join(MANIFEST_FILE), encoded.as_bytes())
     }
 
+    pub fn remove(&self, name: &str) -> Result<()> {
+        let instance_dir = self.instance_dir(name)?;
+        if !is_real_directory(&instance_dir)? {
+            return Err(LswError::InstanceNotFound(name.to_owned()));
+        }
+        let manifest = self.load(name)?;
+        if matches!(
+            manifest.state,
+            crate::InstanceState::Installing
+                | crate::InstanceState::Running
+                | crate::InstanceState::Suspended
+        ) {
+            return Err(LswError::InvalidValue {
+                field: "instance state",
+                reason: format!(
+                    "instance {name:?} is {}; shut it down before removing it",
+                    manifest.state
+                ),
+            });
+        }
+
+        fs::remove_dir_all(&instance_dir)?;
+        let default_path = self.root.join(DEFAULT_INSTANCE_FILE);
+        if is_regular_file(&default_path).unwrap_or(false)
+            && fs::read_to_string(&default_path)
+                .map(|value| value.trim() == name)
+                .unwrap_or(false)
+        {
+            fs::remove_file(default_path)?;
+        }
+        Ok(())
+    }
+
     pub fn load(&self, name: &str) -> Result<InstanceManifest> {
         let instance_dir = self.instance_dir(name)?;
         if !is_real_directory(&instance_dir)? {
@@ -434,6 +467,44 @@ mod tests {
         );
         assert_eq!(store.list().expect("instances should list"), vec![manifest]);
 
+        fs::remove_dir_all(root).expect("test root should be removable");
+    }
+
+    #[test]
+    fn remove_deletes_a_stopped_instance_and_its_default_selection() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lsw-store-remove-test-{nonce}"));
+        let iso = root.join("windows.iso");
+        fs::create_dir_all(&root).expect("test root should be created");
+        fs::write(&iso, b"test media").expect("test ISO should be created");
+        let mut manifest = InstanceManifest::new(InstanceSpec {
+            name: "removable-instance".to_owned(),
+            source_iso: iso,
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("manifest should be valid");
+        manifest.state = crate::InstanceState::Stopped;
+        let store = StateStore::new(root.join("state"));
+        let instance_dir = store.create(&manifest).expect("instance should be stored");
+        fs::write(instance_dir.join("disk.qcow2"), b"disk").expect("disk should be written");
+        store
+            .set_default("removable-instance")
+            .expect("default should be stored");
+        store
+            .remove("removable-instance")
+            .expect("stopped instance should be removable");
+        assert!(!instance_dir.exists());
+        assert!(store.default_name().expect("default should load").is_none());
         fs::remove_dir_all(root).expect("test root should be removable");
     }
 

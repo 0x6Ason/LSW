@@ -30,9 +30,11 @@ validation claims in beta.4.
 
 ## Lifecycle
 
-1. `lsw create` validates the requested shape and stores manifest v3 plus a
-   random 256-bit per-instance agent token. It does not copy the ISO. Version 1
-   and 2 manifests migrate with no published ports.
+1. `lsw install --iso --edition` provides the beta.5 beginner path; `lsw create`
+   remains an advanced primitive. Both validate the requested shape and store
+   manifest v4 plus a random 256-bit per-instance agent token. It does not copy
+   the ISO. Version 1 and 2 manifests migrate with no published ports; version
+   3 manifests receive the default idle-timeout setting.
 2. `lsw install` creates a read-only Setup seed if one does not exist, prepares
    qcow2 storage and a private OVMF variable store, starts swtpm, then starts
    QEMU in install mode. Guided installation is the default.

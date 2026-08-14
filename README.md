@@ -1,192 +1,344 @@
 # LSW 1.0 beta
 
-LSW 是 Linux 上的本機 Windows 開發執行環境。操作方式接近容器：選定一個預設
-instance 後，可直接進入 PowerShell／CMD、執行 Windows 程式及傳輸檔案；實際隔離
-邊界則是 QEMU/KVM microVM，因為 Windows 核心不能與 Linux host 共用。
+LSW is a local Windows development runtime for Linux. It provides a WSL-like
+command-line experience while running a real Windows kernel inside one managed
+QEMU/KVM virtual machine per instance.
 
-目前版本為 `1.0.0-beta.4`。CLI、QMP 生命週期、Windows guest agent、安裝 seed、
-檔案傳輸、ConPTY 終端機、具 lease 的受控 session 與 ephemeral overlay 已實作。逐視窗
-Wayland/X11 整合尚未完成，因此 GUI 安裝／救援暫時使用 private Unix-socket VNC。
-ConPTY 及真正的 Windows/KVM 開機路徑仍需在實機完成 E2E gate；詳見
-[beta 狀態](docs/BETA.md)。
+The current release is `1.0.0-beta.5`. Its focus is daily usability on Linux
+x86_64: one-command installation, automatic host dependency repair, Windows
+edition selection by name, an automatically opened installation viewer,
+configuration and log commands, redacted diagnostic bundles, safe instance
+removal, all-instance shutdown, and a machine-readable performance baseline.
 
-## 支援範圍
+LSW does not start a new VM for every application. Shells, commands, file
+transfers, and GUI processes for an instance all use the same running Windows
+guest.
 
-- Host runtime：Linux x86_64；KVM 建議使用，TCG 只適合診斷。程式碼已分離 backend
-  選擇，並能產生 HVF／WHPX 參數，但 macOS／Windows host 尚未成為可交付 runtime。
-- Guest：使用者自行提供及授權的 Windows 11 x64 安裝 ISO。
-- Runtime：QEMU、`qemu-img`、OVMF 及 swtpm。
-- LSW 不下載或散布 Windows、產品金鑰、啟用資料、預先啟用磁碟或 Tiny11 image。
+## Product principles
 
-「container-like」指 UX 與 image lifecycle，不代表可達到 Linux namespace 容器的
-記憶體密度或冷啟動速度。
+- Running `lsw` starts the default Windows instance when necessary and enters
+  PowerShell, with Windows PowerShell and CMD as fallbacks.
+- Users do not need to operate QEMU, OVMF, swtpm, QMP, or VNC sockets directly.
+- Windows is installed once per instance. Linked-clone image workflows are
+  planned for beta.7.
+- The default device model uses Windows inbox NVMe, e1000e, and VGA drivers.
+  Signed VirtIO acceleration will remain optional.
+- The `secure` profile always retains a driverless path.
+- LSW manages a complete Windows kernel, so it cannot match the absolute memory
+  density of a Linux namespace container. The goal is WSL-like lifecycle and
+  memory behavior, not misleading container terminology.
 
-在無 `/dev/kvm` 及 Windows ISO 的 headless Codex VPS 上，已用暫存的 Ubuntu 官方
-套件實際跑通 QEMU 8.2.2 TCG、OVMF、`qemu-img`、swtpm/vTPM、TCP QMP
-`stop`/`cont`/`quit`，以及兩個只綁定 `127.0.0.1`、分別轉到 guest 5040/8080 的
-host forwarding endpoint；QEMU 結束後兩個 host port 亦已釋放。QEMU 與 swtpm
-都正常結束。
-這項 firmware-level smoke test 證明基礎 VM 組合能啟動，不代表 Windows Setup、
-登入後 agent 或 ConPTY 已完成 E2E 驗收。
+## Supported scope
 
-CI 另有一個不允許 skip 的 product-lifecycle gate：它透過真正的 `lsw create`／
-`prepare`／planner 與 `lswd`，以無 Windows 內容的 placeholder media 驗證 OVMF、NVMe、
-e1000e、vTPM、agent 與 published loopback hostfwd，以及 install、start、status、
-suspend、resume、forced stop。這台 VPS 的 sandbox 對 pathname AF_UNIX `bind` 回傳
-`EPERM`，因此這項產品 gate 只在 CI 執行；它同樣不代表 Windows guest 已開機。
+- Host runtime: Linux x86_64. KVM is strongly recommended; TCG is diagnostic
+  only.
+- Guest: a user-supplied and properly licensed Windows 11 x64 installation ISO.
+- Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, and
+  remote-viewer.
+- LSW never downloads or distributes Windows media, product keys, activation
+  data, preactivated disks, or modified Windows images.
 
-## 快速開始
+The backend layer can plan HVF and WHPX arguments, but macOS and Windows hosts
+are not supported deliverables in this beta.
 
-先安裝發行 bundle，再檢查 host：
+## Quick start
+
+Install the release bundle and repair host dependencies:
 
 ```bash
 ./install.sh
-lsw doctor
+lsw doctor --fix
 ```
 
-建立 instance。`--accept-license` 只記錄你已接受自己所提供媒體的授權條款：
+Create and start a Windows development environment in one command:
 
 ```bash
-lsw create win-dev \
-  --iso /absolute/path/Windows11.iso \
-  --profile slim \
-  --accept-license
+lsw install win-dev \
+  --iso ~/Downloads/Windows11.iso \
+  --edition pro \
+  --profile slim
 ```
 
-若需要把 guest TCP service 發布給 host，可重複使用 `--publish HOST:GUEST`：
+The one-shot installer performs the following steps:
+
+1. Checks the host and installs missing packages through the distribution's
+   package manager.
+2. Reads edition names from `sources/install.wim` or `install.esd` in the ISO.
+3. Creates the instance manifest, sparse qcow2 disk, private OVMF variables,
+   runtime directories, and vTPM state.
+4. Creates a read-only installation seed containing the answer file and the
+   matching LSW guest agent.
+5. Starts Windows Setup and opens the integrated installation viewer.
+
+`--edition pro` is matched against the ISO metadata and is written to the
+answer file as `/IMAGE/NAME`; users no longer need to guess a WIM index. The
+selected edition flow wipes only that instance's dedicated virtual Disk 0.
+It never touches a host disk.
+
+Edition inspection temporarily extracts the ISO's install WIM/ESD into LSW's
+private state directory and removes it immediately after reading its metadata.
+Ensure the state filesystem has enough free space for that temporary file.
+
+The command records that the user is responsible for the license terms of the
+media they supplied. It does not add a product key, bypass activation, skip
+OOBE, or create a prebuilt account.
+
+On a headless host, pass `--no-viewer`; later, reopen the display from a Linux
+graphical session without handling a socket path:
 
 ```bash
-lsw create win-web \
-  --iso /absolute/path/Windows11.iso \
-  --publish 8080:80 \
-  --publish 8443:443 \
-  --accept-license
+lsw view win-dev
 ```
 
-這些 port 只綁定 host 的 `127.0.0.1`，不會建立 LAN listener；`offline` network 不允許
-額外 port publishing。LSW 會拒絕重複、已由其他 instance 使用、目前無法在 loopback
-綁定，或與 agent control port 衝突的 host port。
-
-啟動安裝：
-
-```bash
-lsw install win-dev
-```
-
-發行 bundle 會自動把 `lsw-agent.exe` 放入唯讀安裝 seed。預設為 guided install：
-Windows edition、磁碟選擇及正常 OOBE 仍由使用者完成。命令會印出 private VNC Unix
-socket 路徑，供支援 Unix-socket VNC 的 viewer 完成安裝；它不開 TCP VNC 或 RDP。
-
-若要自動選擇 image 並重建專用虛擬 Disk 0，必須明確指定：
-
-```bash
-lsw install win-dev --locale zh-TW --unattended-index 6
-```
-
-這個選項會清除該 instance 的虛擬 Disk 0。它不會動到 host disk，但仍應先核對
-instance 名稱及 Windows ISO 中的 image index。產生的 answer file 不含產品金鑰、
-啟用繞過、`SkipMachineOOBE` 或預建帳號。
-
-完成 OOBE 並第一次以管理員使用者登入後，agent 會安裝至 user session。之後可用：
+After completing OOBE and the first administrative login:
 
 ```bash
 lsw use win-dev
-lsw                         # pwsh -> Windows PowerShell -> cmd fallback
+lsw                         # enter PowerShell in the default instance
 lsw exec -- cmd.exe /c ver
 lsw run -- notepad.exe
 lsw push ./main.rs 'C:\Users\you\src\main.rs'
 lsw pull 'C:\build\app.exe' ./app.exe
-lsw status
-lsw suspend                  # QMP stop；VM 仍留在記憶體
-lsw resume
-lsw stop
 ```
 
-在互動式 host TTY 上，`lsw shell` 會與支援 capability 的 agent 協商 ConPTY，轉送
-console input/output 並同步 terminal resize；舊版或不支援 ConPTY 的 agent 仍使用 pipe
-session。`session-control-v1` capability 讓 stdin EOF 以明確 frame 關閉輸入但讓程式
-正常結束；取消回報 exit code 130，連線中斷則依協商選項清理 session。beta.4 另以
-`session-lease-v1` capability 協商 1–300 秒的有界 heartbeat lease；預設為 120 秒，client
-每 30 秒送一次 heartbeat，逾時會關閉 socket 並清理由該 session 擁有的 processes。只有
-同時支援 control 與 lease 的雙方才啟用，舊 agent 保留原有 TCP half-close 行為。
+`lsw exec` waits and returns the real guest exit code. `lsw run` currently uses
+the same session transport and waits; detached GUI launch becomes the default
+in beta.6 when the lifecycle contract for detached processes lands.
 
-在 Unix，child 會在執行前進入獨立 process group，正常 leader 結束、取消、斷線、協定
-錯誤或 lease 到期時都會清掉仍留在該 group 的 processes；自行呼叫 `setsid`／`setpgid`
-的程式仍可逃離，因此這不是安全 sandbox。Windows 端會先 suspended-create，再於 resume
-前加入 kill-on-close Job Object，失敗就不讓 child 執行。Windows-native CI 測試涵蓋
-Job descendant cleanup 與 ConPTY setup；這台 Linux VPS 只有 cross-build，且仍未在登入
-後的真 Windows ConPTY session 完成 E2E 驗收。
-
-`lsw run` 已能在登入中的 Windows session 啟動程式，但 beta 尚未把個別 HWND 映射成
-Linux native window；GUI 仍只能從安裝／救援 display 看到。`lsw suspend` 只是暫停目前
-QEMU process 的 in-memory VM，不是休眠或磁碟 snapshot；QEMU／host 結束後不能靠它復原。
-
-若要在建立 VM 前檢查 Windows binary，可直接分析 PE，不需要 state directory：
+## Daily management
 
 ```bash
-lsw inspect ./app.exe
-lsw inspect ./app.exe --imports
-lsw inspect ./app.exe --json
+lsw config get win-dev
+lsw config set win-dev memory.max=4GiB idle-timeout=10m
+lsw logs win-dev
+lsw logs win-dev --follow
+lsw status win-dev
+lsw suspend win-dev
+lsw resume win-dev
+lsw shutdown --all
+lsw diagnose win-dev --bundle
+lsw remove win-dev
 ```
 
-inspector 會報告 machine、subsystem、sections、imports、CLR/certificate table 與 beta
-相容性提示；「certificate table present」不等於已完成 Authenticode 密碼學驗證。
+`memory.max` is applied to the next QEMU start. `idle-timeout` is stored in
+manifest v4 so the beta.7 memory and hibernation governor can enforce one
+stable configuration contract; beta.5 does not yet hibernate automatically.
+
+`lsw diagnose --bundle` creates a support archive containing a redacted
+manifest, host capability report, daemon status, a redacted QEMU plan, and
+bounded log tails. It excludes the agent token, installation seed, Windows
+media, virtual disks, and absolute ISO/state paths.
+
+`lsw remove` refuses to remove an active instance. Shut it down first; removal
+then deletes that instance's manifest, firmware variables, local virtual disk,
+seed, TPM state, and logs.
+
+## Performance baseline
+
+Record a non-mutating local baseline:
+
+```bash
+lsw bench --json
+lsw bench win-dev --json
+```
+
+The JSON includes capability-scan, daemon round-trip, manifest-load, and live
+agent-probe timings when those measurements are available. Cold boot, resume,
+RSS, and lifecycle-soak measurements require the real Windows/KVM harness.
+
+The project targets are:
+
+| Metric | Target |
+| --- | ---: |
+| Shell in an already running guest | p95 below 300 ms |
+| KVM cold boot to agent ready | p95 below 15 s |
+| Disk-backed resume | below 3 s |
+| Stopped or hibernated QEMU RSS | 0 |
+| Idle `lswd` RSS | below 30 MiB |
+| Running Windows idle CPU | below 1% |
+| 4 GiB VM idle host RSS with ballooning | below 2.5 GiB |
+| Linked clone creation | below 5 s and 256 MiB initial growth |
+| Twenty install/start/stop cycles | no orphan process, socket, or port |
+
+Targets are not release claims until the corresponding benchmark has passed on
+documented hardware.
 
 ## Profiles
 
-| Profile | 行為 | Guest Secure Boot |
+| Profile | Behavior | Guest Secure Boot |
 | --- | --- | --- |
-| `standard` | 原生 Windows，保留 servicing | 關閉 |
-| `slim` | 僅移除明列的 optional provisioned AppX，啟用 CompactOS | 關閉 |
-| `ephemeral` | 與 slim 相同，但每次 run 使用並丟棄 qcow2 overlay | 關閉 |
-| `secure` | 不允許 test-signed 自訂 driver，需要已註冊金鑰的 OVMF vars | 開啟 |
+| `standard` | Stock Windows; servicing remains intact | Off |
+| `slim` | Removes only an explicit optional AppX allowlist and enables CompactOS | Off |
+| `ephemeral` | Slim behavior with a disposable qcow2 overlay per run | Off |
+| `secure` | Disallows test-signed custom drivers and requires key-enrolled OVMF variables | On |
 
-所有 beta profile 都保留 WinSxS、Windows Update／servicing stack、MSI/MSIX、Defender
-及開發工具常用依賴。LSW beta 不自動開啟 test signing，也不安裝自簽憑證或自訂 driver。
+Every beta profile preserves WinSxS, Windows Update and the servicing stack,
+MSI/MSIX support, Defender, and common development-tool dependencies. LSW does
+not enable test signing or install a self-signed certificate by default.
 
-## 從 source 建置
+## Advanced commands
 
-Host binaries 不含第三方 Rust crate dependency。專案的 MSRV 是 Rust 1.76，CI 也固定以
-1.76 執行 source gate：
+The following commands remain available for debugging, automation, and manual
+recovery, but are not part of the beginner path:
+
+```bash
+lsw create NAME --iso PATH --accept-license [OPTIONS]
+lsw prepare NAME [--execute]
+lsw seed NAME [OPTIONS] [--execute]
+lsw plan NAME [--run]
+lsw daemon [start|status]
+```
+
+For legacy guided installation of an already-created instance:
+
+```bash
+lsw install NAME
+```
+
+The destructive numeric selector remains available only as an advanced
+compatibility option:
+
+```bash
+lsw install NAME --unattended-index 6
+```
+
+Prefer `--edition NAME`, which validates and displays the names actually present
+in the ISO.
+
+TCP services can be published on host loopback during creation or one-shot
+installation:
+
+```bash
+lsw install win-web \
+  --iso ~/Downloads/Windows11.iso \
+  --edition pro \
+  --publish 8080:80 \
+  --publish 8443:443
+```
+
+Published ports bind only to `127.0.0.1`. LSW rejects duplicates, ports already
+owned by another instance or local process, agent-port collisions, and port
+publishing with the `offline` network mode.
+
+## Terminal and agent behavior
+
+Interactive host terminals negotiate Windows ConPTY when both peers advertise
+support. LSW forwards input/output and terminal resize events; older agents
+fall back to pipe sessions.
+
+Controlled sessions distinguish stdin EOF, authenticated cancellation, and
+disconnect cleanup. The capability-gated session lease is bounded to 1–300
+seconds; the default client requests 120 seconds and sends a heartbeat every
+30 seconds. Lease expiry closes the transport and reclaims owned processes.
+
+On Unix, a child enters a separate process group before `exec`; ordinary
+descendants remaining in that group are reclaimed on exit, cancellation,
+disconnect, protocol failure, or lease expiry. A process can deliberately
+escape with `setsid` or `setpgid`, so this is lifecycle ownership, not a guest
+security sandbox. On Windows, children start suspended and must enter a
+kill-on-close Job Object before they are resumed.
+
+## Windows/KVM end-to-end gate
+
+The firmware and product-lifecycle CI tests exercise the real planner and
+daemon with QEMU, OVMF, NVMe, e1000e, vTPM, QMP, loopback forwarding, suspend,
+resume, and forced stop. Placeholder media is used, so those tests do not claim
+that Windows booted.
+
+Before beta.5 is promoted, run the real hardware gate on a Linux x86_64 machine
+with KVM and a licensed Windows 11 ISO:
+
+```bash
+LSW_WINDOWS_ISO=/absolute/path/Windows11.iso \
+LSW_WINDOWS_EDITION=pro \
+LSW_WINDOWS_AGENT=/absolute/path/lsw-agent.exe \
+scripts/check-windows-kvm-e2e.sh
+```
+
+The operator completes normal OOBE in the viewer. The harness then verifies
+agent readiness, ConPTY/command execution, exit-code propagation, graceful
+shutdown, and cleanup of processes, sockets, and loopback ports.
+
+## Roadmap
+
+- beta.6: working directory and environment injection, signal and Ctrl-C
+  propagation, recursive/resumable transfer, workspace watch sync, Linux ↔
+  Windows path translation, dynamic ports, completion, systemd user socket
+  activation, detached `run`, and fully specified `exec` semantics.
+- beta.7: sealed base images, linked clones, optional signed VirtIO networking,
+  ballooning and vsock, memory-pressure governor, Windows hibernation, automatic
+  resume, guest TRIM, discard, and compaction.
+- beta.8: driverless per-HWND Windows Graphics Capture transported to independent
+  Wayland windows, with X11 fallback, input, resize, DPI, clipboard, audio, and
+  notifications. Shared-memory/GPU acceleration remains optional.
+- beta.9 and later: Linux ARM64 with Windows ARM64, then macOS Apple Silicon with
+  HVF and Windows ARM64, then a Windows host with WHPX.
+
+Apple Silicon cannot efficiently accelerate the current Windows x64 guest. It
+requires a separate Windows ARM64 agent, firmware, installer path, and CI.
+
+## Build from source
+
+The host binaries have no third-party Rust crate dependencies. The MSRV is Rust
+1.76, which is also pinned in CI:
 
 ```bash
 cargo build --workspace
 cargo fmt --all -- --check
-cargo test --workspace --locked
+cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-Windows GNU target 搭配一般 MinGW linker 時可直接建置 agent：
+Build the Windows GNU guest agent with MinGW:
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu --bin lsw-agent
 ```
 
-沒有系統 MinGW 時，可安裝 Zig 並設定其 executable：
+If MinGW is unavailable, configure a Zig executable:
 
 ```bash
 LSW_ZIG=/path/to/zig scripts/build-windows-agent.sh
 LSW_ZIG=/path/to/zig scripts/build-release.sh
 ```
 
-release script 需要 Python 3，會產生 Linux x86_64 bundle、SHA-256 檔及 Windows PE
-agent；PE/COFF build timestamp 會在嚴格檢查 header 後正規化為零。專案本身不會自動
-下載 Zig、Rust target 或作業系統媒體。發行包也包含該 binary 對應的完整 source
-snapshot 與 build scripts。
+The release builder produces a Linux x86_64 archive, SHA-256 sidecar, Windows
+PE agent, exact corresponding-source snapshot, and reproducibility metadata.
+It does not download Rust targets, Zig, or operating-system media.
 
-## 授權
+## Current limitations
 
-LSW 自有程式碼採用 [GNU GPL 3.0 或任何後續版本](LICENSE)，SPDX identifier 為
-`GPL-3.0-or-later`。你可以使用、研究、修改及重新散布；若散布 LSW 或其衍生版本，
-必須依 GPL 向接收者提供相同自由與對應 source。這項授權不涵蓋 Windows、macOS、
-QEMU、OVMF、swtpm 或使用者自行提供的媒體；它們各自適用原權利人的條款。
+- A real Windows Setup → OOBE → agent → ConPTY → shutdown run still requires a
+  KVM-capable test host and user-provided ISO.
+- The installation and recovery display uses private Unix-socket VNC internally;
+  LSW opens the viewer and does not expose TCP VNC or RDP.
+- `lsw run` can start a GUI process, but per-window Wayland/X11 integration is
+  not implemented yet.
+- Suspend/resume currently uses QMP stop/continue and retains guest RAM. It is
+  not hibernation or disk-backed resume.
+- Automatic memory reclaim, balloon control, and idle hibernation are beta.7
+  work. The beta.5 idle timeout is configuration only.
+- Agent authentication is not encrypted and is limited to LSW's local
+  loopback/QEMU user-network path.
+- QEMU does not yet run inside an LSW-specific seccomp/namespace/service-account
+  sandbox.
 
-## 文件
+See [the beta acceptance boundary](docs/BETA.md) for detailed validation status.
 
-- [Beta 驗收範圍與已知限制](docs/BETA.md)
-- [架構](docs/ARCHITECTURE.md)
-- [安全模型](docs/SECURITY.md)
-- [開發與 release gate](docs/DEVELOPMENT.md)
-- [授權與散布邊界](docs/LEGAL_BOUNDARIES.md)
-- [主要設計參考資料](docs/REFERENCES.md)
+## License
+
+LSW-owned code is licensed under
+[GNU GPL 3.0 or any later version](LICENSE), identified as
+`GPL-3.0-or-later`. This license does not cover Windows, QEMU, OVMF, swtpm,
+macOS, or user-supplied media; those remain subject to their respective owners'
+terms.
+
+## Documentation
+
+- [Beta acceptance scope and known limitations](docs/BETA.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [Security model](docs/SECURITY.md)
+- [Development and release gates](docs/DEVELOPMENT.md)
+- [License and distribution boundaries](docs/LEGAL_BOUNDARIES.md)
+- [Design references](docs/REFERENCES.md)

@@ -1,12 +1,12 @@
 # LSW 1.0 beta 狀態
 
-`1.0.0-beta.4` 是可供工程驗證的 Linux x86_64 beta，不是宣稱所有目標硬體都已通過
+`1.0.0-beta.5` 是可供工程驗證的 Linux x86_64 beta，不是宣稱所有目標硬體都已通過
 的 GA。它已把 instance、microVM lifecycle、Windows agent 與合法邊界內的 Setup
 automation 串成一條完整路徑。
 
 ## 已完成並可由 source／CI gate 驗證
 
-- manifest v3、v1/v2 migration、default instance、私有 state permissions、256-bit token
+- manifest v4、v1/v2/v3 migration、default instance、私有 state permissions、256-bit token
   與 loopback TCP port publishing validation
 - guided／unattended Setup seed；XML 可解析，且實際包含 Windows x64 PE agent
 - QEMU backend selection；Linux KVM detection，以及 KVM／TCG／HVF／WHPX command planning

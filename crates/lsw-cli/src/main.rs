@@ -12,10 +12,12 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client::AgentClient;
 use daemon_client::DaemonClient;
@@ -23,7 +25,7 @@ use lsw_core::{
     CustomizationPlan, HostCapabilities, InstallSeedBuilder, InstallSeedOptions, InstanceManifest,
     InstanceSpec, InstanceState, LaunchPhase, LswError, NetworkMode, PeImage, PeImportSymbol,
     PortForward, Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest, StateStore,
-    VmAccelerator, WindowsProfile,
+    VmAccelerator, WindowsEdition, WindowsMediaInspector, WindowsProfile,
 };
 
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -68,12 +70,19 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
 
     let store = StateStore::new(state_root()?);
     match command {
-        "doctor" => doctor(&store),
+        "doctor" => doctor(&store, remaining)?,
+        "bench" => bench(&store, remaining)?,
         "create" => create(&store, remaining)?,
         "prepare" => prepare(&store, remaining)?,
         "seed" => seed(&store, remaining)?,
         "list" => list(&store)?,
         "show" => show(&store, remaining)?,
+        "config" => config(&store, remaining)?,
+        "logs" => logs(&store, remaining)?,
+        "diagnose" => diagnose(&store, remaining)?,
+        "remove" => remove_instance(&store, remaining)?,
+        "shutdown" => shutdown(&store, remaining)?,
+        "view" => view(&store, remaining)?,
         "plan" => plan(&store, remaining)?,
         "use" => select_default(&store, remaining)?,
         "daemon" => daemon(&store, remaining)?,
@@ -150,9 +159,43 @@ fn seed(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-fn doctor(store: &StateStore) {
-    let capabilities = HostCapabilities::detect();
-    let backend = QemuBackend::select(&capabilities);
+fn doctor(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let fix = match arguments {
+        [] => false,
+        [flag] if flag == OsStr::new("--fix") => true,
+        _ => return Err("usage: lsw doctor [--fix]".into()),
+    };
+    let mut capabilities = HostCapabilities::detect();
+    if fix {
+        let missing = capabilities.missing_for_install_workflow();
+        if missing.is_empty() {
+            println!("All beta.5 host dependencies are already installed.\n");
+        } else {
+            println!(
+                "Installing missing beta.5 host dependencies: {}",
+                missing.join(", ")
+            );
+            fix_host_dependencies()?;
+            capabilities = HostCapabilities::detect();
+        }
+    }
+
+    print_host_report(store, &capabilities);
+    if fix {
+        let missing = capabilities.missing_for_install_workflow();
+        if !missing.is_empty() {
+            return Err(format!(
+                "host dependency repair completed but these components are still missing: {}",
+                missing.join(", ")
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn print_host_report(store: &StateStore, capabilities: &HostCapabilities) {
+    let backend = QemuBackend::select(capabilities);
     println!("LSW host capability report");
     println!("  state root:  {}", store.root().display());
     println!("  platform:    {}", capabilities.platform);
@@ -178,6 +221,15 @@ fn doctor(store: &StateStore) {
         display_optional(&capabilities.qemu_img)
     );
     println!("  swtpm:       {}", display_optional(&capabilities.swtpm));
+    println!(
+        "  wimlib:      {}",
+        display_optional(&capabilities.wimlib_imagex)
+    );
+    println!("  xorriso:     {}", display_optional(&capabilities.xorriso));
+    println!(
+        "  viewer:      {}",
+        display_optional(&capabilities.remote_viewer)
+    );
     println!(
         "  OVMF code:   {}",
         display_optional(&capabilities.ovmf_code)
@@ -220,6 +272,124 @@ fn doctor(store: &StateStore) {
         } else {
             println!("No native accelerator is defined; QEMU would use its slow TCG fallback.");
         }
+    }
+}
+
+fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+    let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let distribution = os_release
+        .lines()
+        .find_map(|line| line.strip_prefix("ID="))
+        .map(|value| value.trim_matches('"').to_owned())
+        .unwrap_or_default();
+    let like = os_release
+        .lines()
+        .find_map(|line| line.strip_prefix("ID_LIKE="))
+        .map(|value| value.trim_matches('"').to_owned())
+        .unwrap_or_default();
+    let family = format!("{distribution} {like}");
+    let elevated = command_prefix()?;
+
+    if family.contains("debian") || family.contains("ubuntu") {
+        run_package_command(&elevated, "apt-get", &["update"])?;
+        run_package_command(
+            &elevated,
+            "apt-get",
+            &[
+                "install",
+                "--yes",
+                "qemu-system-x86",
+                "qemu-utils",
+                "ovmf",
+                "swtpm",
+                "wimtools",
+                "xorriso",
+                "virt-viewer",
+            ],
+        )?;
+    } else if family.contains("fedora") || family.contains("rhel") {
+        run_package_command(
+            &elevated,
+            "dnf",
+            &[
+                "install",
+                "--assumeyes",
+                "qemu-system-x86-core",
+                "qemu-img",
+                "edk2-ovmf",
+                "swtpm",
+                "wimlib-utils",
+                "xorriso",
+                "virt-viewer",
+            ],
+        )?;
+    } else if family.contains("arch") {
+        run_package_command(
+            &elevated,
+            "pacman",
+            &[
+                "--sync",
+                "--needed",
+                "--noconfirm",
+                "qemu-desktop",
+                "edk2-ovmf",
+                "swtpm",
+                "wimlib",
+                "xorriso",
+                "virt-viewer",
+            ],
+        )?;
+    } else if family.contains("suse") {
+        run_package_command(
+            &elevated,
+            "zypper",
+            &[
+                "--non-interactive",
+                "install",
+                "qemu-x86",
+                "qemu-tools",
+                "qemu-ovmf-x86_64",
+                "swtpm",
+                "wimlib",
+                "xorriso",
+                "virt-viewer",
+            ],
+        )?;
+    } else {
+        return Err(format!(
+            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, wimlib-imagex, xorriso, and remote-viewer manually"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn command_prefix() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = Command::new("id").arg("-u").output()?;
+    if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "0" {
+        Ok(Vec::new())
+    } else {
+        Ok(vec!["sudo".to_owned()])
+    }
+}
+
+fn run_package_command(
+    prefix: &[String],
+    program: &str,
+    arguments: &[&str],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = if let Some(elevated) = prefix.first() {
+        Command::new(elevated)
+            .arg(program)
+            .args(arguments)
+            .status()?
+    } else {
+        Command::new(program).args(arguments).status()?
+    };
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} failed with {status}").into())
     }
 }
 
@@ -541,13 +711,7 @@ fn start_named_instance(
         println!("{line}");
     }
     if phase == LaunchPhase::Install {
-        println!(
-            "Installation/recovery display: {}",
-            store
-                .instance_dir(name)?
-                .join("run/recovery-vnc.sock")
-                .display()
-        );
+        println!("The installation display is ready; use `lsw view {name}` to reopen it.");
     }
     Ok(())
 }
@@ -556,59 +720,43 @@ fn install_instance(
     store: &StateStore,
     arguments: &[OsString],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut requested = None;
-    let mut options = InstallSeedOptions::default();
-    let mut seed_option_seen = false;
-    let mut without_agent = false;
-    let mut index = 0;
-    while index < arguments.len() {
-        let argument = arguments[index]
-            .to_str()
-            .ok_or("install arguments must be valid UTF-8")?;
-        match argument {
-            "--locale" => {
-                options.locale = next_value(arguments, &mut index, argument)?.to_owned();
-                seed_option_seen = true;
-            }
-            "--unattended-index" => {
-                options.unattended_image_index =
-                    Some(parse_number(arguments, &mut index, argument)?);
-                seed_option_seen = true;
-            }
-            "--agent" => {
-                options.agent_binary = Some(absolute_path(Path::new(next_value(
-                    arguments, &mut index, argument,
-                )?))?);
-                seed_option_seen = true;
-            }
-            "--without-agent" => {
-                if without_agent {
-                    return Err("--without-agent was supplied more than once".into());
-                }
-                without_agent = true;
-                seed_option_seen = true;
-            }
-            value if value.starts_with('-') => {
-                return Err(format!("unknown install option {value:?}").into())
-            }
-            name => {
-                if requested.replace(name).is_some() {
-                    return Err("usage: lsw install [NAME] [OPTIONS]".into());
-                }
-            }
-        }
-        index += 1;
-    }
-    if without_agent && options.agent_binary.is_some() {
+    let parsed = InstallArguments::parse(arguments)?;
+    if parsed.without_agent && parsed.seed.agent_binary.is_some() {
         return Err("--agent and --without-agent cannot be used together".into());
     }
+    if parsed.seed.unattended_image_index.is_some() && parsed.edition.is_some() {
+        return Err("--edition and --unattended-index cannot be used together".into());
+    }
 
-    let name = resolve_name(store, requested)?;
+    if let Some(iso) = parsed.iso.clone() {
+        return install_new_instance(store, parsed, iso);
+    }
+    if parsed.create_option_seen {
+        return Err(
+            "--profile, --cpus, --memory, --disk, --network, and --publish require --iso".into(),
+        );
+    }
+
+    let name = resolve_name(store, parsed.requested.as_deref())?;
+    let manifest = store.load(&name)?;
+    ensure_install_dependencies(
+        manifest.spec.profile,
+        parsed.edition.is_some(),
+        !parsed.no_viewer,
+    )?;
+    let mut options = parsed.seed;
+    if let Some(requested) = parsed.edition.as_deref() {
+        let edition =
+            select_windows_edition(store, &manifest.spec.source_iso, Some(requested), true)?
+                .expect("a required edition selection must return an edition");
+        options.unattended_image_name = Some(edition.name);
+    }
+
     let instance_dir = store.instance_dir(&name)?;
     let seed = instance_dir.join("seed");
     match fs::symlink_metadata(&seed) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            if seed_option_seen {
+            if parsed.seed_option_seen {
                 return Err(format!(
                     "{} already exists; install seed options cannot be changed implicitly",
                     seed.display()
@@ -621,7 +769,7 @@ fn install_instance(
             return Err(format!("{} must be a real directory", seed.display()).into());
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if options.agent_binary.is_none() && !without_agent {
+            if options.agent_binary.is_none() && !parsed.without_agent {
                 options.agent_binary = find_windows_agent();
                 if options.agent_binary.is_none() {
                     return Err(
@@ -630,7 +778,6 @@ fn install_instance(
                     );
                 }
             }
-            let manifest = store.load(&name)?;
             let token = store.read_agent_token(&name)?;
             let plan = InstallSeedBuilder::plan(&manifest, &instance_dir, &token, &options)?;
             for line in plan.describe() {
@@ -641,7 +788,193 @@ fn install_instance(
         }
         Err(error) => return Err(error.into()),
     }
-    start_named_instance(store, &name, LaunchPhase::Install)
+    start_named_instance(store, &name, LaunchPhase::Install)?;
+    if !parsed.no_viewer {
+        launch_installation_viewer(store, &name)?;
+    }
+    Ok(())
+}
+
+fn install_new_instance(
+    store: &StateStore,
+    parsed: InstallArguments,
+    iso: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = parsed
+        .requested
+        .as_deref()
+        .ok_or("usage: lsw install NAME --iso PATH --edition EDITION [OPTIONS]")?;
+    ensure_install_dependencies(parsed.profile, true, !parsed.no_viewer)?;
+    let iso = absolute_path(&iso)?;
+
+    let edition = select_windows_edition(store, &iso, parsed.edition.as_deref(), true)?
+        .expect("a new one-shot install must select an edition");
+    let mut options = parsed.seed;
+    options.unattended_image_name = Some(edition.name.clone());
+    if options.agent_binary.is_none() && !parsed.without_agent {
+        options.agent_binary = find_windows_agent();
+        if options.agent_binary.is_none() {
+            return Err(
+                "lsw-agent.exe was not found; pass --agent PATH, set LSW_WINDOWS_AGENT, or explicitly use --without-agent"
+                    .into(),
+            );
+        }
+    }
+
+    let spec = InstanceSpec {
+        name: name.to_owned(),
+        source_iso: iso,
+        profile: parsed.profile,
+        cpus: parsed.cpus,
+        memory_mib: parsed.memory_mib,
+        disk_gib: parsed
+            .disk_gib
+            .unwrap_or_else(|| parsed.profile.default_disk_gib()),
+        network: parsed.network,
+        port_forwards: parsed.port_forwards,
+        license_accepted: true,
+        allow_unsupported_requirements: parsed.allow_unsupported_requirements,
+    };
+    let manifest = InstanceManifest::new(spec)?;
+    let instance_dir = store.create(&manifest)?;
+    if store.default_name()?.is_none() {
+        store.set_default(name)?;
+    }
+    println!("Created instance {name:?} using {}.", edition.name);
+    println!(
+        "You are responsible for the license, product key, and activation of the Windows media you supplied."
+    );
+
+    let provisioner = Provisioner::new(HostCapabilities::detect());
+    let preparation = provisioner.plan(&manifest, &instance_dir)?;
+    provisioner.apply(&preparation)?;
+    println!("Prepared disk, firmware variables, runtime directories, and vTPM state.");
+
+    let token = store.read_agent_token(name)?;
+    let seed_plan = InstallSeedBuilder::plan(&manifest, &instance_dir, &token, &options)?;
+    for line in seed_plan.describe() {
+        println!("  {line}");
+    }
+    InstallSeedBuilder::apply(&seed_plan)?;
+    println!(
+        "Installation seed created at {}",
+        seed_plan.destination.display()
+    );
+    start_named_instance(store, name, LaunchPhase::Install)?;
+    if !parsed.no_viewer {
+        launch_installation_viewer(store, name)?;
+    }
+    Ok(())
+}
+
+fn ensure_install_dependencies(
+    profile: WindowsProfile,
+    needs_media_tools: bool,
+    needs_viewer: bool,
+) -> Result<HostCapabilities, Box<dyn std::error::Error>> {
+    let mut capabilities = HostCapabilities::detect();
+    let mut missing = capabilities.missing_for_profile_launch(profile);
+    missing.extend(capabilities.missing_for_profile_preparation(profile));
+    if needs_media_tools && capabilities.wimlib_imagex.is_none() {
+        missing.push("wimlib-imagex");
+    }
+    if needs_media_tools && capabilities.xorriso.is_none() {
+        missing.push("xorriso");
+    }
+    if needs_viewer && capabilities.remote_viewer.is_none() {
+        missing.push("remote-viewer");
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    if !missing.is_empty() {
+        println!("Missing host dependencies: {}", missing.join(", "));
+        println!("Attempting the same package repair as `lsw doctor --fix`...");
+        fix_host_dependencies()?;
+        capabilities = HostCapabilities::detect();
+        let mut remaining = capabilities.missing_for_profile_launch(profile);
+        remaining.extend(capabilities.missing_for_profile_preparation(profile));
+        if needs_media_tools && capabilities.wimlib_imagex.is_none() {
+            remaining.push("wimlib-imagex");
+        }
+        if needs_media_tools && capabilities.xorriso.is_none() {
+            remaining.push("xorriso");
+        }
+        if needs_viewer && capabilities.remote_viewer.is_none() {
+            remaining.push("remote-viewer");
+        }
+        remaining.sort_unstable();
+        remaining.dedup();
+        if !remaining.is_empty() {
+            return Err(format!(
+                "required install dependencies remain unavailable: {}",
+                remaining.join(", ")
+            )
+            .into());
+        }
+    }
+    Ok(capabilities)
+}
+
+fn select_windows_edition(
+    store: &StateStore,
+    iso: &Path,
+    requested: Option<&str>,
+    require_selection: bool,
+) -> Result<Option<WindowsEdition>, Box<dyn std::error::Error>> {
+    if requested.is_none() && !require_selection {
+        return Ok(None);
+    }
+    let editions = WindowsMediaInspector::new(HostCapabilities::detect())
+        .inspect(iso, &store.root().join("run"))?;
+    let selected = if let Some(requested) = requested {
+        let matches = editions
+            .iter()
+            .filter(|edition| edition.matches(requested))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [edition] => Some((*edition).clone()),
+            [] => {
+                return Err(format!(
+                    "edition {requested:?} is not present in {}; available editions: {}",
+                    iso.display(),
+                    editions
+                        .iter()
+                        .map(|edition| edition.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .into())
+            }
+            _ => {
+                return Err(format!(
+                    "edition {requested:?} is ambiguous; use one of the full names shown below"
+                )
+                .into())
+            }
+        }
+    } else if editions.len() == 1 {
+        editions.first().cloned()
+    } else {
+        None
+    };
+
+    println!("Windows editions found in {}:", iso.display());
+    for edition in &editions {
+        let marker = if selected.as_ref() == Some(edition) {
+            " (selected)"
+        } else {
+            ""
+        };
+        println!("  - {}{}", edition.name, marker);
+    }
+    if let Some(selected) = selected {
+        Ok(Some(selected))
+    } else {
+        Err(
+            "the ISO contains multiple editions; pass --edition NAME (for example, --edition pro)"
+                .into(),
+        )
+    }
 }
 
 fn find_windows_agent() -> Option<PathBuf> {
@@ -661,6 +994,79 @@ fn find_windows_agent() -> Option<PathBuf> {
             metadata.file_type().is_file() && !metadata.file_type().is_symlink()
         })
     })
+}
+
+fn view(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = optional_name(arguments, "view")?;
+    let name = resolve_name(store, requested)?;
+    launch_viewer(store, &name, true)
+}
+
+fn launch_installation_viewer(
+    store: &StateStore,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    launch_viewer(store, name, false)
+}
+
+fn launch_viewer(
+    store: &StateStore,
+    name: &str,
+    explicit: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
+        let message = format!(
+            "no graphical desktop was detected; run `lsw view {name}` from a graphical session"
+        );
+        if explicit {
+            return Err(message.into());
+        }
+        println!("Viewer not opened: {message}.");
+        return Ok(());
+    }
+
+    let capabilities = HostCapabilities::detect();
+    let viewer = env::var_os("LSW_INSTALL_VIEWER")
+        .map(PathBuf::from)
+        .or(capabilities.remote_viewer);
+    let Some(viewer) = viewer else {
+        let message = "remote-viewer was not found; run `lsw doctor --fix`";
+        if explicit {
+            return Err(message.into());
+        }
+        println!("Viewer not opened: {message}.");
+        return Ok(());
+    };
+
+    let instance_dir = store.instance_dir(name)?;
+    let socket = instance_dir.join("run/recovery-vnc.sock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    if !socket.exists() {
+        return Err(format!("the installation display for {name:?} is not ready").into());
+    }
+    let socket_text = socket
+        .to_str()
+        .filter(|value| !value.contains(['\r', '\n']))
+        .ok_or("the installation display path cannot be represented safely")?;
+    let connection = instance_dir.join("run/installation-viewer.vv");
+    fs::write(
+        &connection,
+        format!(
+            "[virt-viewer]\ntype=vnc\nunix-path={socket_text}\ntitle=LSW installation - {name}\n"
+        ),
+    )?;
+    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600))?;
+    Command::new(viewer)
+        .arg(&connection)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    println!("Opened the LSW installation viewer for {name:?}.");
+    Ok(())
 }
 
 fn status(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
@@ -982,6 +1388,561 @@ fn list(store: &StateStore) -> Result<(), LswError> {
     Ok(())
 }
 
+fn config(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let action = arguments
+        .first()
+        .and_then(|value| value.to_str())
+        .ok_or("usage: lsw config get [NAME] | lsw config set NAME KEY=VALUE [KEY=VALUE ...]")?;
+    match action {
+        "get" => {
+            let requested = optional_name(&arguments[1..], "config get")?;
+            let name = resolve_name(store, requested)?;
+            let manifest = store.load(&name)?;
+            println!("name={}", manifest.spec.name);
+            println!("profile={}", manifest.spec.profile);
+            println!("cpus={}", manifest.spec.cpus);
+            println!("memory.max={}", format_memory(manifest.spec.memory_mib));
+            println!("disk.max={}GiB", manifest.spec.disk_gib);
+            println!("network={}", manifest.spec.network);
+            println!(
+                "idle-timeout={}",
+                format_duration(manifest.idle_timeout_seconds)
+            );
+        }
+        "set" => {
+            let name = arguments
+                .get(1)
+                .and_then(|value| value.to_str())
+                .ok_or("usage: lsw config set NAME KEY=VALUE [KEY=VALUE ...]")?;
+            if arguments.len() < 3 {
+                return Err("usage: lsw config set NAME KEY=VALUE [KEY=VALUE ...]".into());
+            }
+            let mut manifest = store.load(name)?;
+            if matches!(
+                manifest.state,
+                InstanceState::Installing | InstanceState::Running | InstanceState::Suspended
+            ) {
+                return Err(format!(
+                    "instance {name:?} is {}; shut it down before changing runtime limits",
+                    manifest.state
+                )
+                .into());
+            }
+            for assignment in &arguments[2..] {
+                let assignment = assignment
+                    .to_str()
+                    .ok_or("configuration assignments must be valid UTF-8")?;
+                let (key, value) = assignment
+                    .split_once('=')
+                    .ok_or("configuration assignments must use KEY=VALUE syntax")?;
+                match key {
+                    "memory.max" => manifest.spec.memory_mib = parse_memory_mib(value)?,
+                    "idle-timeout" => {
+                        manifest.idle_timeout_seconds = parse_duration_seconds(value)?
+                    }
+                    _ => {
+                        return Err(format!(
+                            "unknown configuration key {key:?}; supported keys are memory.max and idle-timeout"
+                        )
+                        .into())
+                    }
+                }
+            }
+            store.update(&manifest)?;
+            println!("Updated configuration for {name:?}.");
+            println!("memory.max={}", format_memory(manifest.spec.memory_mib));
+            println!(
+                "idle-timeout={}",
+                format_duration(manifest.idle_timeout_seconds)
+            );
+        }
+        _ => {
+            return Err(
+                "usage: lsw config get [NAME] | lsw config set NAME KEY=VALUE [KEY=VALUE ...]"
+                    .into(),
+            )
+        }
+    }
+    Ok(())
+}
+
+fn parse_memory_mib(value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("GiB") {
+        (number, 1024_u64)
+    } else if let Some(number) = value.strip_suffix("MiB") {
+        (number, 1_u64)
+    } else {
+        (value, 1_u64)
+    };
+    let amount = number.parse::<u64>()?;
+    u32::try_from(
+        amount
+            .checked_mul(multiplier)
+            .ok_or("memory value is too large")?,
+    )
+    .map_err(|_| "memory value is too large".into())
+}
+
+fn format_memory(memory_mib: u32) -> String {
+    if memory_mib % 1024 == 0 {
+        format!("{}GiB", memory_mib / 1024)
+    } else {
+        format!("{memory_mib}MiB")
+    }
+}
+
+fn parse_duration_seconds(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    if value == "0" || value == "off" {
+        return Ok(0);
+    }
+    let (number, multiplier) = if let Some(number) = value.strip_suffix('s') {
+        (number, 1_u64)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60_u64)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 60 * 60)
+    } else if let Some(number) = value.strip_suffix('d') {
+        (number, 24 * 60 * 60)
+    } else {
+        return Err("duration must use s, m, h, or d (for example, 10m)".into());
+    };
+    number
+        .parse::<u64>()?
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".into())
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds == 0 {
+        "off".to_owned()
+    } else if seconds % (24 * 60 * 60) == 0 {
+        format!("{}d", seconds / (24 * 60 * 60))
+    } else if seconds % (60 * 60) == 0 {
+        format!("{}h", seconds / (60 * 60))
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn logs(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut requested = None;
+    let mut follow = false;
+    let mut lines = 200_usize;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index]
+            .to_str()
+            .ok_or("log arguments must be valid UTF-8")?;
+        match argument {
+            "--follow" | "-f" => follow = true,
+            "--lines" | "-n" => lines = parse_number(arguments, &mut index, argument)?,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown logs option {value:?}").into())
+            }
+            name => {
+                if requested.replace(name).is_some() {
+                    return Err("usage: lsw logs [NAME] [--lines N] [--follow]".into());
+                }
+            }
+        }
+        index += 1;
+    }
+    let name = resolve_name(store, requested)?;
+    let path = store.instance_dir(&name)?.join("qemu.log");
+    if !path.is_file() {
+        return Err(format!("no QEMU log exists yet for instance {name:?}").into());
+    }
+    let (text, mut offset) = read_log_tail(&path, lines)?;
+    print!("{text}");
+    std::io::stdout().flush()?;
+    if follow {
+        loop {
+            thread::sleep(Duration::from_millis(250));
+            let mut file = fs::File::open(&path)?;
+            let length = file.metadata()?.len();
+            if length < offset {
+                offset = 0;
+            }
+            if length > offset {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                print!("{}", String::from_utf8_lossy(&bytes));
+                std::io::stdout().flush()?;
+                offset = length;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_log_tail(path: &Path, lines: usize) -> Result<(String, u64), Box<dyn std::error::Error>> {
+    const MAX_TAIL_BYTES: u64 = 1024 * 1024;
+    let mut file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(MAX_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut selected = text.lines().rev().take(lines).collect::<Vec<_>>();
+    selected.reverse();
+    let mut output = selected.join("\n");
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    Ok((output, length))
+}
+
+fn remove_instance(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = required_exact_name(arguments, "remove")?;
+    store.remove(name)?;
+    println!("Removed instance {name:?} and its local virtual disk.");
+    Ok(())
+}
+
+fn shutdown(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut all = false;
+    let mut force = false;
+    let mut requested = None;
+    for argument in arguments {
+        let argument = argument
+            .to_str()
+            .ok_or("shutdown arguments must be valid UTF-8")?;
+        match argument {
+            "--all" => all = true,
+            "--force" => force = true,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown shutdown option {value:?}").into())
+            }
+            name => {
+                if requested.replace(name).is_some() {
+                    return Err("usage: lsw shutdown [NAME | --all] [--force]".into());
+                }
+            }
+        }
+    }
+    if all && requested.is_some() {
+        return Err("NAME and --all cannot be used together".into());
+    }
+    let names = if all {
+        store
+            .list()?
+            .into_iter()
+            .filter(|manifest| {
+                matches!(
+                    manifest.state,
+                    InstanceState::Installing | InstanceState::Running | InstanceState::Suspended
+                )
+            })
+            .map(|manifest| manifest.spec.name)
+            .collect::<Vec<_>>()
+    } else {
+        vec![resolve_name(store, requested)?]
+    };
+    if names.is_empty() {
+        println!("No active LSW instances.");
+        return Ok(());
+    }
+    let client = DaemonClient::new(store);
+    let mode = if force { "force" } else { "graceful" };
+    let mut failures = Vec::new();
+    for name in names {
+        match client.request_checked(&format!("STOP {name} {mode}")) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            Err(error) => failures.push(format!("{name}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "some instances could not be shut down: {}",
+            failures.join("; ")
+        )
+        .into())
+    }
+}
+
+fn diagnose(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let name = arguments
+        .first()
+        .and_then(|value| value.to_str())
+        .ok_or("usage: lsw diagnose NAME [--bundle] [--output PATH]")?;
+    let mut bundle = false;
+    let mut output = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = arguments[index]
+            .to_str()
+            .ok_or("diagnose arguments must be valid UTF-8")?;
+        match argument {
+            "--bundle" => bundle = true,
+            "--output" => {
+                output = Some(PathBuf::from(next_value(arguments, &mut index, argument)?));
+                bundle = true;
+            }
+            _ => return Err(format!("unknown diagnose option {argument:?}").into()),
+        }
+        index += 1;
+    }
+    let manifest = store.load(name)?;
+    let instance_dir = store.instance_dir(name)?;
+    println!("LSW diagnosis for {name:?}");
+    println!("  state: {}", manifest.state);
+    println!("  instance directory: {}", instance_dir.display());
+    println!("  QEMU log: {}", instance_dir.join("qemu.log").display());
+    if !bundle {
+        println!("Pass --bundle to create a redacted support archive.");
+        return Ok(());
+    }
+
+    store.initialize()?;
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let diagnostics_root = store.root().join("run");
+    fs::create_dir_all(&diagnostics_root)?;
+    fs::set_permissions(&diagnostics_root, fs::Permissions::from_mode(0o700))?;
+    let staging = diagnostics_root.join(format!(
+        "diagnose-{name}-{}-{timestamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&staging)?;
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+    let result = (|| -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let encoded = manifest.encode()?;
+        let redacted = encoded
+            .lines()
+            .map(|line| {
+                if line.starts_with("source_iso=") {
+                    "source_iso=<redacted>".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(
+            staging.join("instance.redacted.lsw"),
+            format!("{redacted}\n"),
+        )?;
+        fs::write(
+            staging.join("host.txt"),
+            diagnostic_host_text(store, &HostCapabilities::detect()),
+        )?;
+        let daemon = DaemonClient::new(store);
+        let status = daemon
+            .request(&format!("STATUS {name}"))
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_else(|error| format!("unavailable: {error}"));
+        fs::write(staging.join("status.txt"), format!("{status}\n"))?;
+        if let Ok(plan) = QemuPlanner::new(HostCapabilities::detect()).plan(
+            &manifest,
+            &instance_dir,
+            if manifest.state == InstanceState::Configured {
+                LaunchPhase::Install
+            } else {
+                LaunchPhase::Run
+            },
+        ) {
+            let mut command = plan.display_command();
+            if let Some(value) = manifest.spec.source_iso.to_str() {
+                command = command.replace(value, "<WINDOWS_ISO>");
+            }
+            if let Some(value) = instance_dir.to_str() {
+                command = command.replace(value, "<INSTANCE_DIR>");
+            }
+            fs::write(staging.join("qemu-plan.txt"), format!("{command}\n"))?;
+        }
+        let redactions = [
+            (manifest.spec.source_iso.as_path(), "<WINDOWS_ISO>"),
+            (instance_dir.as_path(), "<INSTANCE_DIR>"),
+            (store.root(), "<STATE_ROOT>"),
+        ];
+        for filename in ["qemu.log", "helper.log", "swtpm.log"] {
+            copy_diagnostic_tail(
+                &instance_dir.join(filename),
+                &staging.join(filename),
+                &redactions,
+            )?;
+        }
+
+        let output =
+            absolute_path(&output.unwrap_or_else(|| {
+                PathBuf::from(format!("lsw-diagnose-{name}-{timestamp}.tar.gz"))
+            }))?;
+        if output.exists() {
+            return Err(format!("refusing to replace existing {}", output.display()).into());
+        }
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&output)
+            .args(["-C"])
+            .arg(&staging)
+            .arg(".")
+            .status()?;
+        if !status.success() {
+            return Err(format!("tar failed with {status}").into());
+        }
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o600))?;
+        Ok(output)
+    })();
+    let _ = fs::remove_dir_all(&staging);
+    let output = result?;
+    println!("Created redacted diagnostic bundle: {}", output.display());
+    Ok(())
+}
+
+fn diagnostic_host_text(_store: &StateStore, capabilities: &HostCapabilities) -> String {
+    let backend = QemuBackend::select(capabilities);
+    format!(
+        concat!(
+            "lsw_version={}\nstate_root={}\nplatform={}\naccelerator={}\n",
+            "kvm={}\nqemu={}\nqemu_img={}\nswtpm={}\nwimlib={}\nxorriso={}\nviewer={}\n"
+        ),
+        env!("CARGO_PKG_VERSION"),
+        "<redacted>",
+        capabilities.platform,
+        backend.accelerator(),
+        yes_no(capabilities.accelerators.supports(VmAccelerator::Kvm)),
+        display_optional(&capabilities.qemu_system),
+        display_optional(&capabilities.qemu_img),
+        display_optional(&capabilities.swtpm),
+        display_optional(&capabilities.wimlib_imagex),
+        display_optional(&capabilities.xorriso),
+        display_optional(&capabilities.remote_viewer),
+    )
+}
+
+fn copy_diagnostic_tail(
+    source: &Path,
+    destination: &Path,
+    redactions: &[(&Path, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !fs::symlink_metadata(source)
+        .map(|metadata| metadata.file_type().is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let mut file = fs::File::open(source)?;
+    let length = file.metadata()?.len();
+    file.seek(SeekFrom::Start(length.saturating_sub(4 * 1024 * 1024)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    for (path, replacement) in redactions {
+        if let Some(path) = path.to_str().filter(|path| !path.is_empty()) {
+            text = text.replace(path, replacement);
+        }
+    }
+    fs::write(destination, text)?;
+    Ok(())
+}
+
+fn bench(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut json = false;
+    let mut requested = None;
+    for argument in arguments {
+        let argument = argument
+            .to_str()
+            .ok_or("bench arguments must be valid UTF-8")?;
+        match argument {
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown bench option {value:?}").into())
+            }
+            name => {
+                if requested.replace(name).is_some() {
+                    return Err("usage: lsw bench [NAME] [--json]".into());
+                }
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let capabilities = HostCapabilities::detect();
+    let capability_scan_us = started.elapsed().as_micros();
+    let started = Instant::now();
+    let daemon_ready = DaemonClient::new(store).request("PING").is_ok();
+    let daemon_ping_us = daemon_ready.then_some(started.elapsed().as_micros());
+
+    let name = requested
+        .map(str::to_owned)
+        .or_else(|| store.default_name().ok().flatten());
+    let mut manifest_load_us = None;
+    let mut agent_probe_us = None;
+    if let Some(name) = name.as_deref() {
+        let started = Instant::now();
+        if let Ok(manifest) = store.load(name) {
+            manifest_load_us = Some(started.elapsed().as_micros());
+            let started = Instant::now();
+            let ready = store
+                .read_agent_token(name)
+                .ok()
+                .and_then(|token| AgentClient::connect(&manifest, &token).ok())
+                .and_then(|client| client.probe().ok())
+                .is_some();
+            if ready {
+                agent_probe_us = Some(started.elapsed().as_micros());
+            }
+        }
+    }
+
+    if json {
+        let mut output = String::from("{");
+        write!(
+            output,
+            "\"version\":\"{}\",\"accelerator\":\"{}\",\"capability_scan_us\":{}",
+            env!("CARGO_PKG_VERSION"),
+            QemuBackend::select(&capabilities).accelerator(),
+            capability_scan_us
+        )?;
+        push_optional_number(&mut output, "daemon_ping_us", daemon_ping_us);
+        push_optional_number(&mut output, "manifest_load_us", manifest_load_us);
+        push_optional_number(&mut output, "agent_probe_us", agent_probe_us);
+        output.push_str(
+            ",\"targets\":{\"warm_shell_p95_ms\":300,\"cold_boot_p95_ms\":15000,\"resume_p95_ms\":3000}}",
+        );
+        println!("{output}");
+    } else {
+        println!("LSW beta.5 performance baseline");
+        println!(
+            "  accelerator: {}",
+            QemuBackend::select(&capabilities).accelerator()
+        );
+        println!("  capability scan: {capability_scan_us} us");
+        println!("  daemon ping: {}", format_microseconds(daemon_ping_us));
+        println!("  manifest load: {}", format_microseconds(manifest_load_us));
+        println!("  agent probe: {}", format_microseconds(agent_probe_us));
+        println!("Use --json to record a machine-readable baseline.");
+    }
+    Ok(())
+}
+
+fn push_optional_number(output: &mut String, key: &str, value: Option<u128>) {
+    write!(output, ",\"{key}\":").expect("writing to a String cannot fail");
+    if let Some(value) = value {
+        write!(output, "{value}").expect("writing to a String cannot fail");
+    } else {
+        output.push_str("null");
+    }
+}
+
+fn format_microseconds(value: Option<u128>) -> String {
+    value
+        .map(|value| format!("{value} us"))
+        .unwrap_or_else(|| "unavailable".to_owned())
+}
+
 fn prepare(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let name = required_name_with_flag(arguments, "prepare", "--execute")?;
     let execute = arguments
@@ -1028,6 +1989,10 @@ fn show(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
     println!("CPUs:                 {}", manifest.spec.cpus);
     println!("memory:               {} MiB", manifest.spec.memory_mib);
     println!("disk:                 {} GiB", manifest.spec.disk_gib);
+    println!(
+        "idle timeout:         {}",
+        format_duration(manifest.idle_timeout_seconds)
+    );
     println!("network:              {}", manifest.spec.network);
     if manifest.spec.port_forwards.is_empty() {
         println!("published TCP ports:  none");
@@ -1156,7 +2121,8 @@ fn print_help() {
     println!(concat!(
         "LSW - local Windows development runtime\n\n",
         "USAGE:\n",
-        "  lsw doctor\n",
+        "  lsw doctor [--fix]\n",
+        "  lsw bench [NAME] [--json]\n",
         "  lsw inspect FILE [--imports] [--json]\n",
         "  lsw profile PROFILE\n",
         "  lsw create NAME --iso PATH --accept-license [OPTIONS]\n",
@@ -1164,10 +2130,18 @@ fn print_help() {
         "  lsw seed NAME [--locale LOCALE] [--agent PATH] [--unattended-index N] [--execute]\n",
         "  lsw list\n",
         "  lsw show NAME\n",
+        "  lsw config get [NAME]\n",
+        "  lsw config set NAME memory.max=4GiB idle-timeout=10m\n",
+        "  lsw logs [NAME] [--lines N] [--follow]\n",
+        "  lsw diagnose NAME [--bundle] [--output PATH]\n",
+        "  lsw remove NAME\n",
+        "  lsw shutdown [NAME | --all] [--force]\n",
         "  lsw use NAME\n",
         "  lsw plan NAME [--run]\n",
-        "  lsw install [NAME] [--locale LOCALE] [--agent PATH]\n",
-        "              [--unattended-index N] [--without-agent]\n",
+        "  lsw install NAME --iso PATH --edition EDITION [--profile PROFILE] [OPTIONS]\n",
+        "  lsw install [NAME] [--locale LOCALE] [--edition EDITION] [--agent PATH]\n",
+        "              [--unattended-index N] [--without-agent] [--no-viewer]\n",
+        "  lsw view [NAME]\n",
         "  lsw start [NAME]\n",
         "  lsw status [NAME]\n",
         "  lsw suspend [NAME]\n",
@@ -1190,17 +2164,153 @@ fn print_help() {
         "  --accept-license     confirm acceptance of the supplied media's license\n",
         "  --allow-unsupported-requirements\n",
         "                       permit an explicitly unsupported small VM\n\n",
+        "ONE-SHOT INSTALL:\n",
+        "  --edition EDITION   select an edition by its ISO name or a friendly alias such as pro\n",
+        "  --no-viewer         do not open the installation viewer (for headless automation)\n",
+        "  supplying --iso records responsibility for the user-provided Windows license\n\n",
         "SEED SAFETY:\n",
         "  --unattended-index N  select image N and explicitly wipe the dedicated VM disk\n",
         "  without that option, Windows edition/disk selection remains interactive\n\n",
         "ENVIRONMENT:\n",
         "  LSW_STATE_DIR        override the local state directory\n",
         "  LSW_WINDOWS_AGENT    override the lsw-agent.exe used by `lsw install`\n",
+        "  LSW_INSTALL_VIEWER   override the remote-viewer executable\n",
         "  LSW_OVMF_CODE        override the OVMF code firmware path\n",
         "  LSW_OVMF_VARS        override the OVMF variable template path\n",
         "  LSW_OVMF_SECURE_CODE override Secure Boot-capable OVMF code\n",
         "  LSW_OVMF_SECURE_VARS override a key-enrolled Secure Boot variable template\n"
     ));
+}
+
+#[derive(Debug)]
+struct InstallArguments {
+    requested: Option<String>,
+    iso: Option<PathBuf>,
+    edition: Option<String>,
+    profile: WindowsProfile,
+    cpus: u16,
+    memory_mib: u32,
+    disk_gib: Option<u32>,
+    network: NetworkMode,
+    port_forwards: Vec<PortForward>,
+    allow_unsupported_requirements: bool,
+    seed: InstallSeedOptions,
+    without_agent: bool,
+    no_viewer: bool,
+    seed_option_seen: bool,
+    create_option_seen: bool,
+}
+
+impl InstallArguments {
+    fn parse(arguments: &[OsString]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut parsed = Self {
+            requested: None,
+            iso: None,
+            edition: None,
+            profile: WindowsProfile::Standard,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: None,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            allow_unsupported_requirements: false,
+            seed: InstallSeedOptions::default(),
+            without_agent: false,
+            no_viewer: false,
+            seed_option_seen: false,
+            create_option_seen: false,
+        };
+        let mut index = 0;
+        while index < arguments.len() {
+            let argument = arguments[index]
+                .to_str()
+                .ok_or("install arguments must be valid UTF-8")?;
+            match argument {
+                "--iso" => {
+                    if parsed.iso.is_some() {
+                        return Err("--iso was supplied more than once".into());
+                    }
+                    parsed.iso = Some(PathBuf::from(next_value(arguments, &mut index, argument)?));
+                }
+                "--edition" => {
+                    if parsed.edition.is_some() {
+                        return Err("--edition was supplied more than once".into());
+                    }
+                    parsed.edition = Some(next_value(arguments, &mut index, argument)?.to_owned());
+                    parsed.seed_option_seen = true;
+                }
+                "--profile" => {
+                    parsed.profile = next_value(arguments, &mut index, argument)?.parse()?;
+                    parsed.create_option_seen = true;
+                }
+                "--cpus" => {
+                    parsed.cpus = parse_number(arguments, &mut index, argument)?;
+                    parsed.create_option_seen = true;
+                }
+                "--memory" => {
+                    parsed.memory_mib = parse_number(arguments, &mut index, argument)?;
+                    parsed.create_option_seen = true;
+                }
+                "--disk" => {
+                    parsed.disk_gib = Some(parse_number(arguments, &mut index, argument)?);
+                    parsed.create_option_seen = true;
+                }
+                "--network" => {
+                    parsed.network = next_value(arguments, &mut index, argument)?.parse()?;
+                    parsed.create_option_seen = true;
+                }
+                "--publish" => {
+                    parsed
+                        .port_forwards
+                        .push(next_value(arguments, &mut index, argument)?.parse()?);
+                    parsed.create_option_seen = true;
+                }
+                "--locale" => {
+                    parsed.seed.locale = next_value(arguments, &mut index, argument)?.to_owned();
+                    parsed.seed_option_seen = true;
+                }
+                "--unattended-index" => {
+                    parsed.seed.unattended_image_index =
+                        Some(parse_number(arguments, &mut index, argument)?);
+                    parsed.seed_option_seen = true;
+                }
+                "--agent" => {
+                    parsed.seed.agent_binary = Some(absolute_path(Path::new(next_value(
+                        arguments, &mut index, argument,
+                    )?))?);
+                    parsed.seed_option_seen = true;
+                }
+                "--without-agent" => {
+                    if parsed.without_agent {
+                        return Err("--without-agent was supplied more than once".into());
+                    }
+                    parsed.without_agent = true;
+                    parsed.seed_option_seen = true;
+                }
+                "--no-viewer" => {
+                    if parsed.no_viewer {
+                        return Err("--no-viewer was supplied more than once".into());
+                    }
+                    parsed.no_viewer = true;
+                }
+                "--allow-unsupported-requirements" => {
+                    parsed.allow_unsupported_requirements = true;
+                    parsed.create_option_seen = true;
+                }
+                "--accept-license" => {}
+                value if value.starts_with('-') => {
+                    return Err(format!("unknown install option {value:?}").into())
+                }
+                name => {
+                    if parsed.requested.replace(name.to_owned()).is_some() {
+                        return Err("usage: lsw install [NAME] [OPTIONS]".into());
+                    }
+                }
+            }
+            index += 1;
+        }
+        Ok(parsed)
+    }
 }
 
 #[derive(Debug)]
@@ -1345,6 +2455,45 @@ mod tests {
         .map(OsString::from)
         .collect::<Vec<_>>();
         assert!(CreateArguments::parse(&arguments).is_err());
+    }
+
+    #[test]
+    fn one_shot_install_parses_the_beta_five_beginner_flow() {
+        let arguments = [
+            "win-dev",
+            "--iso",
+            "Windows11.iso",
+            "--edition",
+            "pro",
+            "--profile",
+            "slim",
+            "--no-viewer",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let parsed = InstallArguments::parse(&arguments).expect("install options should parse");
+        assert_eq!(parsed.requested.as_deref(), Some("win-dev"));
+        assert_eq!(parsed.iso, Some(PathBuf::from("Windows11.iso")));
+        assert_eq!(parsed.edition.as_deref(), Some("pro"));
+        assert_eq!(parsed.profile, WindowsProfile::Slim);
+        assert!(parsed.no_viewer);
+    }
+
+    #[test]
+    fn runtime_configuration_units_are_strict_and_stable() {
+        assert_eq!(parse_memory_mib("4GiB").expect("memory should parse"), 4096);
+        assert_eq!(
+            parse_memory_mib("4608MiB").expect("memory should parse"),
+            4608
+        );
+        assert!(parse_memory_mib("4GB").is_err());
+        assert_eq!(
+            parse_duration_seconds("10m").expect("duration should parse"),
+            600
+        );
+        assert_eq!(format_duration(600), "10m");
+        assert!(parse_duration_seconds("ten minutes").is_err());
     }
 
     #[test]

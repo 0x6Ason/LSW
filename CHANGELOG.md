@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.0-beta.5
+
+- Added the one-shot `lsw install NAME --iso PATH --edition NAME` path. It
+  checks host dependencies, reads the actual Windows edition names from the
+  ISO's install WIM/ESD, creates and prepares the instance, selects the image by
+  `/IMAGE/NAME`, creates the agent seed, starts Setup, and opens an integrated
+  private-socket installation viewer.
+- Added `lsw doctor --fix`, `config get/set`, `logs`, `view`, redacted
+  `diagnose --bundle`, safe `remove`, `shutdown --all`, and `bench --json`.
+  Manifest v4 persists `idle-timeout`; `memory.max` takes effect on the next VM
+  start. Automatic idle hibernation remains beta.7 work.
+- Added Windows media metadata inspection through xorriso and wimlib, friendly
+  edition aliases such as `pro`, UTF-8/UTF-16 WIM XML handling, and answer-file
+  XML escaping. Numeric image indexes remain an advanced compatibility option.
+- Added cleanup of QEMU pid/viewer artifacts and stale runtime sockets after a
+  stopped guest, plus a real Windows/KVM operator harness covering Setup, OOBE,
+  agent readiness, guest output and exit codes, graceful shutdown, and cleanup.
+- Rewrote the README completely in English and documented beta.5 commands,
+  measurable performance targets, roadmap order, legal boundaries, and honest
+  hardware-validation limits.
+
 ## 1.0.0-beta.4
 
 - Added per-session process ownership. Unix children enter a new process group

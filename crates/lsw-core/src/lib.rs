@@ -14,6 +14,7 @@ mod preparation;
 mod profile;
 mod qemu;
 mod store;
+mod windows_media;
 
 pub use backend::{AcceleratorCapabilities, HostPlatform, QemuBackend, VmAccelerator};
 pub use capabilities::HostCapabilities;
@@ -29,6 +30,7 @@ pub use preparation::{PreparationPlan, PreparationStep, Provisioner};
 pub use profile::{SecuritySettings, WindowsProfile};
 pub use qemu::{CommandInvocation, CommandPlan, LaunchPhase, QemuPlanner};
 pub use store::StateStore;
+pub use windows_media::{WindowsEdition, WindowsMediaInspector};
 
 pub const AGENT_GUEST_PORT: u16 = 5040;
 pub const AGENT_TOKEN_FILE: &str = "agent.token";

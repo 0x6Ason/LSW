@@ -9,7 +9,7 @@ runners used KVM or installed Windows.
 ## Local checks
 
 Use the Rust version declared by `rust-version` in the workspace manifest. The
-beta.4 workflows pin Rust 1.76.0 instead of treating the moving `stable`
+beta.5 workflows pin Rust 1.76.0 instead of treating the moving `stable`
 toolchain as the MSRV gate:
 
 ```sh
@@ -98,7 +98,7 @@ Useful controls are:
 - `CARGO_TARGET_DIR`: isolate Cargo artifacts; relative paths are resolved from
   the workspace root and are respected by both host and guest-agent builders.
 - `LSW_EXPECT_VERSION`: require the binary version to match a tag such as
-  `v1.0.0-beta.4`.
+  `v1.0.0-beta.5`.
 - `SOURCE_DATE_EPOCH`: set the reproducible build environment and all archive
   member timestamps. The default is a fixed epoch. Archive ownership and modes
   are normalized, and gzip timestamps are disabled.
