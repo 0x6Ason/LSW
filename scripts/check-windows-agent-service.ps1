@@ -18,6 +18,17 @@ $PrimaryFailure = $null
 $CleanupFailures = New-Object System.Collections.Generic.List[string]
 $CapturedProcesses = New-Object System.Collections.Generic.List[System.Diagnostics.Process]
 
+function ConvertTo-ScBinaryPathArgument {
+    param([Parameter(Mandatory = $true)][string] $Command)
+
+    # Windows PowerShell 5.1 does not escape embedded quotes when serializing a
+    # native argument with spaces. sc.exe needs them in the binPath value.
+    if ($PSVersionTable.PSVersion.Major -le 5) {
+        return $Command.Replace('"', '\"')
+    }
+    return $Command
+}
+
 function Invoke-CheckedNative {
     param(
         [Parameter(Mandatory = $true)][string] $FilePath,
@@ -334,10 +345,11 @@ try {
         ('a' * 64),
         (New-Object System.Text.UTF8Encoding($false))
     )
+    $ScBinaryCommand = ConvertTo-ScBinaryPathArgument -Command $BinaryCommand
 
     Invoke-CheckedNative 'sc.exe' @(
         'create', $ServiceName,
-        'binPath=', $BinaryCommand,
+        'binPath=', $ScBinaryCommand,
         'start=', 'auto'
     )
     $OwnService = $true

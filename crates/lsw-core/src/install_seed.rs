@@ -324,6 +324,17 @@ $ServiceDisplayName = 'LSW Guest Agent'
 $ServiceAccount = 'NT SERVICE\LSWAgent'
 $ScExe = Join-Path $env:SystemRoot 'System32\sc.exe'
 
+function ConvertTo-ScBinaryPathArgument {
+    param([Parameter(Mandatory = $true)][string] $Command)
+
+    # Windows PowerShell 5.1 does not escape embedded quotes when serializing a
+    # native argument with spaces. sc.exe needs them in the binPath value.
+    if ($PSVersionTable.PSVersion.Major -le 5) {
+        return $Command.Replace('"', '\"')
+    }
+    return $Command
+}
+
 function Invoke-Sc {
     param(
         [Parameter(Mandatory = $true)]
@@ -397,17 +408,18 @@ $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 Remove-ItemProperty -Path $RunKey -Name 'LSWAgent' -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath $AgentSource -Destination $AgentTarget -Force
 $AgentCommand = ('"{0}" --service --token-file "{1}"' -f $AgentTarget, $TokenTarget)
+$ScAgentCommand = ConvertTo-ScBinaryPathArgument -Command $AgentCommand
 if ($null -eq $ExistingService) {
     Invoke-Sc @(
         'create', $ServiceName,
-        'binPath=', $AgentCommand,
+        'binPath=', $ScAgentCommand,
         'DisplayName=', $ServiceDisplayName,
         'start=', 'auto'
     )
 }
 Invoke-Sc @(
     'config', $ServiceName,
-    'binPath=', $AgentCommand,
+    'binPath=', $ScAgentCommand,
     'DisplayName=', $ServiceDisplayName,
     'start=', 'auto'
 )
@@ -419,6 +431,9 @@ if ($null -eq $ConfiguredService -or -not [string]::Equals(
     [System.StringComparison]::OrdinalIgnoreCase
 )) {
     throw 'SCM did not assign the LSWAgent virtual service account.'
+}
+if ($ConfiguredService.PathName -cne $AgentCommand) {
+    throw 'SCM did not preserve the quoted LSWAgent binary command.'
 }
 Invoke-Sc @('sidtype', $ServiceName, 'unrestricted')
 Invoke-Sc @('description', $ServiceName, 'Provides authenticated command execution for an LSW Windows guest.')
@@ -665,7 +680,13 @@ mod tests {
         assert!(installer.contains("'config', $ServiceName"));
         assert!(installer.contains("'start=', 'auto'"));
         assert!(installer.contains("'obj=', $ServiceAccount"));
+        assert!(installer.contains("function ConvertTo-ScBinaryPathArgument"));
+        assert!(installer.contains("$Command.Replace('\"', '\\\"')"));
+        assert!(installer.contains("$ScAgentCommand = ConvertTo-ScBinaryPathArgument"));
+        assert_eq!(installer.matches("'binPath=', $ScAgentCommand").count(), 2);
+        assert!(!installer.contains("'binPath=', $AgentCommand"));
         assert!(installer.contains("$ConfiguredService.StartName"));
+        assert!(installer.contains("$ConfiguredService.PathName -cne $AgentCommand"));
         assert!(!installer.contains("password="));
         assert!(installer.contains("'failure', $ServiceName"));
         assert!(installer.contains("$ExitCode = $LASTEXITCODE"));
