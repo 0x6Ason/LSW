@@ -8,7 +8,9 @@ automation 串成一條完整路徑。
 
 - manifest v4、v1/v2/v3 migration、default instance、私有 state permissions、256-bit token
   與 loopback TCP port publishing validation
-- guided／unattended Setup seed；XML 可解析，且實際包含 Windows x64 PE agent
+- guided／unattended Setup seed；XML 可解析，實際包含 Windows x64 PE agent，並以
+  `NT SERVICE\LSWAgent` virtual account 註冊 automatic `LSWAgent` service，而非
+  interactive user 的 `HKCU` startup entry
 - QEMU backend selection；Linux KVM detection，以及 KVM／TCG／HVF／WHPX command planning
 - OVMF、vTPM、NVMe、e1000e、VGA、private VNC socket 與 NAT loopback host forwarding
 - `lswd` protocol、QMP negotiation、狀態查詢、in-memory suspend/resume、powerdown/quit 與
@@ -39,7 +41,8 @@ automation 串成一條完整路徑。
 
 上面的 ConPTY 項目指協定、host bridge、Windows binary cross-build 與可在此環境執行的
 測試；Windows MSVC native Job/ConPTY tests 是 workflow gate，不代表這台 Linux VPS 已
-執行該 job，更不代表已在登入後的真 Windows console session 實際操作過互動 shell。
+執行該 job，更不代表已在真 Windows 的 Session 0 `LSWAgent` service context 實際操作過
+互動 shell。
 
 ## 需要真實 host／Windows 驗證的 gate
 
@@ -49,9 +52,11 @@ automation 串成一條完整路徑。
 與 daemon 的 host-side lifecycle 由 CI 的 pathname-socket product gate 負責，本 VPS 沒有
 執行該 gate；以下 Windows 工作負載仍不能宣稱實機通過：
 
-- KVM cold boot、Windows 11 Setup、OOBE、第一次登入與 HKCU agent autorun；以及
-  完整 shutdown 後，在不再手動登入、不掛載 ISO/seed 的情況下用裸 `lsw`
-  恢復 agent-backed ConPTY shell
+- KVM cold boot、Windows 11 Setup、OOBE、第一次登入、OOBE local user 的 password／
+  automatic-logon policy，以及 automatic `LSWAgent` service 的 Name／StartMode／State／
+  StartName 與 `S-1-5-80-...` process SID；完整 shutdown 後，還需在沒有 interactive
+  console user、不掛載 ISO/seed 的情況下用裸 `lsw` 恢復同一 service SID 的
+  agent-backed ConPTY shell
 - 各 Linux distribution 的 OVMF/secure-variable 路徑差異
 - Windows firewall rule、QEMU slirp 的 `10.0.2.2` source matching
 - 低階 loopback hostfwd listener 已驗證；`--publish` 對真實 guest TCP service 的資料傳輸
@@ -80,6 +85,9 @@ automation 串成一條完整路徑。
   shared-memory graphics driver。`lsw run` 會啟動 guest 程式，但不會產生 Linux native
   application window。
 - 安裝及救援仍需 private Unix-socket VNC；沒有 RDP，也沒有 TCP VNC listener。
+- Agent command／ConPTY session 在 Windows Session 0 以
+  `NT SERVICE\LSWAgent` 身分執行，不 impersonate OOBE user。這可在沒有登入時提供 CLI，
+  但 service 啟動的 GUI 不會出現在 user desktop；user-session companion 尚未實作。
 - suspend/resume 只對仍在執行的 QEMU process 使用 QMP `stop`/`cont`；沒有 RAM
   save-to-disk、跨 host 復原、live migration、host folder、USB passthrough 或 image export。
 - Agent authentication 尚未加密，只能用於設計中的本機 loopback/QEMU user-network path。
@@ -92,12 +100,14 @@ automation 串成一條完整路徑。
 ## 建議的實機驗收順序
 
 1. 在有 KVM 的 Linux x86_64 測試機執行 `lsw doctor`。
-2. 使用未修改、已授權的 Windows 11 x64 ISO 建立 `standard` instance。
+2. 使用未修改、已授權的 Windows 11 x64 ISO 建立 beta.5 預設的 `slim` instance。
 3. 先測 guided install，再以 disposable instance 測 `--unattended-index`。
-4. 完成 OOBE/first logon，測 ConPTY shell（Unicode、Ctrl、resize、stdin EOF、取消、
-   斷線與 lease expiry）、exit-code propagation、descendant cleanup、1 GiB file transfer
-   及並行命令；再完整 shutdown、關閉 viewer，以裸 `lsw` 驗證無第二次
-   手動登入的冷啟動恢復。
+4. 完成 OOBE/first logon，先確認 console local user 需要非空 password、沒有 autologon，
+   並驗證 `LSWAgent` 為 Auto／Running、StartName 是 `NT SERVICE\LSWAgent`。再以 service
+   identity 測 ConPTY shell（Unicode、Ctrl、resize、stdin EOF、取消、斷線與 lease
+   expiry）、exit-code propagation、descendant cleanup、1 GiB file transfer 及並行命令；
+   完整 shutdown、關閉 viewer 後，以裸 `lsw` 驗證沒有 interactive console user、沒有
+   ISO/seed、service SID 不變的冷啟動恢復。
 5. 發布 disposable guest TCP service，確認 listener 只在 `127.0.0.1`，並測 port collision。
 6. 測 suspend/resume、graceful stop、guest crash、daemon restart 與 stale-socket recovery。
 7. 分別測 `offline`、`ephemeral` 與 key-enrolled `secure` profile。

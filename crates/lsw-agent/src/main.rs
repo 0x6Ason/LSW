@@ -34,58 +34,167 @@ fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("lsw-agent: {error}");
+            write_stderr(format_args!("lsw-agent: {error}"));
             ExitCode::FAILURE
         }
     }
 }
 
+fn write_stderr(message: std::fmt::Arguments<'_>) {
+    // Windows services commonly have no valid standard handles. Logging must
+    // remain best-effort so a missing console cannot unwind the service main.
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{message}");
+}
+
 fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Error>> {
     let configuration = Configuration::parse(&arguments)?;
+
+    if configuration.service {
+        #[cfg(windows)]
+        {
+            return windows_service::run(configuration);
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("--service is only supported on Windows".into());
+        }
+    }
+
+    run_agent(configuration, None, |address| {
+        println!("lsw-agent listening on {address}");
+        Ok(())
+    })
+}
+
+fn run_agent(
+    configuration: Configuration,
+    shutdown: Option<&Receiver<()>>,
+    ready: impl FnOnce(SocketAddr) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let token = Arc::new(read_token(&configuration.token_file)?);
     let listener = TcpListener::bind(configuration.listen)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
-    println!("lsw-agent listening on {}", listener.local_addr()?);
+    let local_address = listener.local_addr()?;
+
+    if shutdown.is_some_and(shutdown_requested) {
+        return Ok(());
+    }
+    ready(local_address)?;
+
+    if let Some(shutdown) = shutdown {
+        listener.set_nonblocking(true)?;
+        return run_stoppable_listener(
+            &listener,
+            &configuration,
+            &token,
+            &active_sessions,
+            shutdown,
+        );
+    }
 
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
-                if configuration.once {
-                    if let Err(error) = handle_connection(stream, &token) {
-                        eprintln!("lsw-agent: session failed: {error}");
-                    }
+                if dispatch_connection(stream, &configuration, &token, &active_sessions) {
                     return Ok(());
                 }
-
-                let previous = active_sessions.fetch_add(1, Ordering::AcqRel);
-                if previous >= configuration.max_sessions {
-                    active_sessions.fetch_sub(1, Ordering::AcqRel);
-                    eprintln!(
-                        "lsw-agent: refusing connection: {} sessions are already active",
-                        configuration.max_sessions
-                    );
-                    continue;
-                }
-
-                let session_token = Arc::clone(&token);
-                let session_counter = Arc::clone(&active_sessions);
-                let spawn_result = thread::Builder::new()
-                    .name("lsw-agent-session".to_owned())
-                    .spawn(move || {
-                        let _slot = SessionSlot(session_counter);
-                        if let Err(error) = handle_connection(stream, &session_token) {
-                            eprintln!("lsw-agent: session failed: {error}");
-                        }
-                    });
-                if let Err(error) = spawn_result {
-                    active_sessions.fetch_sub(1, Ordering::AcqRel);
-                    eprintln!("lsw-agent: could not start session thread: {error}");
-                }
             }
-            Err(error) => eprintln!("lsw-agent: accept failed: {error}"),
+            Err(error) => write_stderr(format_args!("lsw-agent: accept failed: {error}")),
         }
     }
     Ok(())
+}
+
+fn run_stoppable_listener(
+    listener: &TcpListener,
+    configuration: &Configuration,
+    token: &Arc<String>,
+    active_sessions: &Arc<AtomicUsize>,
+    shutdown: &Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ACCEPT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+    loop {
+        if shutdown_requested(shutdown) {
+            return Ok(());
+        }
+
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if dispatch_connection(stream, configuration, token, active_sessions) {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if wait_for_shutdown(shutdown, ACCEPT_RETRY_INTERVAL) {
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                write_stderr(format_args!("lsw-agent: accept failed: {error}"));
+                if wait_for_shutdown(shutdown, ACCEPT_RETRY_INTERVAL) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn shutdown_requested(shutdown: &Receiver<()>) -> bool {
+    match shutdown.try_recv() {
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => true,
+        Err(mpsc::TryRecvError::Empty) => false,
+    }
+}
+
+fn wait_for_shutdown(shutdown: &Receiver<()>, timeout: Duration) -> bool {
+    match shutdown.recv_timeout(timeout) {
+        Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
+        Err(RecvTimeoutError::Timeout) => false,
+    }
+}
+
+fn dispatch_connection(
+    stream: TcpStream,
+    configuration: &Configuration,
+    token: &Arc<String>,
+    active_sessions: &Arc<AtomicUsize>,
+) -> bool {
+    if configuration.once {
+        if let Err(error) = handle_connection(stream, token) {
+            write_stderr(format_args!("lsw-agent: session failed: {error}"));
+        }
+        return true;
+    }
+
+    let previous = active_sessions.fetch_add(1, Ordering::AcqRel);
+    if previous >= configuration.max_sessions {
+        active_sessions.fetch_sub(1, Ordering::AcqRel);
+        write_stderr(format_args!(
+            "lsw-agent: refusing connection: {} sessions are already active",
+            configuration.max_sessions
+        ));
+        return false;
+    }
+
+    let session_token = Arc::clone(token);
+    let session_counter = Arc::clone(active_sessions);
+    let spawn_result = thread::Builder::new()
+        .name("lsw-agent-session".to_owned())
+        .spawn(move || {
+            let _slot = SessionSlot(session_counter);
+            if let Err(error) = handle_connection(stream, &session_token) {
+                write_stderr(format_args!("lsw-agent: session failed: {error}"));
+            }
+        });
+    if let Err(error) = spawn_result {
+        active_sessions.fetch_sub(1, Ordering::AcqRel);
+        write_stderr(format_args!(
+            "lsw-agent: could not start session thread: {error}"
+        ));
+    }
+    false
 }
 
 struct SessionSlot(Arc<AtomicUsize>);
@@ -2208,11 +2317,279 @@ mod windows_conpty {
     }
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_service {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, SyncSender};
+    use std::sync::Mutex;
+
+    use super::{run_agent, Configuration};
+
+    const SERVICE_NAME: [u16; 9] = [
+        b'L' as u16,
+        b'S' as u16,
+        b'W' as u16,
+        b'A' as u16,
+        b'g' as u16,
+        b'e' as u16,
+        b'n' as u16,
+        b't' as u16,
+        0,
+    ];
+
+    const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
+    const SERVICE_STOPPED: u32 = 0x0000_0001;
+    const SERVICE_START_PENDING: u32 = 0x0000_0002;
+    const SERVICE_STOP_PENDING: u32 = 0x0000_0003;
+    const SERVICE_RUNNING: u32 = 0x0000_0004;
+    const SERVICE_ACCEPT_STOP: u32 = 0x0000_0001;
+    const SERVICE_ACCEPT_SHUTDOWN: u32 = 0x0000_0004;
+    const SERVICE_CONTROL_STOP: u32 = 0x0000_0001;
+    const SERVICE_CONTROL_INTERROGATE: u32 = 0x0000_0004;
+    const SERVICE_CONTROL_SHUTDOWN: u32 = 0x0000_0005;
+    const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
+    const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
+
+    type ServiceMainFunction = extern "system" fn(u32, *mut *mut u16);
+    type HandlerFunction = extern "system" fn(u32, u32, *mut c_void, *mut c_void) -> u32;
+    type ServiceStatusHandle = *mut c_void;
+
+    #[repr(C)]
+    struct ServiceTableEntryW {
+        service_name: *mut u16,
+        service_main: Option<ServiceMainFunction>,
+    }
+
+    #[repr(C)]
+    struct ServiceStatus {
+        service_type: u32,
+        current_state: u32,
+        controls_accepted: u32,
+        win32_exit_code: u32,
+        service_specific_exit_code: u32,
+        checkpoint: u32,
+        wait_hint: u32,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn StartServiceCtrlDispatcherW(service_table: *const ServiceTableEntryW) -> i32;
+        fn RegisterServiceCtrlHandlerExW(
+            service_name: *const u16,
+            handler: Option<HandlerFunction>,
+            context: *mut c_void,
+        ) -> ServiceStatusHandle;
+        fn SetServiceStatus(
+            status_handle: ServiceStatusHandle,
+            service_status: *const ServiceStatus,
+        ) -> i32;
+    }
+
+    static CONFIGURATION: Mutex<Option<Configuration>> = Mutex::new(None);
+    static STOP_SENDER: Mutex<Option<SyncSender<()>>> = Mutex::new(None);
+    static SERVICE_ERROR: Mutex<Option<String>> = Mutex::new(None);
+    static STATUS_REPORT_LOCK: Mutex<()> = Mutex::new(());
+    static STATUS_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    static CURRENT_STATE: AtomicUsize = AtomicUsize::new(SERVICE_STOPPED as usize);
+
+    pub(super) fn run(configuration: Configuration) -> Result<(), Box<dyn std::error::Error>> {
+        *CONFIGURATION
+            .lock()
+            .map_err(|_| "Windows service configuration lock was poisoned")? = Some(configuration);
+        *STOP_SENDER
+            .lock()
+            .map_err(|_| "Windows service stop lock was poisoned")? = None;
+        *SERVICE_ERROR
+            .lock()
+            .map_err(|_| "Windows service error lock was poisoned")? = None;
+        STATUS_HANDLE.store(0, Ordering::Release);
+        CURRENT_STATE.store(SERVICE_STOPPED as usize, Ordering::Release);
+
+        let mut service_name = SERVICE_NAME.to_vec();
+        let service_table = [
+            ServiceTableEntryW {
+                service_name: service_name.as_mut_ptr(),
+                service_main: Some(service_main),
+            },
+            ServiceTableEntryW {
+                service_name: ptr::null_mut(),
+                service_main: None,
+            },
+        ];
+        let dispatched = unsafe { StartServiceCtrlDispatcherW(service_table.as_ptr()) };
+        if dispatched == 0 {
+            if let Ok(mut configuration) = CONFIGURATION.lock() {
+                configuration.take();
+            }
+            return Err(format!(
+                "could not connect LSWAgent to the Windows Service Control Manager: {}; \
+                 --service must be started by SCM",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+
+        STATUS_HANDLE.store(0, Ordering::Release);
+        let error = SERVICE_ERROR
+            .lock()
+            .map_err(|_| "Windows service error lock was poisoned")?
+            .take();
+        match error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+
+    extern "system" fn service_main(_argument_count: u32, _arguments: *mut *mut u16) {
+        let result = service_main_inner();
+        let failed = result.is_err();
+        let (win32_exit_code, service_specific_exit_code) = if failed {
+            (ERROR_SERVICE_SPECIFIC_ERROR, 1)
+        } else {
+            (0, 0)
+        };
+        let stopped_result = report_status(
+            SERVICE_STOPPED,
+            0,
+            win32_exit_code,
+            service_specific_exit_code,
+            0,
+            0,
+        );
+
+        if let Err(error) = result {
+            record_error(error.to_string());
+        }
+        if let Err(error) = stopped_result {
+            record_error(format!("could not report LSWAgent as stopped: {error}"));
+        }
+    }
+
+    fn service_main_inner() -> Result<(), Box<dyn std::error::Error>> {
+        let status_handle = unsafe {
+            RegisterServiceCtrlHandlerExW(
+                SERVICE_NAME.as_ptr(),
+                Some(service_control_handler),
+                ptr::null_mut(),
+            )
+        };
+        if status_handle.is_null() {
+            return Err(format!(
+                "could not register the LSWAgent service control handler: {}",
+                io::Error::last_os_error()
+            )
+            .into());
+        }
+        STATUS_HANDLE.store(status_handle as usize, Ordering::Release);
+        report_status(SERVICE_START_PENDING, 0, 0, 0, 1, 10_000)?;
+
+        let configuration = CONFIGURATION
+            .lock()
+            .map_err(|_| "Windows service configuration lock was poisoned")?
+            .take()
+            .ok_or("Windows service configuration was not initialized")?;
+        let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+        *STOP_SENDER
+            .lock()
+            .map_err(|_| "Windows service stop lock was poisoned")? = Some(stop_sender);
+
+        let result = run_agent(configuration, Some(&stop_receiver), |_address| {
+            report_status(
+                SERVICE_RUNNING,
+                SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN,
+                0,
+                0,
+                0,
+                0,
+            )?;
+            Ok(())
+        });
+
+        if let Ok(mut stop_sender) = STOP_SENDER.lock() {
+            stop_sender.take();
+        }
+        if CURRENT_STATE.load(Ordering::Acquire) == SERVICE_RUNNING as usize {
+            report_status(SERVICE_STOP_PENDING, 0, 0, 0, 1, 10_000)?;
+        }
+        result
+    }
+
+    extern "system" fn service_control_handler(
+        control: u32,
+        _event_type: u32,
+        _event_data: *mut c_void,
+        _context: *mut c_void,
+    ) -> u32 {
+        match control {
+            SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
+                let _ = report_status(SERVICE_STOP_PENDING, 0, 0, 0, 1, 10_000);
+                if let Ok(stop_sender) = STOP_SENDER.lock() {
+                    if let Some(stop_sender) = stop_sender.as_ref() {
+                        let _ = stop_sender.try_send(());
+                    }
+                }
+                0
+            }
+            // SCM already retains the last status sent with SetServiceStatus;
+            // acknowledging INTERROGATE asks it to return that cached state.
+            SERVICE_CONTROL_INTERROGATE => 0,
+            _ => ERROR_CALL_NOT_IMPLEMENTED,
+        }
+    }
+
+    fn report_status(
+        state: u32,
+        controls_accepted: u32,
+        win32_exit_code: u32,
+        service_specific_exit_code: u32,
+        checkpoint: u32,
+        wait_hint: u32,
+    ) -> io::Result<()> {
+        let _status_guard = STATUS_REPORT_LOCK.lock().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "service status lock was poisoned")
+        })?;
+        let status_handle = STATUS_HANDLE.load(Ordering::Acquire) as ServiceStatusHandle;
+        if status_handle.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "service status handle is not initialized",
+            ));
+        }
+        let status = ServiceStatus {
+            service_type: SERVICE_WIN32_OWN_PROCESS,
+            current_state: state,
+            controls_accepted,
+            win32_exit_code,
+            service_specific_exit_code,
+            checkpoint,
+            wait_hint,
+        };
+        if unsafe { SetServiceStatus(status_handle, &status) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        CURRENT_STATE.store(state as usize, Ordering::Release);
+        Ok(())
+    }
+
+    fn record_error(message: String) {
+        if let Ok(mut service_error) = SERVICE_ERROR.lock() {
+            if service_error.is_none() {
+                *service_error = Some(message);
+            }
+        }
+    }
+}
+
 struct Configuration {
     listen: SocketAddr,
     token_file: PathBuf,
     once: bool,
     max_sessions: usize,
+    service: bool,
 }
 
 impl Configuration {
@@ -2221,6 +2598,7 @@ impl Configuration {
         let mut token_file = env::var_os("LSW_AGENT_TOKEN_FILE").map(PathBuf::from);
         let mut once = false;
         let mut max_sessions = DEFAULT_MAX_SESSIONS;
+        let mut service = false;
         let mut index = 0;
         while index < arguments.len() {
             let option = arguments[index]
@@ -2253,10 +2631,12 @@ impl Configuration {
                     }
                 }
                 "--once" => once = true,
+                "--service" => service = true,
                 "--help" | "-h" => {
                     println!(
-                        "lsw-agent --token-file PATH [--listen IP:PORT] [--max-sessions N] [--once]\n\
-                         The default listener is 0.0.0.0:5040 inside the restricted guest network."
+                        "lsw-agent --token-file PATH [--listen IP:PORT] [--max-sessions N] [--once] [--service]\n\
+                         The default listener is 0.0.0.0:5040 inside the restricted guest network.\n\
+                         --service runs LSWAgent under the Windows Service Control Manager."
                     );
                     std::process::exit(0);
                 }
@@ -2270,6 +2650,7 @@ impl Configuration {
                 .ok_or("--token-file PATH or LSW_AGENT_TOKEN_FILE is required")?,
             once,
             max_sessions,
+            service,
         })
     }
 }
@@ -2333,6 +2714,70 @@ mod tests {
             "0".into(),
         ];
         assert!(Configuration::parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn service_mode_composes_with_existing_options() {
+        let arguments = vec![
+            "--service".into(),
+            "--token-file".into(),
+            "C:\\ProgramData\\LSW\\agent.token".into(),
+            "--listen".into(),
+            "127.0.0.1:55040".into(),
+            "--max-sessions".into(),
+            "8".into(),
+        ];
+        let configuration = Configuration::parse(&arguments).expect("configuration should parse");
+
+        assert!(configuration.service);
+        assert_eq!(configuration.listen, "127.0.0.1:55040".parse().unwrap());
+        assert_eq!(configuration.max_sessions, 8);
+        assert_eq!(
+            configuration.token_file,
+            PathBuf::from("C:\\ProgramData\\LSW\\agent.token")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn service_mode_fails_before_accessing_files_off_windows() {
+        let error = run(vec![
+            "--service".into(),
+            "--token-file".into(),
+            "a-file-that-must-not-be-read".into(),
+        ])
+        .expect_err("service mode must be Windows-only");
+
+        assert_eq!(error.to_string(), "--service is only supported on Windows");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_mode_requires_scm_before_accessing_files() {
+        let error = run(vec![
+            "--service".into(),
+            "--token-file".into(),
+            "a-file-that-must-not-be-read".into(),
+        ])
+        .expect_err("a normal test process must not connect to SCM as a service");
+
+        assert!(
+            error
+                .to_string()
+                .contains("--service must be started by SCM"),
+            "unexpected SCM rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn shutdown_channel_wakes_or_disconnects_the_accept_wait() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(()).expect("shutdown should be queued");
+        assert!(wait_for_shutdown(&receiver, Duration::from_secs(1)));
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(sender);
+        assert!(shutdown_requested(&receiver));
     }
 
     #[test]

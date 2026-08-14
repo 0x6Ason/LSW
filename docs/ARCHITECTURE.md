@@ -12,7 +12,7 @@ guest. Host platform and accelerator selection are separated from guest
 protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
 and QEMU argument generation exist as planner-level work only. There are no
 macOS or Windows host-side binaries, daemon IPC integrations, or runtime
-validation claims in beta.4.
+validation claims in the beta.5 candidate.
 
 ## Components
 
@@ -44,9 +44,13 @@ validation claims in beta.4.
 4. A normal guest shutdown leaves the base disk intact. An ephemeral instance
    uses a fresh qcow2 backing overlay for each run and removes that overlay only
    after QEMU has stopped.
-5. At first administrative logon, the seed installs the agent in the interactive
-   user's session and registers a per-user startup entry. This avoids placing
-   GUI work in Windows Session 0.
+5. At first administrative logon, the seed installs the agent as the automatic
+   `LSWAgent` Windows service under the virtual account
+   `NT SERVICE\LSWAgent`. It removes the legacy per-user startup entry and
+   restricts the guest token to SYSTEM, Administrators, and that service
+   identity. Commands and ConPTY sessions therefore run in Windows Session 0
+   without storing the OOBE user's password or requiring automatic logon.
+   Visible desktop GUI work requires a future user-session companion.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
    ConPTY and host stdin is a terminal, the host enters raw mode and forwards
@@ -135,8 +139,8 @@ That environment has no `/dev/kvm`, licensed Windows ISO, graphical desktop, or
 pathname Unix sockets (AF_UNIX `bind` returns `EPERM`). The firmware smoke
 therefore validates the QEMU building blocks locally, while the product daemon's
 Unix-socket lifecycle is a CI-only gate in this environment. Neither gate
-validates KVM acceleration, Windows Setup/OOBE, the logged-in agent, or ConPTY
-end to end.
+validates KVM acceleration, Windows Setup/OOBE, the installed service agent, or
+ConPTY end to end.
 
 ## Network publishing
 

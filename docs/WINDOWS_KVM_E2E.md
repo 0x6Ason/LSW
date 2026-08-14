@@ -3,13 +3,15 @@
 The real Windows gate validates the release candidate on an explicitly
 dedicated Linux x86_64 KVM runner. It installs from operator-supplied Windows
 media, waits for normal OOBE and first login, then checks agent readiness,
-PowerShell command execution, guest exit-code propagation, graceful shutdown,
-an interactive ConPTY shell, QEMU/daemon/viewer cleanup, socket cleanup, and
-host-port release. The release job exercises the beta.5 beginner `slim`
-profile. It then closes the installation viewer, cold-starts the
-installed guest through a bare `lsw`, proves ConPTY and agent execution return
-without a second manual sign-in, and verifies that neither the ISO nor the seed
-is attached to the restarted QEMU process.
+the exact automatic `LSWAgent` Windows service configuration and virtual-account
+process SID, PowerShell command execution, guest exit-code propagation,
+graceful shutdown, an interactive ConPTY shell, QEMU/daemon/viewer cleanup,
+socket cleanup, and host-port release. The release job exercises the beta.5
+beginner `slim` profile. It then closes the installation viewer, cold-starts
+the installed guest through a bare `lsw`, proves ConPTY and service-backed agent
+execution return at the Windows sign-in screen, requires the same service SID,
+and verifies that neither the ISO nor the seed is attached to the restarted
+QEMU process.
 
 The workflow is deliberately manual. GitHub-hosted runners do not expose KVM,
 and the beta.5 harness requires an operator to complete OOBE in the private LSW
@@ -140,15 +142,42 @@ firewall if a fully controlled network boundary is required.
 After first login, the harness owns the remaining sequence. It closes the
 viewer before the cold-restart check; do not perform a second manual sign-in.
 The gate fails unless a bare `lsw` restores an agent-backed ConPTY shell from
-the installed disk without installation media.
+the installed disk without installation media or an interactive console user.
 
 Use a disposable, password-protected local Windows test identity. Do not enable
-automatic logon or use a blank password: the harness rejects both so an `HKCU`
-startup entry cannot create a false cold-start pass. Do not enter a personal
-Microsoft account or production credential into a release-gate guest. With the
-current per-user agent startup design, this cold-start requirement is expected
-to block beta.5 until a boot-time service/session architecture is implemented
-and the original interactive user context is restored securely.
+automatic logon or use a blank password. While the operator is still signed in,
+the harness captures the console identity from `Win32_ComputerSystem.UserName`,
+requires an enabled local-account SID, checks `PasswordRequired`, rejects a
+blank-password `LogonUserW` success, and rejects Winlogon automatic-logon state
+or a stored `DefaultPassword`. These checks apply to the OOBE user, not to the
+agent service account. Do not enter a personal Microsoft account or production
+credential into a release-gate guest.
+
+## Guest service contract
+
+The installation seed must register exactly one service named `LSWAgent` with
+`StartMode=Auto`, `State=Running`, and
+`StartName=NT SERVICE\LSWAgent`. All agent commands, including ConPTY sessions,
+intentionally run in Windows Session 0 under that virtual service account; the
+service does not impersonate the OOBE user or store that user's password.
+
+Before the first shutdown, the harness resolves both the service process owner
+and the command process identity, requires both to equal the translated
+`NT SERVICE\LSWAgent` SID, and requires the SID to begin with `S-1-5-80-`.
+After a full guest shutdown and bare-`lsw` boot, the harness repeats the service
+configuration and identity checks and requires the same SID. It also requires
+`Win32_ComputerSystem.UserName` to be empty and rechecks that Winlogon has
+neither automatic logon nor a stored default password. This prevents a hidden
+desktop login from making the cold-start test pass.
+
+Session 0 is sufficient for the beta.5 command and ConPTY contract, but it does
+not provide visible desktop GUI applications. A future user-session companion
+will own GUI, clipboard, audio, and per-window integration without changing the
+boot-time service boundary.
+
+This workflow and harness define the required release evidence; they do not
+claim the service path has passed on real hardware. Tag beta.5 only after the
+exact candidate completes this job successfully on the dedicated KVM runner.
 
 Tag only the exact commit named in a successful run. If `master` changes, run
 the gate again for the new commit. The release workflow rejects every new tag

@@ -34,8 +34,16 @@ is complete.
 
 Each instance receives a random 256-bit token from `/dev/urandom`. The host copy
 never appears in `lsw show` or the manifest. Setup copies the guest copy to
-`ProgramData\\LSW` with an ACL for the installing user, Administrators, and
-SYSTEM.
+`ProgramData\LSW` with an ACL for SYSTEM, Administrators, and the
+`NT SERVICE\LSWAgent` virtual service identity. No ACE is added for the
+individual OOBE user; administrators retain access through the Administrators
+group.
+
+The seed registers `LSWAgent` as an automatic Windows service. It runs in
+Session 0 under `NT SERVICE\LSWAgent`, without a stored user password or an
+automatic desktop logon. This boot-time identity is intentionally separate from
+the interactive OOBE account; visible desktop GUI integration will require a
+future user-session companion.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
 guest port 5040 only from the QEMU user-network host address. Authentication is
@@ -78,10 +86,12 @@ they resume. Assignment failure, including an incompatible nested-job policy,
 fails closed. The Windows behavior has a native CI gate, but was only
 cross-built—not executed—on this Linux VPS.
 
-Agent powers are intentionally broad after authentication: it can execute as the
-logged-in Windows user and read or create files that user can access. Protect the
-host token and state backups accordingly. Transfers reject symlinks and existing
-destinations and verify declared byte counts before committing a temporary file.
+Agent powers are intentionally broad after authentication: it can execute
+arbitrary processes as the `NT SERVICE\LSWAgent` virtual account and read or
+create files that service identity can access. It does not impersonate the OOBE
+desktop user. Protect the host token and state backups accordingly. Transfers
+reject symlinks and existing destinations and verify declared byte counts before
+committing a temporary file.
 
 ## Network policy
 

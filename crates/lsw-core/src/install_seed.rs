@@ -319,33 +319,173 @@ if (-not (Test-Path -LiteralPath $AgentSource -PathType Leaf)) {
 
 $InstallRoot = Join-Path $env:ProgramFiles 'LSW'
 $DataRoot = Join-Path $env:ProgramData 'LSW'
+$ServiceName = 'LSWAgent'
+$ServiceDisplayName = 'LSW Guest Agent'
+$ServiceAccount = 'NT SERVICE\LSWAgent'
+$ScExe = Join-Path $env:SystemRoot 'System32\sc.exe'
+
+function Invoke-Sc {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $ArgumentList
+    )
+
+    & $ScExe @ArgumentList
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -ne 0) {
+        throw ('sc.exe {0} failed with exit code {1}.' -f $ArgumentList[0], $ExitCode)
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $InstallRoot, $DataRoot | Out-Null
 $AgentTarget = Join-Path $InstallRoot 'lsw-agent.exe'
 $TokenTarget = Join-Path $DataRoot 'agent.token'
+$ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+if ($null -ne $ExistingService -and $ExistingService.Status -ne 'Stopped') {
+    if ($ExistingService.Status -ne 'StopPending') {
+        Invoke-Sc @('stop', $ServiceName)
+    }
+    $ExistingService.WaitForStatus(
+        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+        [TimeSpan]::FromSeconds(30)
+    )
+    $ExistingService.Refresh()
+    if ($ExistingService.Status -ne 'Stopped') {
+        throw 'The existing LSWAgent service did not stop before the agent was replaced.'
+    }
+}
+
+$AgentTargetFullPath = [System.IO.Path]::GetFullPath($AgentTarget)
+$StaleAgents = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'lsw-agent.exe'"
+foreach ($StaleAgent in $StaleAgents) {
+    if ($null -eq $StaleAgent.ExecutablePath) {
+        continue
+    }
+    $StalePath = [System.IO.Path]::GetFullPath($StaleAgent.ExecutablePath)
+    if ([string]::Equals($StalePath, $AgentTargetFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $Termination = Invoke-CimMethod -InputObject $StaleAgent -MethodName Terminate
+        if ($Termination.ReturnValue -ne 0) {
+            throw ('Failed to stop stale LSW agent process {0} (return code {1}).' -f $StaleAgent.ProcessId, $Termination.ReturnValue)
+        }
+        $TerminationDeadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            $RemainingAgent = Get-CimInstance -ClassName Win32_Process -Filter (
+                'ProcessId = {0}' -f $StaleAgent.ProcessId
+            )
+            if ($null -eq $RemainingAgent) {
+                break
+            }
+            if ($null -ne $RemainingAgent.ExecutablePath) {
+                $RemainingPath = [System.IO.Path]::GetFullPath($RemainingAgent.ExecutablePath)
+                if (-not [string]::Equals(
+                    $RemainingPath,
+                    $AgentTargetFullPath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    break
+                }
+            }
+            if ([DateTime]::UtcNow -ge $TerminationDeadline) {
+                throw ('Timed out waiting for stale LSW agent process {0} to exit.' -f $StaleAgent.ProcessId)
+            }
+            Start-Sleep -Milliseconds 100
+        } while ($true)
+    }
+}
+
+$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+Remove-ItemProperty -Path $RunKey -Name 'LSWAgent' -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath $AgentSource -Destination $AgentTarget -Force
+$AgentCommand = ('"{0}" --service --token-file "{1}"' -f $AgentTarget, $TokenTarget)
+if ($null -eq $ExistingService) {
+    Invoke-Sc @(
+        'create', $ServiceName,
+        'binPath=', $AgentCommand,
+        'DisplayName=', $ServiceDisplayName,
+        'start=', 'auto'
+    )
+}
+Invoke-Sc @(
+    'config', $ServiceName,
+    'binPath=', $AgentCommand,
+    'DisplayName=', $ServiceDisplayName,
+    'start=', 'auto'
+)
+Invoke-Sc @('config', $ServiceName, 'obj=', $ServiceAccount)
+$ConfiguredService = Get-CimInstance -ClassName Win32_Service -Filter "Name = 'LSWAgent'"
+if ($null -eq $ConfiguredService -or -not [string]::Equals(
+    $ConfiguredService.StartName,
+    $ServiceAccount,
+    [System.StringComparison]::OrdinalIgnoreCase
+)) {
+    throw 'SCM did not assign the LSWAgent virtual service account.'
+}
+Invoke-Sc @('sidtype', $ServiceName, 'unrestricted')
+Invoke-Sc @('description', $ServiceName, 'Provides authenticated command execution for an LSW Windows guest.')
+Invoke-Sc @(
+    'failure', $ServiceName,
+    'reset=', '86400',
+    'actions=', 'restart/5000/restart/15000/restart/60000'
+)
+Invoke-Sc @('failureflag', $ServiceName, '1')
+
+$System = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+$Administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$ServiceIdentity = (New-Object System.Security.Principal.NTAccount($ServiceAccount)).Translate(
+    [System.Security.Principal.SecurityIdentifier]
+)
+$Allow = [System.Security.AccessControl.AccessControlType]::Allow
+
+$DirectoryAcl = New-Object System.Security.AccessControl.DirectorySecurity
+$DirectoryAcl.SetAccessRuleProtection($true, $false)
+$DirectoryAcl.SetOwner($Administrators)
+$Inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$NoPropagation = [System.Security.AccessControl.PropagationFlags]::None
+$FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+$ReadAndExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+foreach ($Identity in @($System, $Administrators)) {
+    $DirectoryAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $Identity, $FullControl, $Inherit, $NoPropagation, $Allow
+    )))
+}
+$DirectoryAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $ServiceIdentity, $ReadAndExecute, $Inherit, $NoPropagation, $Allow
+)))
+Set-Acl -LiteralPath $DataRoot -AclObject $DirectoryAcl
+
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'agent.token') -Destination $TokenTarget -Force
 
 $Acl = New-Object System.Security.AccessControl.FileSecurity
 $Acl.SetAccessRuleProtection($true, $false)
-$Rights = [System.Security.AccessControl.FileSystemRights]::FullControl
-$Allow = [System.Security.AccessControl.AccessControlType]::Allow
-$Current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-$System = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-$Administrators = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
-foreach ($Identity in @($Current, $System, $Administrators)) {
-    $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($Identity, $Rights, $Allow)))
+$Acl.SetOwner($Administrators)
+foreach ($Identity in @($System, $Administrators)) {
+    $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $Identity, $FullControl, $Allow
+    )))
 }
+$Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $ServiceIdentity, [System.Security.AccessControl.FileSystemRights]::Read, $Allow
+)))
 Set-Acl -LiteralPath $TokenTarget -AclObject $Acl
 
-$AgentCommand = ('"{0}" --token-file "{1}"' -f $AgentTarget, $TokenTarget)
-$RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-New-ItemProperty -Path $RunKey -Name 'LSWAgent' -Value $AgentCommand -PropertyType String -Force | Out-Null
 if (-not (Get-NetFirewallRule -DisplayName 'LSW Guest Agent' -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName 'LSW Guest Agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5040 -RemoteAddress 10.0.2.2 | Out-Null
 }
 
 & (Join-Path $PSScriptRoot 'apply-profile.ps1')
-Start-Process -FilePath $AgentTarget -ArgumentList @('--token-file', $TokenTarget) -WindowStyle Hidden
+Invoke-Sc @('start', $ServiceName)
+$StartedService = Get-Service -Name $ServiceName
+$StartedService.WaitForStatus(
+    [System.ServiceProcess.ServiceControllerStatus]::Running,
+    [TimeSpan]::FromSeconds(30)
+)
+# Catch an immediate post-start failure before FirstLogonCommands reports
+# success. Configured recovery does not begin until five seconds later.
+Start-Sleep -Milliseconds 500
+$StartedService.Refresh()
+if ($StartedService.Status -ne 'Running') {
+    throw 'LSWAgent did not remain running after SCM started it.'
+}
 "#
 }
 
@@ -509,6 +649,53 @@ mod tests {
         assert!(!answer.contains("SkipMachineOOBE"));
         assert!(!answer.contains("HideEULAPage"));
         assert!(!answer.contains("WillWipeDisk"));
+
+        let installer = String::from_utf8(
+            plan.generated
+                .get(Path::new("lsw/install-agent.ps1"))
+                .expect("agent installer should exist")
+                .clone(),
+        )
+        .expect("agent installer should be UTF-8");
+        assert!(installer.contains("$ServiceName = 'LSWAgent'"));
+        assert!(installer.contains("$ServiceDisplayName = 'LSW Guest Agent'"));
+        assert!(installer.contains("$ServiceAccount = 'NT SERVICE\\LSWAgent'"));
+        assert!(installer.contains("--service --token-file"));
+        assert!(installer.contains("'create', $ServiceName"));
+        assert!(installer.contains("'config', $ServiceName"));
+        assert!(installer.contains("'start=', 'auto'"));
+        assert!(installer.contains("'obj=', $ServiceAccount"));
+        assert!(installer.contains("$ConfiguredService.StartName"));
+        assert!(!installer.contains("password="));
+        assert!(installer.contains("'failure', $ServiceName"));
+        assert!(installer.contains("$ExitCode = $LASTEXITCODE"));
+        assert!(installer.contains("$ServiceIdentity"));
+        assert!(installer.contains("$StartedService.WaitForStatus"));
+        assert!(installer.contains("$StartedService.Status -ne 'Running'"));
+        assert!(installer.contains("$AgentTargetFullPath"));
+        assert!(
+            installer.contains("Invoke-CimMethod -InputObject $StaleAgent -MethodName Terminate")
+        );
+        assert!(installer.contains("$TerminationDeadline"));
+        assert!(installer.contains("Remove-ItemProperty -Path $RunKey -Name 'LSWAgent'"));
+        assert!(!installer.contains("New-ItemProperty"));
+        assert!(!installer.contains("Start-Process"));
+
+        let wait_for_stop = installer
+            .find("$ExistingService.WaitForStatus")
+            .expect("installer should wait for the old service to stop");
+        let terminate_stale_agent = installer
+            .find("Invoke-CimMethod -InputObject $StaleAgent -MethodName Terminate")
+            .expect("installer should terminate the exact-path legacy agent");
+        let remove_autorun = installer
+            .find("Remove-ItemProperty -Path $RunKey -Name 'LSWAgent'")
+            .expect("installer should remove the legacy autorun value");
+        let replace_binary = installer
+            .find("Copy-Item -LiteralPath $AgentSource")
+            .expect("installer should replace the agent binary");
+        assert!(wait_for_stop < replace_binary);
+        assert!(terminate_stale_agent < remove_autorun);
+        assert!(remove_autorun < replace_binary);
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 

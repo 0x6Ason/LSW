@@ -83,6 +83,11 @@ The command records that the user is responsible for the license terms of the
 media they supplied. It does not add a product key, bypass activation, skip
 OOBE, or create a prebuilt account.
 
+The installation seed registers the guest agent as the automatic Windows
+service `LSWAgent`, running as the virtual account `NT SERVICE\LSWAgent`.
+It does not add a per-user `HKCU` startup entry, store an OOBE user's password,
+or require automatic logon for a cold start.
+
 On a headless host, pass `--no-viewer`; later, reopen the display from a Linux
 graphical session without handling a socket path:
 
@@ -96,14 +101,15 @@ After completing OOBE and the first administrative login:
 lsw use win-dev
 lsw                         # enter PowerShell in the default instance
 lsw exec -- cmd.exe /c ver
-lsw run -- notepad.exe
-lsw push ./main.rs 'C:\Users\you\src\main.rs'
-lsw pull 'C:\build\app.exe' ./app.exe
+lsw exec -- powershell.exe -NoProfile -Command "New-Item -ItemType Directory -Force C:\src | Out-Null"
+lsw push ./main.rs 'C:\src\main.rs'
+lsw pull 'C:\src\build\app.exe' ./app.exe
 ```
 
 `lsw exec` waits and returns the real guest exit code. `lsw run` currently uses
-the same session transport and waits; detached GUI launch becomes the default
-in beta.6 when the lifecycle contract for detached processes lands.
+the same Session 0 transport and waits; it is not a visible desktop launcher.
+Detached process semantics arrive in beta.6. Visible GUI launch requires the
+future user-session companion described in the roadmap.
 
 ## Daily management
 
@@ -226,6 +232,13 @@ Interactive host terminals negotiate Windows ConPTY when both peers advertise
 support. LSW forwards input/output and terminal resize events; older agents
 fall back to pipe sessions.
 
+The beta.5 agent runs at boot as the automatic `LSWAgent` Windows service under
+`NT SERVICE\LSWAgent`. Shell and `exec` processes therefore use that service
+identity in Windows Session 0; they do not impersonate the OOBE desktop user.
+This provides command access before login without storing a user credential.
+A later user-session companion will be required for visible desktop GUI
+processes, clipboard, audio, and per-window integration.
+
 Controlled sessions distinguish stdin EOF, authenticated cancellation, and
 disconnect cleanup. The capability-gated session lease is bounded to 1–300
 seconds; the default client requests 120 seconds and sends a heartbeat every
@@ -256,11 +269,14 @@ scripts/check-windows-kvm-e2e.sh
 ```
 
 The operator completes normal OOBE in the viewer. The harness then verifies
-the Windows 11 build and requested edition, agent readiness, ConPTY/command
-execution, exit-code propagation, and graceful shutdown. It closes the viewer,
-uses a bare `lsw` to cold-start the installed guest without installation media,
-requires the agent-backed ConPTY shell to return without another manual login,
-then checks cleanup of QEMU, the daemon, the viewer, sockets, and loopback ports.
+the Windows 11 build and requested edition, the password and automatic-logon
+policy of the active OOBE user, and the automatic `LSWAgent` service's name,
+state, startup mode, virtual-account identity, and `S-1-5-80-...` process SID.
+It exercises true ConPTY, command execution, exit-code propagation, and graceful
+shutdown. It then closes the viewer, uses a bare `lsw` to cold-start the
+installed guest without installation media or an interactive Windows login,
+and requires the same service SID, ConPTY shell, and command transport before
+checking cleanup of QEMU, the daemon, the viewer, sockets, and loopback ports.
 
 ## Roadmap
 
@@ -314,14 +330,16 @@ It does not download Rust targets, Zig, or operating-system media.
 
 - A real Windows Setup → OOBE → agent → ConPTY → shutdown → cold-restart
   run still requires a KVM-capable test host and user-provided ISO.
-- The guest agent is currently registered in the interactive user's `HKCU` Run
-  key. The beta.5 release gate therefore requires a cold boot to restore the
-  agent-backed shell without another manual sign-in; beta.5 must not be tagged
-  until that succeeds or the startup architecture is corrected.
+- The guest agent now runs as the automatic `LSWAgent` Windows service under
+  `NT SERVICE\LSWAgent`, but that boot-time path has not yet passed the real
+  Windows/KVM release gate. beta.5 must not be tagged until the exact candidate
+  passes Setup, OOBE, service identity, true ConPTY, shutdown, and no-login cold
+  restart on the dedicated hardware runner.
 - The installation and recovery display uses private Unix-socket VNC internally;
   LSW opens the viewer and does not expose TCP VNC or RDP.
-- `lsw run` can start a GUI process, but per-window Wayland/X11 integration is
-  not implemented yet.
+- `lsw run` can start a Session 0 process, but a service-launched GUI is not a
+  visible desktop application. A user-session companion and per-window
+  Wayland/X11 integration are not implemented yet.
 - Suspend/resume currently uses QMP stop/continue and retains guest RAM. It is
   not hibernation or disk-backed resume.
 - Automatic memory reclaim, balloon control, and idle hibernation are beta.7

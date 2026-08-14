@@ -76,10 +76,19 @@ LSW_WINDOWS_LINKER=mingw scripts/build-windows-agent.sh
 `x86_64-w64-mingw32-gcc`. `LSW_ZIG` and `LSW_MINGW_CC` override the executable
 used by each backend. CI cross-builds the agent and inspects its PE machine
 type. A separate Windows runner builds the MSVC target, runs the native agent
-tests serially (including Job Object descendant cleanup and ConPTY setup), and
-loads the resulting executable with `--help`. The Linux VPS performed only the
-GNU cross-build. Neither gate exercises a managed guest session or a logged-in
+tests serially (including Job Object descendant cleanup, ConPTY setup, and the
+SCM rejection path outside a service process), and loads the resulting
+executable with `--help`. Linux-side validation cannot execute the Windows
+binary. Neither gate exercises a managed guest session or a service-backed
 Windows ConPTY session.
+
+The beta.5 seed installs the agent as the automatic Windows service `LSWAgent`
+under the virtual account `NT SERVICE\LSWAgent`; it must not restore the old
+per-user `HKCU` startup entry. Cross-build and executable-load checks cannot
+prove that SCM registration, Session 0 ConPTY, or boot-time startup works. The
+real Windows/KVM gate therefore queries `Win32_Service`, verifies the service
+process and command identities resolve to the same `S-1-5-80-...` SID, and
+requires that SID to remain stable across a full shutdown and bare-`lsw` boot.
 
 ## Release bundle
 
@@ -125,7 +134,8 @@ Job/ConPTY setup tests plus an executable load smoke on ordinary pushes and pull
 requests. It also installs distribution QEMU/OVMF/swtpm packages and runs both
 the timeout-bounded TCG firmware smoke and the non-skippable product-lifecycle
 gate described above. All Rust jobs use the declared 1.76.0 MSRV. The native
-Windows job does not boot a managed guest or exercise a logged-in ConPTY shell;
+Windows job does not boot a managed guest or exercise a service-backed ConPTY
+shell end to end;
 the QEMU jobs use no Windows ISO. CI also builds, installs, and verifies a
 disposable release bundle without publishing it.
 
@@ -140,7 +150,11 @@ as prereleases.
 gate. It can run only by manual dispatch from an exact `master` commit on the
 explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. Windows media is
 pre-provisioned read-only on that runner and is verified by SHA-256; the
-workflow never downloads or uploads it. See
+workflow never downloads or uploads it. The gate captures the local OOBE user
+only for password/automatic-logon policy checks; all agent commands run as
+`NT SERVICE\LSWAgent`. After shutdown it requires a no-login cold boot, the
+same service SID, true ConPTY, detached installation media, and complete runtime
+cleanup. See
 [`WINDOWS_KVM_E2E.md`](WINDOWS_KVM_E2E.md) for runner isolation, protected
 environment, media provisioning, and operator instructions. Tagged releases
 after the existing beta.1–beta.4 tags fail closed unless this workflow has a

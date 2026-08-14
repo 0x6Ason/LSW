@@ -14,13 +14,18 @@
 - Added Windows media metadata inspection through xorriso and wimlib, friendly
   edition aliases such as `pro`, UTF-8/UTF-16 WIM XML handling, and answer-file
   XML escaping. Numeric image indexes remain an advanced compatibility option.
+- Replaced the interactive user's `HKCU` agent startup entry with the automatic
+  `LSWAgent` Windows service, running under the virtual account
+  `NT SERVICE\LSWAgent`. Agent commands intentionally execute in that service
+  identity and do not require a stored user password or automatic logon.
 - Added cleanup of QEMU pid/viewer artifacts and stale runtime sockets after a
   stopped guest, plus a guarded real Windows/KVM operator workflow covering
-  Setup, OOBE, Windows build/edition identity, agent readiness, true ConPTY,
-  guest exit codes, graceful shutdown, bare-`lsw` cold restart without install
-  media, and exact daemon/viewer/QEMU/socket/port cleanup. New tagged releases
-  fail closed unless that job passed for the exact commit; beta.1–beta.4 remain
-  grandfathered and untouched.
+  Setup, OOBE user credential policy, Windows build/edition identity, the
+  automatic service's configuration and stable process SID, true ConPTY, guest
+  exit codes, graceful shutdown, bare-`lsw` cold restart without install media
+  or an interactive login, and exact daemon/viewer/QEMU/socket/port cleanup.
+  New tagged releases fail closed unless that job passed for the exact commit;
+  beta.1–beta.4 remain grandfathered and untouched.
 - Removed the Windows-native process-tree test's PowerShell startup timing race;
   it now observes descendant readiness through kernel Job Object membership.
 - Rewrote the README completely in English and documented beta.5 commands,
