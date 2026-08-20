@@ -40,8 +40,8 @@ jobs:
           CONFIRMATION: ${{ inputs.confirmation }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REPOSITORY" != p07575/lsw ]]; then
-            echo "error: this gate can run only in p07575/lsw" >&2
+          if [[ "$GITHUB_REPOSITORY" != 0x6Ason/lsw ]]; then
+            echo "error: this gate can run only in 0x6Ason/lsw" >&2
             exit 1
           fi
           if [[ "$GITHUB_REF" != refs/heads/master ]]; then
