@@ -680,8 +680,8 @@ mod tests {
     fn start_request_round_trip_preserves_unicode() {
         let request = StartRequest {
             kind: SessionKind::Exec,
-            argv: vec!["pwsh".to_owned(), "香港.ps1".to_owned()],
-            working_directory: Some("C:\\工作".to_owned()),
+            argv: vec!["pwsh".to_owned(), "résumé.ps1".to_owned()],
+            working_directory: Some("C:\\données".to_owned()),
         };
         assert_eq!(
             StartRequest::decode(&request.encode().expect("request should encode"))

@@ -897,9 +897,9 @@ fn authenticated_loopback_file_transfer_preserves_unicode_and_bytes() {
         .as_nanos();
     let root = std::env::temp_dir().join(format!("lsw-agent-e2e-{nonce}"));
     fs::create_dir(&root).expect("fixture directory should be created");
-    let destination = root.join("香港-資料.bin");
+    let destination = root.join("résumé-данные.bin");
     let destination_text = destination.to_string_lossy().into_owned();
-    let contents = b"binary\0payload\xff\nUTF-8:\xe9\xa6\x99\xe6\xb8\xaf";
+    let contents = b"binary\0payload\xff\nUTF-8:\xf0\x9f\x9a\x80";
     let token = "b".repeat(64);
 
     let (mut upload, upload_server) = connect(&token);

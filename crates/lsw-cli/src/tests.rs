@@ -115,10 +115,10 @@ fn pe_json_strings_escape_protocol_sensitive_characters() {
     let mut output = String::new();
     push_json_string(
         &mut output,
-        "quote=\" slash=\\ line=\n tab=\t control=\u{0001} 中文",
+        "quote=\" slash=\\ line=\n tab=\t control=\u{0001} café 🚀",
     );
     assert_eq!(
         output,
-        "\"quote=\\\" slash=\\\\ line=\\n tab=\\t control=\\u0001 中文\""
+        "\"quote=\\\" slash=\\\\ line=\\n tab=\\t control=\\u0001 café 🚀\""
     );
 }
