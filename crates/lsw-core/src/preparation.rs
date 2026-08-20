@@ -306,7 +306,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "win-dev".to_owned(),
             source_iso: iso,
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,

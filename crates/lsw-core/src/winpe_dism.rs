@@ -1,0 +1,1672 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Network-isolated Windows PE orchestration for real DISM servicing.
+//!
+//! The prepare VM owns virtual Disk 0 and produces a slim WIM. The apply VM
+//! keeps that workspace as Disk 0 and may wipe only the LSW-owned target at
+//! Disk 1. Plans encode this topology explicitly so callers cannot substitute a
+//! host block device or silently change the destructive target.
+
+#![deny(missing_docs)]
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+use crate::{
+    CommandInvocation, CustomizationPlan, HostCapabilities, InstanceManifest, LswError,
+    PreparationPlan, PreparationStep, QemuBackend, Result, WindowsProfile,
+};
+
+/// Disk number assigned to the private temporary WinPE workspace.
+pub const WINPE_WORKSPACE_DISK_ID: u32 = 0;
+/// Capacity of the private temporary workspace disk.
+pub const WINPE_WORKSPACE_SIZE_GIB: u32 = 32;
+/// Stable filename of the WIM produced by the prepare phase.
+pub const WINPE_PREPARED_IMAGE_NAME: &str = "lsw-prepared.wim";
+/// Disk number assigned to the LSW-owned instance target during apply.
+pub const WINPE_TARGET_DISK_ID: u32 = 1;
+/// Maximum wall-clock duration of either WinPE microVM phase.
+pub const WINPE_VM_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+const WINPE_WORKSPACE_DRIVE: &str = "W:";
+const WINPE_SCRIPT_FILE: &str = "lsw/winpe-dism.cmd";
+const WINPE_SEED_SENTINEL: &str = "lsw\\winpe-dism.cmd";
+const WINPE_APPLY_SCRIPT_FILE: &str = "lsw/apply-image.cmd";
+const WINPE_APPLY_SENTINEL: &str = "lsw\\apply-image.cmd";
+const MAX_SEED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_STATUS_LOG_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One of the two isolated WinPE microVM phases.
+pub enum WinPeDismVmPhase {
+    /// Service an exported edition and produce the prepared WIM.
+    Prepare,
+    /// Apply the prepared WIM to the instance disk and configure UEFI boot.
+    Apply,
+}
+
+impl WinPeDismVmPhase {
+    fn seed_directory(self) -> &'static str {
+        match self {
+            Self::Prepare => "winpe-seed",
+            Self::Apply => "winpe-apply-seed",
+        }
+    }
+
+    fn completion_marker(self) -> &'static str {
+        match self {
+            Self::Prepare => "LSW-WINPE-DISM complete",
+            Self::Apply => "LSW-WINPE-DISM apply-complete",
+        }
+    }
+
+    fn failure_marker(self) -> &'static str {
+        match self {
+            Self::Prepare => "LSW-WINPE-DISM failed",
+            Self::Apply => "LSW-WINPE-DISM apply-failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Fully resolved QEMU and host-preparation plan for one WinPE phase.
+pub struct WinPeDismVmPlan {
+    /// Phase implemented by this plan.
+    pub phase: WinPeDismVmPhase,
+    /// Validated QEMU backend and accelerator selection.
+    pub backend: QemuBackend,
+    /// QEMU command with fixed disk ordering and disabled networking.
+    pub invocation: CommandInvocation,
+    /// Host files and private disks that must exist before launch.
+    pub host_preparation: PreparationPlan,
+    /// Serial status log containing bounded completion markers.
+    pub status_log: PathBuf,
+    /// QEMU diagnostic log for this phase.
+    pub qemu_log: PathBuf,
+    /// Capabilities missing from the current host.
+    pub missing_capabilities: Vec<&'static str>,
+    /// Human-readable security and topology notes.
+    pub notes: Vec<String>,
+}
+
+impl WinPeDismVmPlan {
+    /// Returns a shell-escaped display form of the QEMU invocation.
+    pub fn display_command(&self) -> String {
+        self.invocation.display_command()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Observed result of a successfully completed WinPE phase.
+pub struct WinPeDismRunResult {
+    /// Phase that completed.
+    pub phase: WinPeDismVmPhase,
+    /// Elapsed wall-clock duration.
+    pub elapsed: Duration,
+    /// Bounded serial status lines retained for diagnostics.
+    pub status_events: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Declarative DISM operation in the prepare phase.
+pub enum WinPeDismStage {
+    /// Partition and format the private workspace disk.
+    InitializeWorkspace,
+    /// Locate `install.wim` or `install.esd` on the official ISO.
+    LocateInstallImage,
+    /// Export the selected Windows edition with DISM.
+    ExportEdition {
+        /// One-based WIM image index selected from official media metadata.
+        index: u32,
+    },
+    /// Mount the exported WIM for offline servicing.
+    MountOfflineImage,
+    /// Enumerate provisioned AppX packages before bounded removal.
+    InventoryProvisionedAppx,
+    /// Remove one allowlisted provisioned AppX package when present.
+    RemoveProvisionedAppx {
+        /// Exact allowlisted package display-name pattern passed to DISM.
+        display_name: String,
+    },
+    /// Commit and integrity-check the prepared WIM.
+    CommitPreparedImage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Declarative operation in the target-disk apply phase.
+pub enum WinPeDismApplyStage {
+    /// Locate the prepared WIM on private Disk 0.
+    LocatePreparedImage,
+    /// Partition and format only the LSW-owned target at Disk 1.
+    InitializeTarget,
+    /// Apply the prepared WIM, optionally using CompactOS.
+    ApplyPreparedImage {
+        /// Whether DISM applies the image using CompactOS storage.
+        compact: bool,
+    },
+    /// Stage unattend and guest-agent setup payloads.
+    StageGuestSetup,
+    /// Create UEFI boot files with BCDBoot.
+    ConfigureUefiBoot,
+}
+
+impl WinPeDismApplyStage {
+    /// Describes the stage without exposing generated script contents.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::LocatePreparedImage => {
+                format!("locate {WINPE_PREPARED_IMAGE_NAME} on the private workspace")
+            }
+            Self::InitializeTarget => format!(
+                "initialize LSW-owned virtual Disk {WINPE_TARGET_DISK_ID} with EFI, MSR, and Windows partitions"
+            ),
+            Self::ApplyPreparedImage { compact } => format!(
+                "apply the prepared image to the target{}",
+                if *compact { " with CompactOS" } else { "" }
+            ),
+            Self::StageGuestSetup => {
+                "stage the offline unattend file and private guest-agent setup payload".to_owned()
+            }
+            Self::ConfigureUefiBoot => {
+                "create the target UEFI boot files with BCDBoot".to_owned()
+            }
+        }
+    }
+}
+
+impl WinPeDismStage {
+    /// Describes the stage without exposing generated script contents.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::InitializeWorkspace => format!(
+                "initialize virtual Disk {WINPE_WORKSPACE_DISK_ID} as the private WinPE workspace"
+            ),
+            Self::LocateInstallImage => {
+                "locate sources/install.wim or sources/install.esd on the official ISO".to_owned()
+            }
+            Self::ExportEdition { index } => format!(
+                "export Windows image index {index} to {WINPE_PREPARED_IMAGE_NAME} with DISM"
+            ),
+            Self::MountOfflineImage => {
+                "mount the exported image with Windows DISM inside WinPE".to_owned()
+            }
+            Self::InventoryProvisionedAppx => {
+                "inventory provisioned AppX packages with Windows DISM".to_owned()
+            }
+            Self::RemoveProvisionedAppx { display_name } => {
+                format!("remove provisioned AppX package {display_name} when present")
+            }
+            Self::CommitPreparedImage => {
+                "commit and integrity-check the prepared WIM with Windows DISM".to_owned()
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Generated prepare-phase seed and its private workspace contract.
+pub struct WinPeDismPlan {
+    /// Profile used to derive the bounded DISM customization.
+    pub profile: WindowsProfile,
+    /// One-based edition index exported from the official install image.
+    pub edition_index: u32,
+    /// New seed directory written atomically by [`WinPeDismBackend::write_seed`].
+    pub destination: PathBuf,
+    /// Private qcow2 workspace owned by this instance.
+    pub workspace_disk: PathBuf,
+    /// Required workspace capacity in GiB.
+    pub workspace_size_gib: u32,
+    /// Stable prepared-WIM filename inside the workspace.
+    pub prepared_image_name: &'static str,
+    /// Whether the later apply phase should request CompactOS.
+    pub compact_on_apply: bool,
+    /// Ordered prepare-phase operations encoded in the script.
+    pub stages: Vec<WinPeDismStage>,
+    /// Relative files generated in the seed directory.
+    pub files: Vec<PathBuf>,
+    generated: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Generated apply-phase seed and fixed target-disk contract.
+pub struct WinPeDismApplyPlan {
+    /// Profile whose prepared WIM will be applied.
+    pub profile: WindowsProfile,
+    /// New apply-seed directory written atomically by the backend.
+    pub destination: PathBuf,
+    /// Existing private workspace containing the prepared WIM.
+    pub workspace_disk: PathBuf,
+    /// LSW-owned instance qcow2 that may be initialized.
+    pub target_disk: PathBuf,
+    /// Fixed virtual disk number expected by the generated DiskPart script.
+    pub target_disk_id: u32,
+    /// Whether to request CompactOS during DISM apply.
+    pub compact: bool,
+    /// Whether the seed contains guest-agent setup files.
+    pub includes_agent: bool,
+    /// Ordered apply-phase operations encoded in the script.
+    pub stages: Vec<WinPeDismApplyStage>,
+    /// Relative files generated in the apply seed.
+    pub files: Vec<PathBuf>,
+    generated: BTreeMap<PathBuf, Vec<u8>>,
+}
+
+impl WinPeDismApplyPlan {
+    /// Returns a human-readable plan including its destructive-disk warning.
+    pub fn describe(&self) -> Vec<String> {
+        let mut lines = self
+            .stages
+            .iter()
+            .map(WinPeDismApplyStage::describe)
+            .collect::<Vec<_>>();
+        lines.extend(
+            self.files
+                .iter()
+                .map(|file| format!("write {}", self.destination.join(file).display())),
+        );
+        lines.push(format!(
+            "warning: the apply job wipes only LSW-owned virtual Disk {}; the workspace must remain Disk 0 and no host disk may be attached",
+            self.target_disk_id
+        ));
+        lines
+    }
+
+    /// Returns the generated ASCII apply script.
+    pub fn script(&self) -> &str {
+        std::str::from_utf8(
+            self.generated
+                .get(Path::new(WINPE_APPLY_SCRIPT_FILE))
+                .expect("WinPE DISM apply plans always contain their script"),
+        )
+        .expect("the generated WinPE apply script is ASCII")
+    }
+}
+
+impl WinPeDismPlan {
+    /// Returns a human-readable plan including its workspace-disk warning.
+    pub fn describe(&self) -> Vec<String> {
+        let mut lines = vec![format!(
+            "require a blank private {} GiB workspace disk at {}",
+            self.workspace_size_gib,
+            self.workspace_disk.display()
+        )];
+        lines.extend(self.stages.iter().map(WinPeDismStage::describe));
+        lines.extend(
+            self.files
+                .iter()
+                .map(|file| format!("write {}", self.destination.join(file).display())),
+        );
+        lines.push(format!(
+            "warning: the WinPE job wipes only LSW-owned virtual Disk {WINPE_WORKSPACE_DISK_ID}; the QEMU integration must not attach a host disk"
+        ));
+        lines
+    }
+
+    /// Returns the generated ASCII prepare script.
+    pub fn script(&self) -> &str {
+        // Construction always inserts this fixed path.
+        std::str::from_utf8(
+            self.generated
+                .get(Path::new(WINPE_SCRIPT_FILE))
+                .expect("WinPE DISM plans always contain their script"),
+        )
+        .expect("the generated WinPE script is ASCII")
+    }
+}
+
+/// Plans, writes, and runs the two-phase WinPE DISM workflow.
+pub struct WinPeDismBackend;
+
+impl WinPeDismBackend {
+    /// Builds a prepare-phase plan without writing files or launching QEMU.
+    pub fn plan(
+        profile: WindowsProfile,
+        edition_index: u32,
+        instance_dir: &Path,
+    ) -> Result<WinPeDismPlan> {
+        if edition_index == 0 {
+            return Err(LswError::InvalidValue {
+                field: "image index",
+                reason: "must be at least 1".to_owned(),
+            });
+        }
+        require_real_directory(instance_dir)?;
+
+        let destination = instance_dir.join("winpe-seed");
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(LswError::InvalidValue {
+                field: "WinPE DISM seed",
+                reason: format!(
+                    "{} already exists; LSW will not replace it automatically",
+                    destination.display()
+                ),
+            });
+        }
+
+        let customization = CustomizationPlan::for_profile(profile)?;
+        validate_appx_patterns(&customization.remove_provisioned_appx_patterns)?;
+        let mut stages = vec![
+            WinPeDismStage::InitializeWorkspace,
+            WinPeDismStage::LocateInstallImage,
+            WinPeDismStage::ExportEdition {
+                index: edition_index,
+            },
+            WinPeDismStage::MountOfflineImage,
+            WinPeDismStage::InventoryProvisionedAppx,
+        ];
+        stages.extend(
+            customization
+                .remove_provisioned_appx_patterns
+                .iter()
+                .map(|display_name| WinPeDismStage::RemoveProvisionedAppx {
+                    display_name: display_name.clone(),
+                }),
+        );
+        stages.push(WinPeDismStage::CommitPreparedImage);
+
+        let mut generated = BTreeMap::new();
+        generated.insert(
+            PathBuf::from("Autounattend.xml"),
+            autounattend().into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from("lsw/workspace.diskpart"),
+            workspace_diskpart().into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from(WINPE_SCRIPT_FILE),
+            winpe_script(edition_index, &customization).into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from("README.txt"),
+            seed_readme(profile, edition_index, &customization).into_bytes(),
+        );
+        let files = generated.keys().cloned().collect();
+
+        Ok(WinPeDismPlan {
+            profile,
+            edition_index,
+            destination,
+            workspace_disk: instance_dir.join("run/winpe-workspace.qcow2"),
+            workspace_size_gib: WINPE_WORKSPACE_SIZE_GIB,
+            prepared_image_name: WINPE_PREPARED_IMAGE_NAME,
+            compact_on_apply: customization.compact_os,
+            stages,
+            files,
+            generated,
+        })
+    }
+
+    /// Builds an apply-phase plan with Disk 1 as the only destructive target.
+    pub fn plan_apply(
+        manifest: &InstanceManifest,
+        instance_dir: &Path,
+        install_seed: &Path,
+        locale: &str,
+    ) -> Result<WinPeDismApplyPlan> {
+        manifest.spec.validate()?;
+        require_real_directory(instance_dir)?;
+        require_real_directory(install_seed)?;
+        validate_locale(locale)?;
+
+        let destination = instance_dir.join("winpe-apply-seed");
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(LswError::InvalidValue {
+                field: "WinPE DISM apply seed",
+                reason: format!(
+                    "{} already exists; LSW will not replace it automatically",
+                    destination.display()
+                ),
+            });
+        }
+
+        let workspace_disk = instance_dir.join("run/winpe-workspace.qcow2");
+        let target_disk = instance_dir.join("disk.qcow2");
+        let compact = CustomizationPlan::for_profile(manifest.spec.profile)?.compact_os;
+        let mut generated = BTreeMap::new();
+        generated.insert(
+            PathBuf::from("Autounattend.xml"),
+            apply_autounattend().into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from("lsw/target.diskpart"),
+            target_diskpart().into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from(WINPE_APPLY_SCRIPT_FILE),
+            apply_script(compact).into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from("lsw/offline-unattend.xml"),
+            offline_unattend(manifest, locale).into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from("README.txt"),
+            apply_seed_readme(manifest.spec.profile, compact).into_bytes(),
+        );
+
+        let mut includes_agent = false;
+        for relative in [
+            "lsw/agent.token",
+            "lsw/instance.txt",
+            "lsw/install-agent.ps1",
+            "lsw/apply-profile.ps1",
+            "lsw/lsw-agent.exe",
+        ] {
+            let source = install_seed.join(relative);
+            match read_seed_payload(&source)? {
+                Some(contents) => {
+                    if relative.ends_with("lsw-agent.exe") {
+                        includes_agent = true;
+                    }
+                    generated.insert(PathBuf::from("payload").join(relative), contents);
+                }
+                None if relative.ends_with("lsw-agent.exe") => {}
+                None => {
+                    return Err(LswError::InvalidValue {
+                        field: "install seed",
+                        reason: format!("{} is missing", source.display()),
+                    })
+                }
+            }
+        }
+
+        let files = generated.keys().cloned().collect();
+        Ok(WinPeDismApplyPlan {
+            profile: manifest.spec.profile,
+            destination,
+            workspace_disk,
+            target_disk,
+            target_disk_id: WINPE_TARGET_DISK_ID,
+            compact,
+            includes_agent,
+            stages: vec![
+                WinPeDismApplyStage::LocatePreparedImage,
+                WinPeDismApplyStage::InitializeTarget,
+                WinPeDismApplyStage::ApplyPreparedImage { compact },
+                WinPeDismApplyStage::StageGuestSetup,
+                WinPeDismApplyStage::ConfigureUefiBoot,
+            ],
+            files,
+            generated,
+        })
+    }
+
+    /// Builds the network-disabled QEMU plan for one WinPE phase.
+    pub fn plan_vm(
+        capabilities: HostCapabilities,
+        manifest: &InstanceManifest,
+        instance_dir: &Path,
+        phase: WinPeDismVmPhase,
+    ) -> Result<WinPeDismVmPlan> {
+        manifest.spec.validate_for_create()?;
+        require_real_directory(instance_dir)?;
+        require_real_directory(&instance_dir.join("run"))?;
+        require_real_directory(&instance_dir.join(phase.seed_directory()))?;
+
+        let backend = QemuBackend::select(&capabilities);
+        let program = capabilities
+            .qemu_system
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64"));
+        let firmware_code = capabilities
+            .firmware_code(manifest.spec.profile)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/path/to/OVMF_CODE.fd"));
+        let firmware_vars_source = capabilities
+            .firmware_vars(manifest.spec.profile)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("/path/to/OVMF_VARS.fd"));
+        let phase_name = match phase {
+            WinPeDismVmPhase::Prepare => "prepare",
+            WinPeDismVmPhase::Apply => "apply",
+        };
+        let firmware_vars = instance_dir.join(format!("run/winpe-{phase_name}-OVMF_VARS.fd"));
+        let workspace_disk = instance_dir.join("run/winpe-workspace.qcow2");
+        let target_disk = instance_dir.join("disk.qcow2");
+        let status_log = instance_dir.join(format!("run/winpe-{phase_name}-serial.log"));
+        let qemu_log = instance_dir.join(format!("winpe-{phase_name}-qemu.log"));
+        let mut steps = Vec::new();
+        let mut missing_capabilities = Vec::new();
+
+        plan_new_firmware_vars(
+            &firmware_vars_source,
+            &firmware_vars,
+            &mut steps,
+            &mut missing_capabilities,
+            capabilities.firmware_vars(manifest.spec.profile).is_some(),
+        )?;
+        match phase {
+            WinPeDismVmPhase::Prepare => {
+                if path_is_missing(&workspace_disk, "WinPE workspace disk")? {
+                    let qemu_img = capabilities
+                        .qemu_img
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("qemu-img"));
+                    steps.push(PreparationStep::CreateDisk {
+                        program: qemu_img,
+                        destination: workspace_disk.clone(),
+                        size_gib: WINPE_WORKSPACE_SIZE_GIB,
+                    });
+                    if capabilities.qemu_img.is_none() {
+                        missing_capabilities.push("qemu-img");
+                    }
+                } else {
+                    require_regular_file(&workspace_disk, "WinPE workspace disk")?;
+                }
+            }
+            WinPeDismVmPhase::Apply => {
+                require_regular_file(&workspace_disk, "prepared WinPE workspace disk")?;
+                require_regular_file(&target_disk, "target system disk")?;
+            }
+        }
+
+        if capabilities.qemu_system.is_none() {
+            missing_capabilities.push("qemu-system-x86_64");
+        }
+        if capabilities.firmware_code(manifest.spec.profile).is_none() {
+            missing_capabilities.push(if manifest.spec.profile.security().secure_boot {
+                "Secure Boot OVMF code firmware"
+            } else {
+                "OVMF code firmware"
+            });
+        }
+        missing_capabilities.sort_unstable();
+        missing_capabilities.dedup();
+
+        let security = manifest.spec.profile.security();
+        let mut arguments = Vec::new();
+        push_pair(
+            &mut arguments,
+            "-name",
+            format!("lsw-{}-winpe-{phase_name}", manifest.spec.name),
+        );
+        push_pair(
+            &mut arguments,
+            "-machine",
+            if security.secure_boot {
+                "q35,usb=on,smm=on"
+            } else {
+                "q35,usb=on"
+            },
+        );
+        push_pair(&mut arguments, "-smp", manifest.spec.cpus.to_string());
+        push_pair(
+            &mut arguments,
+            "-m",
+            format!("{}M", manifest.spec.memory_mib),
+        );
+        arguments.extend(backend.acceleration_arguments().iter().map(OsString::from));
+        push_pair(
+            &mut arguments,
+            "-drive",
+            format!(
+                "if=pflash,format=raw,readonly=on,file={}",
+                qemu_path(&firmware_code)
+            ),
+        );
+        push_pair(
+            &mut arguments,
+            "-drive",
+            format!("if=pflash,format=raw,file={}", qemu_path(&firmware_vars)),
+        );
+        if security.secure_boot {
+            push_pair(
+                &mut arguments,
+                "-global",
+                "driver=cfi.pflash01,property=secure,value=on",
+            );
+        }
+        push_pair(
+            &mut arguments,
+            "-drive",
+            format!(
+                "file={},if=none,id=workspace,format=qcow2,discard=unmap",
+                qemu_path(&workspace_disk)
+            ),
+        );
+        push_pair(
+            &mut arguments,
+            "-device",
+            "nvme,drive=workspace,serial=lsw-winpe-workspace,addr=0x4",
+        );
+        if phase == WinPeDismVmPhase::Apply {
+            push_pair(
+                &mut arguments,
+                "-drive",
+                format!(
+                    "file={},if=none,id=target,format=qcow2,discard=unmap",
+                    qemu_path(&target_disk)
+                ),
+            );
+            push_pair(
+                &mut arguments,
+                "-device",
+                "nvme,drive=target,serial=lsw-system,addr=0x5",
+            );
+        }
+        push_pair(
+            &mut arguments,
+            "-drive",
+            format!(
+                "media=cdrom,readonly=on,file={}",
+                qemu_path(&manifest.spec.source_iso)
+            ),
+        );
+        push_pair(
+            &mut arguments,
+            "-drive",
+            format!(
+                "file=fat:ro:{},format=raw,if=none,id=lsw-winpe-seed,snapshot=on",
+                qemu_path(&instance_dir.join(phase.seed_directory()))
+            ),
+        );
+        push_pair(&mut arguments, "-device", "qemu-xhci");
+        push_pair(
+            &mut arguments,
+            "-device",
+            "usb-storage,drive=lsw-winpe-seed,removable=on",
+        );
+        push_pair(&mut arguments, "-device", "VGA");
+        push_pair(&mut arguments, "-boot", "once=d,menu=off");
+        push_pair(&mut arguments, "-nic", "none");
+        push_pair(
+            &mut arguments,
+            "-serial",
+            format!("file:{}", qemu_path(&status_log)),
+        );
+        push_pair(
+            &mut arguments,
+            "-qmp",
+            format!(
+                "unix:{},server=on,wait=off",
+                qemu_path(&instance_dir.join(format!("run/winpe-{phase_name}-qmp.sock")))
+            ),
+        );
+        arguments.push("-nodefaults".into());
+        arguments.push("-no-reboot".into());
+        push_pair(&mut arguments, "-monitor", "none");
+        push_pair(&mut arguments, "-display", "none");
+
+        let mut notes = vec![match phase {
+            WinPeDismVmPhase::Prepare => {
+                "preparation VM attaches only the private workspace as writable Disk 0; the target disk is not attached"
+                    .to_owned()
+            }
+            WinPeDismVmPhase::Apply => {
+                "apply VM attaches the prepared workspace as Disk 0 and the LSW target qcow2 as Disk 1"
+                    .to_owned()
+            }
+        }];
+        notes.push("preparation networking is disabled".to_owned());
+        notes.push(format!(
+            "successful completion requires serial marker {:?}",
+            phase.completion_marker()
+        ));
+        if let Some(note) = backend.fallback_note() {
+            notes.push(note);
+        }
+
+        Ok(WinPeDismVmPlan {
+            phase,
+            backend,
+            invocation: CommandInvocation {
+                program: program.into_os_string(),
+                arguments,
+            },
+            host_preparation: PreparationPlan {
+                steps,
+                missing_capabilities: missing_capabilities.clone(),
+            },
+            status_log,
+            qemu_log,
+            missing_capabilities,
+            notes,
+        })
+    }
+
+    /// Runs a WinPE phase and requires its exact serial completion marker.
+    pub fn run_vm(plan: &WinPeDismVmPlan, timeout: Duration) -> Result<WinPeDismRunResult> {
+        if timeout.is_zero() {
+            return Err(LswError::InvalidValue {
+                field: "WinPE timeout",
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+        if !plan.missing_capabilities.is_empty() {
+            return Err(LswError::MissingCapabilities(
+                plan.missing_capabilities.clone(),
+            ));
+        }
+        crate::Provisioner::new(HostCapabilities::unavailable(plan.backend.platform()))
+            .apply(&plan.host_preparation)?;
+        prepare_output_file(&plan.status_log)?;
+        let stdout = prepare_output_file(&plan.qemu_log)?;
+        let stderr = stdout.try_clone()?;
+        let started = Instant::now();
+        let mut child = Command::new(&plan.invocation.program)
+            .args(&plan.invocation.arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()?;
+
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(LswError::InvalidValue {
+                    field: "WinPE DISM run",
+                    reason: format!(
+                        "{:?} phase exceeded {} seconds; inspect {} and {}",
+                        plan.phase,
+                        timeout.as_secs(),
+                        plan.status_log.display(),
+                        plan.qemu_log.display()
+                    ),
+                });
+            }
+            thread::sleep(Duration::from_millis(250));
+        };
+        if !status.success() {
+            return Err(LswError::ExternalCommandFailed {
+                program: PathBuf::from(&plan.invocation.program),
+                status: status.code(),
+            });
+        }
+
+        let status_events = read_status_events(&plan.status_log)?;
+        if status_events
+            .iter()
+            .any(|event| event.contains(plan.phase.failure_marker()))
+        {
+            return Err(LswError::InvalidValue {
+                field: "WinPE DISM run",
+                reason: format!(
+                    "{:?} phase reported failure; inspect {} and {}",
+                    plan.phase,
+                    plan.status_log.display(),
+                    plan.qemu_log.display()
+                ),
+            });
+        }
+        if !status_events
+            .iter()
+            .any(|event| event.contains(plan.phase.completion_marker()))
+        {
+            return Err(LswError::InvalidValue {
+                field: "WinPE DISM run",
+                reason: format!(
+                    "{:?} phase exited without completion marker {:?}; inspect {}",
+                    plan.phase,
+                    plan.phase.completion_marker(),
+                    plan.status_log.display()
+                ),
+            });
+        }
+        Ok(WinPeDismRunResult {
+            phase: plan.phase,
+            elapsed: started.elapsed(),
+            status_events,
+        })
+    }
+
+    /// Atomically writes a new prepare seed and refuses replacement.
+    pub fn write_seed(plan: &WinPeDismPlan) -> Result<()> {
+        write_generated_seed(&plan.destination, &plan.generated, "WinPE DISM seed")
+    }
+
+    /// Atomically writes a new apply seed and refuses replacement.
+    pub fn write_apply_seed(plan: &WinPeDismApplyPlan) -> Result<()> {
+        write_generated_seed(&plan.destination, &plan.generated, "WinPE DISM apply seed")
+    }
+}
+
+fn write_generated_seed(
+    destination: &Path,
+    generated: &BTreeMap<PathBuf, Vec<u8>>,
+    field: &'static str,
+) -> Result<()> {
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(LswError::InvalidValue {
+            field,
+            reason: format!("refusing to replace existing {}", destination.display()),
+        });
+    }
+    let parent = destination.parent().ok_or_else(|| LswError::InvalidValue {
+        field,
+        reason: "destination has no parent directory".to_owned(),
+    })?;
+    let name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("winpe-seed");
+    let staging = parent.join(format!("{name}.tmp-{}", std::process::id()));
+    if fs::symlink_metadata(&staging).is_ok() {
+        return Err(LswError::InvalidValue {
+            field,
+            reason: format!("staging path {} already exists", staging.display()),
+        });
+    }
+    fs::create_dir(&staging)?;
+    set_private_directory_permissions(&staging)?;
+
+    let result = (|| {
+        for (relative, contents) in generated {
+            let destination = staging.join(relative);
+            if let Some(directory) = destination.parent() {
+                fs::create_dir_all(directory)?;
+                set_private_directory_permissions(directory)?;
+            }
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&destination)?;
+            set_private_file_permissions(&destination)?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+        fs::rename(&staging, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn plan_new_firmware_vars(
+    source: &Path,
+    destination: &Path,
+    steps: &mut Vec<PreparationStep>,
+    missing_capabilities: &mut Vec<&'static str>,
+    source_available: bool,
+) -> Result<()> {
+    if path_is_missing(destination, "WinPE firmware variable store")? {
+        steps.push(PreparationStep::CopyFirmwareVariables {
+            source: source.to_owned(),
+            destination: destination.to_owned(),
+        });
+        if !source_available {
+            missing_capabilities.push("OVMF variable template");
+        }
+    } else {
+        require_regular_file(destination, "WinPE firmware variable store")?;
+    }
+    Ok(())
+}
+
+fn path_is_missing(path: &Path, field: &'static str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(LswError::InvalidValue {
+            field,
+            reason: format!("{} must not be a symbolic link", path.display()),
+        }),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn require_regular_file(path: &Path, field: &'static str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field,
+            reason: format!("{} is not a regular file", path.display()),
+        })
+    }
+}
+
+fn prepare_output_file(path: &Path) -> Result<fs::File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            return Err(LswError::InvalidValue {
+                field: "WinPE log",
+                reason: format!("{} is not a regular file", path.display()),
+            })
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    set_private_file_permissions(path)?;
+    Ok(file)
+}
+
+fn read_status_events(path: &Path) -> Result<Vec<String>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(LswError::InvalidValue {
+            field: "WinPE status log",
+            reason: format!("{} is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() > MAX_STATUS_LOG_BYTES {
+        return Err(LswError::InvalidValue {
+            field: "WinPE status log",
+            reason: format!("{} exceeds 1 MiB", path.display()),
+        });
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)?
+        .take(MAX_STATUS_LOG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes)
+        .lines()
+        .map(|line| line.trim_matches(|character: char| character.is_control()))
+        .filter(|line| line.contains("LSW-WINPE-DISM "))
+        .map(str::to_owned)
+        .collect())
+}
+
+fn push_pair(
+    arguments: &mut Vec<OsString>,
+    option: impl Into<OsString>,
+    value: impl Into<OsString>,
+) {
+    arguments.push(option.into());
+    arguments.push(value.into());
+}
+
+fn qemu_path(path: &Path) -> String {
+    path.to_string_lossy().replace(',', ",,")
+}
+
+fn autounattend() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Prepare the selected Windows image with Microsoft DISM</Description>
+          <Path>cmd.exe /d /c for %D in (D E F G H I J K L M N O P Q R S T U V X Y Z) do @if exist "%D:\{WINPE_SEED_SENTINEL}" call "%D:\{WINPE_SEED_SENTINEL}"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+      <UserData><AcceptEula>true</AcceptEula></UserData>
+    </component>
+  </settings>
+</unattend>
+"#
+    )
+}
+
+fn workspace_diskpart() -> String {
+    format!(
+        "select disk {WINPE_WORKSPACE_DISK_ID}\r\nclean\r\nconvert gpt\r\ncreate partition primary\r\nformat fs=ntfs quick label=LSW-WORK\r\nassign letter={}\r\nexit\r\n",
+        WINPE_WORKSPACE_DRIVE.trim_end_matches(':')
+    )
+}
+
+fn apply_autounattend() -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Apply the prepared LSW Windows image</Description>
+          <Path>cmd.exe /d /c for %D in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist "%D:\{WINPE_APPLY_SENTINEL}" call "%D:\{WINPE_APPLY_SENTINEL}"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+      <UserData><AcceptEula>true</AcceptEula></UserData>
+    </component>
+  </settings>
+</unattend>
+"#
+    )
+}
+
+fn target_diskpart() -> String {
+    format!(
+        "select disk {WINPE_TARGET_DISK_ID}\r\nclean\r\nconvert gpt\r\ncreate partition efi size=260\r\nformat fs=fat32 quick label=System\r\nassign letter=S\r\ncreate partition msr size=16\r\ncreate partition primary\r\nformat fs=ntfs quick label=Windows\r\nassign letter=T\r\nexit\r\n"
+    )
+}
+
+fn apply_script(compact: bool) -> String {
+    let compact_argument = if compact { " /Compact:on" } else { "" };
+    format!(
+        r#"@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+set "LSW_SEED=%~d0"
+set "LSW_LOG="
+set "LSW_IMAGE="
+set "LSW_DISM=%SystemRoot%\System32\dism.exe"
+
+for %%D in (C D E F G H I J K L M N O P Q R S U V W X Y Z) do (
+    if not defined LSW_IMAGE if exist "%%D:\{WINPE_PREPARED_IMAGE_NAME}" (
+        set "LSW_IMAGE=%%D:\{WINPE_PREPARED_IMAGE_NAME}"
+        set "LSW_LOG=%%D:\logs\winpe-apply.log"
+    )
+)
+if not defined LSW_IMAGE goto :fail
+if /i "%LSW_IMAGE:~0,2%"=="%LSW_SEED%" goto :fail
+if not exist "%LSW_IMAGE%" goto :fail
+
+call :status initialize-target
+diskpart.exe /s "%LSW_SEED%\lsw\target.diskpart" >>"%LSW_LOG%" 2>&1
+if errorlevel 1 goto :fail
+if not exist "T:\" goto :fail
+if not exist "S:\" goto :fail
+
+call :status apply-image
+call :run "%LSW_DISM%" /English /Apply-Image /ImageFile:"%LSW_IMAGE%" /Index:1 /ApplyDir:T:\ /CheckIntegrity{compact_argument}
+if errorlevel 1 goto :fail
+if not exist "T:\Windows\System32\bcdboot.exe" goto :fail
+
+call :status stage-guest-setup
+mkdir "T:\ProgramData\LSW\setup" "T:\Windows\Panther" >>"%LSW_LOG%" 2>&1
+if errorlevel 1 goto :fail
+xcopy.exe "%LSW_SEED%\payload\lsw\*" "T:\ProgramData\LSW\setup\" /E /H /K /Y /I >>"%LSW_LOG%" 2>&1
+if errorlevel 1 goto :fail
+copy /Y "%LSW_SEED%\lsw\offline-unattend.xml" "T:\Windows\Panther\unattend.xml" >>"%LSW_LOG%" 2>&1
+if errorlevel 1 goto :fail
+icacls.exe "T:\ProgramData\LSW\setup" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >>"%LSW_LOG%" 2>&1
+if errorlevel 1 goto :fail
+
+call :status configure-boot
+call :run "T:\Windows\System32\bcdboot.exe" T:\Windows /s S: /f UEFI
+if errorlevel 1 goto :fail
+
+call :status apply-complete
+wpeutil.exe shutdown
+exit /b 0
+
+:run
+>>"%LSW_LOG%" echo ^> %*
+%* >>"%LSW_LOG%" 2>&1
+set "LSW_EXIT=!errorlevel!"
+if not "!LSW_EXIT!"=="0" >>"%LSW_LOG%" echo command failed with exit code !LSW_EXIT!
+exit /b !LSW_EXIT!
+
+:fail
+call :status apply-failed
+if defined LSW_LOG >>"%LSW_LOG%" echo WinPE apply failed
+wpeutil.exe shutdown
+exit /b 1
+
+:status
+echo LSW-WINPE-DISM %*>COM1
+exit /b 0
+"#
+    )
+}
+
+fn offline_unattend(manifest: &InstanceManifest, locale: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order><Description>Install LSW guest agent service</Description>
+          <Path>powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\ProgramData\LSW\setup\install-agent.ps1"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>{locale}</InputLocale><SystemLocale>{locale}</SystemLocale><UILanguage>{locale}</UILanguage><UserLocale>{locale}</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <ComputerName>{computer_name}</ComputerName>
+    </component>
+  </settings>
+</unattend>
+"#,
+        locale = xml_escape(locale),
+        computer_name = windows_computer_name(&manifest.spec.name),
+    )
+}
+
+fn winpe_script(edition_index: u32, customization: &CustomizationPlan) -> String {
+    let removal_patterns = customization
+        .remove_provisioned_appx_patterns
+        .iter()
+        .map(|pattern| {
+            format!("call :remove_if_present \"{pattern}\"\r\nif errorlevel 1 goto :fail_mounted")
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    let removal = if removal_patterns.is_empty() {
+        "call :status no-appx-removals".to_owned()
+    } else {
+        removal_patterns
+    };
+
+    format!(
+        r#"@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+set "LSW_SEED=%~d0"
+set "LSW_WORK={WINPE_WORKSPACE_DRIVE}"
+set "LSW_MOUNT={WINPE_WORKSPACE_DRIVE}\mount"
+set "LSW_SCRATCH={WINPE_WORKSPACE_DRIVE}\scratch"
+set "LSW_LOG={WINPE_WORKSPACE_DRIVE}\logs\winpe-dism.log"
+set "LSW_PACKAGES={WINPE_WORKSPACE_DRIVE}\logs\provisioned-appx.txt"
+set "LSW_IMAGE={WINPE_WORKSPACE_DRIVE}\{WINPE_PREPARED_IMAGE_NAME}"
+set "LSW_DISM=%SystemRoot%\System32\dism.exe"
+
+call :status initialize-workspace
+diskpart.exe /s "%LSW_SEED%\lsw\workspace.diskpart" > X:\lsw-workspace.log 2>&1
+if errorlevel 1 goto :fail
+mkdir "%LSW_MOUNT%" "%LSW_SCRATCH%" "{WINPE_WORKSPACE_DRIVE}\logs" >nul 2>&1
+if errorlevel 1 goto :fail
+
+set "LSW_SOURCE="
+for %%D in (C D E F G H I J K L M N O P Q R S T U V X Y Z) do (
+    if not defined LSW_SOURCE if exist "%%D:\sources\install.wim" set "LSW_SOURCE=%%D:\sources\install.wim"
+    if not defined LSW_SOURCE if exist "%%D:\sources\install.esd" set "LSW_SOURCE=%%D:\sources\install.esd"
+)
+if not defined LSW_SOURCE (
+    >>"%LSW_LOG%" echo official media has no sources\install.wim or sources\install.esd
+    goto :fail
+)
+
+call :status export-image
+call :run "%LSW_DISM%" /English /Export-Image /SourceImageFile:"%LSW_SOURCE%" /SourceIndex:{edition_index} /DestinationImageFile:"%LSW_IMAGE%" /Compress:max /CheckIntegrity
+if errorlevel 1 goto :fail
+
+call :status mount-image
+call :run "%LSW_DISM%" /English /Mount-Image /ImageFile:"%LSW_IMAGE%" /Index:1 /MountDir:"%LSW_MOUNT%" /ScratchDir:"%LSW_SCRATCH%" /CheckIntegrity
+if errorlevel 1 goto :fail_mounted
+
+call :status inventory-appx
+"%LSW_DISM%" /English /Image:"%LSW_MOUNT%" /Get-ProvisionedAppxPackages >"%LSW_PACKAGES%" 2>>"%LSW_LOG%"
+if errorlevel 1 goto :fail_mounted
+{removal}
+
+call :status commit-image
+call :run "%LSW_DISM%" /English /Unmount-Image /MountDir:"%LSW_MOUNT%" /Commit /CheckIntegrity
+if errorlevel 1 goto :fail_mounted
+call :status complete
+wpeutil.exe shutdown
+exit /b 0
+
+:remove_if_present
+set "LSW_DISPLAY_NAME=%~1"
+for /f "tokens=2 delims=:" %%P in ('findstr.exe /b /c:"PackageName :" "%LSW_PACKAGES%"') do (
+    set "LSW_PACKAGE=%%P"
+    for /f "tokens=*" %%Q in ("!LSW_PACKAGE!") do set "LSW_PACKAGE=%%Q"
+    echo(!LSW_PACKAGE!| findstr.exe /i /b /l /c:"!LSW_DISPLAY_NAME!_" >nul
+    if not errorlevel 1 (
+        call :status remove-appx !LSW_DISPLAY_NAME!
+        call :run "%LSW_DISM%" /English /Image:"%LSW_MOUNT%" /Remove-ProvisionedAppxPackage /PackageName:!LSW_PACKAGE!
+        if errorlevel 1 exit /b 1
+    )
+)
+exit /b 0
+
+:run
+>>"%LSW_LOG%" echo ^> %*
+%* >>"%LSW_LOG%" 2>&1
+set "LSW_EXIT=!errorlevel!"
+if not "!LSW_EXIT!"=="0" >>"%LSW_LOG%" echo command failed with exit code !LSW_EXIT!
+exit /b !LSW_EXIT!
+
+:fail_mounted
+call :status discard-image
+"%LSW_DISM%" /English /Unmount-Image /MountDir:"%LSW_MOUNT%" /Discard >>"%LSW_LOG%" 2>&1
+
+:fail
+call :status failed
+wpeutil.exe shutdown
+exit /b 1
+
+:status
+echo LSW-WINPE-DISM %*>COM1
+exit /b 0
+"#
+    )
+}
+
+fn seed_readme(
+    profile: WindowsProfile,
+    edition_index: u32,
+    customization: &CustomizationPlan,
+) -> String {
+    format!(
+        "LSW WinPE DISM preparation seed\r\n\r\nProfile: {profile}\r\nEdition index: {edition_index}\r\nOutput: {WINPE_WORKSPACE_DRIVE}\\{WINPE_PREPARED_IMAGE_NAME}\r\n\r\nThis seed contains no Windows image, product key, activation data, or Microsoft binary.\r\nIt must be booted only in LSW's isolated preparation VM with a blank LSW-owned virtual Disk {WINPE_WORKSPACE_DISK_ID}.\r\nThe script uses dism.exe from the official Windows ISO's WinPE environment. Linux wimlib is not used for Windows package, AppX, or feature servicing.\r\nCompact-on-apply: {}\r\n",
+        if customization.compact_os { "yes" } else { "no" }
+    )
+}
+
+fn apply_seed_readme(profile: WindowsProfile, compact: bool) -> String {
+    format!(
+        "LSW WinPE DISM apply seed\r\n\r\nProfile: {profile}\r\nInput: {WINPE_PREPARED_IMAGE_NAME}\r\nTarget: virtual Disk {WINPE_TARGET_DISK_ID}\r\nCompact-on-apply: {}\r\n\r\nThis seed contains no Windows image, product key, or activation data. It may contain the per-instance LSW agent token and must remain private.\r\nIt must be booted only with the LSW workspace as virtual Disk 0 and a new LSW-owned target qcow2 as virtual Disk {WINPE_TARGET_DISK_ID}. Never attach a host block device.\r\n",
+        if compact { "yes" } else { "no" }
+    )
+}
+
+fn read_seed_payload(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(LswError::InvalidValue {
+            field: "install seed payload",
+            reason: format!("{} is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() > MAX_SEED_PAYLOAD_BYTES {
+        return Err(LswError::InvalidValue {
+            field: "install seed payload",
+            reason: format!("{} exceeds 64 MiB", path.display()),
+        });
+    }
+    Ok(Some(fs::read(path)?))
+}
+
+fn validate_locale(locale: &str) -> Result<()> {
+    if (2..=20).contains(&locale.len())
+        && locale
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && locale.bytes().any(|byte| byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "locale",
+            reason: "must look like en-US or zh-HK".to_owned(),
+        })
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn windows_computer_name(instance: &str) -> String {
+    let mut name = format!("LSW-{}", instance.to_ascii_uppercase())
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(15)
+        .collect::<String>();
+    while name.ends_with('-') {
+        name.pop();
+    }
+    name
+}
+
+fn validate_appx_patterns(patterns: &[String]) -> Result<()> {
+    if patterns.iter().all(|pattern| {
+        !pattern.is_empty()
+            && pattern.len() <= 128
+            && pattern
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    }) {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "AppX removal pattern",
+            reason: "must contain only ASCII letters, digits, dot, dash, or underscore".to_owned(),
+        })
+    }
+}
+
+fn require_real_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "instance directory",
+            reason: format!("{} is not a real directory", path.display()),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::{
+        InstallSeedBuilder, InstallSeedOptions, InstanceSpec, NetworkMode, WindowsProfile,
+    };
+
+    static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn fixture() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let fixture_id = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "lsw-winpe-dism-test-{}-{nonce}-{fixture_id}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("run")).expect("fixture should be created");
+        root
+    }
+
+    fn manifest(root: &Path, profile: WindowsProfile) -> InstanceManifest {
+        let iso = root.join("windows.iso");
+        fs::write(&iso, b"media").expect("ISO fixture should be written");
+        InstanceManifest::new(InstanceSpec {
+            name: "win-dev".to_owned(),
+            source_iso: iso,
+            profile,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("manifest should be valid")
+    }
+
+    fn install_seed(root: &Path, manifest: &InstanceManifest) -> PathBuf {
+        let options = InstallSeedOptions {
+            unattended_image_name: Some("Windows 11 Pro".to_owned()),
+            ..InstallSeedOptions::default()
+        };
+        let plan = InstallSeedBuilder::plan(manifest, root, &"a".repeat(64), &options)
+            .expect("install seed should be planned");
+        InstallSeedBuilder::apply(&plan).expect("install seed should be written");
+        root.join("seed")
+    }
+
+    fn vm_capabilities(root: &Path) -> HostCapabilities {
+        let mut capabilities = HostCapabilities::unavailable(crate::HostPlatform::Linux);
+        let qemu = root.join("qemu-system-x86_64");
+        let qemu_img = root.join("qemu-img");
+        let code = root.join("OVMF_CODE.fd");
+        let vars = root.join("OVMF_VARS.fd");
+        for path in [&qemu, &qemu_img, &code, &vars] {
+            fs::write(path, b"fixture").expect("capability fixture should be written");
+        }
+        capabilities.qemu_system = Some(qemu);
+        capabilities.qemu_img = Some(qemu_img);
+        capabilities.ovmf_code = Some(code);
+        capabilities.ovmf_vars = Some(vars);
+        capabilities
+    }
+
+    #[test]
+    fn slim_plan_uses_only_windows_dism_for_offline_servicing() {
+        let root = fixture();
+        let plan = WinPeDismBackend::plan(WindowsProfile::Slim, 6, &root)
+            .expect("slim plan should be generated");
+        let script = plan.script();
+
+        assert!(script.contains("dism.exe"));
+        assert!(script.contains("/English /Export-Image"));
+        assert!(script.contains("/SourceIndex:6"));
+        assert!(script.contains("/Mount-Image"));
+        assert!(script.contains("/Get-ProvisionedAppxPackages"));
+        assert!(script.contains("/Remove-ProvisionedAppxPackage"));
+        assert!(script.contains("/Unmount-Image"));
+        assert!(script.contains("/Commit /CheckIntegrity"));
+        assert!(!script.contains("wimlib"));
+        assert!(!script.contains("powershell"));
+        assert!(!script.contains("/Remove-Package"));
+        assert!(!script.contains("/Disable-Feature"));
+        assert!(plan.compact_on_apply);
+        assert!(plan.stages.iter().any(|stage| matches!(
+            stage,
+            WinPeDismStage::RemoveProvisionedAppx { display_name }
+                if *display_name == "Clipchamp.Clipchamp"
+        )));
+
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn stock_profile_exports_without_removing_packages() {
+        let root = fixture();
+        let plan = WinPeDismBackend::plan(WindowsProfile::Vanilla, 1, &root)
+            .expect("vanilla plan should be generated");
+        assert!(!plan.compact_on_apply);
+        assert!(!plan
+            .stages
+            .iter()
+            .any(|stage| matches!(stage, WinPeDismStage::RemoveProvisionedAppx { .. })));
+        assert!(!plan.script().contains("call :remove_if_present \""));
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn seed_is_atomic_and_does_not_contain_license_secrets() {
+        let root = fixture();
+        let plan = WinPeDismBackend::plan(WindowsProfile::Slim, 6, &root)
+            .expect("slim plan should be generated");
+        WinPeDismBackend::write_seed(&plan).expect("seed should be written");
+
+        let answer = fs::read_to_string(root.join("winpe-seed/Autounattend.xml"))
+            .expect("answer file should be readable");
+        assert!(answer.contains("<RunSynchronous>"));
+        assert!(answer.contains("<AcceptEula>true</AcceptEula>"));
+        assert!(!answer.contains("ProductKey"));
+        assert!(root.join("winpe-seed/lsw/winpe-dism.cmd").is_file());
+        assert!(WinPeDismBackend::write_seed(&plan).is_err());
+
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn zero_image_index_is_rejected() {
+        let root = fixture();
+        assert!(WinPeDismBackend::plan(WindowsProfile::Slim, 0, &root).is_err());
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn apply_plan_wipes_only_the_second_virtual_disk_and_stages_the_agent() {
+        let root = fixture();
+        let manifest = manifest(&root, WindowsProfile::Slim);
+        let install_seed = install_seed(&root, &manifest);
+        let plan = WinPeDismBackend::plan_apply(&manifest, &root, &install_seed, "zh-HK")
+            .expect("apply plan should be generated");
+        let script = plan.script();
+
+        assert_eq!(plan.target_disk_id, 1);
+        assert!(plan.compact);
+        assert!(!plan.includes_agent);
+        assert!(script.contains("/Apply-Image"));
+        assert!(script.contains("/Compact:on"));
+        assert!(script.contains("/ApplyDir:T:\\"));
+        assert!(script.contains("bcdboot.exe"));
+        assert!(script.contains("/s S: /f UEFI"));
+        assert!(script.contains("icacls.exe"));
+        assert!(!script.contains("select disk"));
+
+        let diskpart = String::from_utf8(
+            plan.generated
+                .get(Path::new("lsw/target.diskpart"))
+                .expect("target diskpart script should exist")
+                .clone(),
+        )
+        .expect("diskpart script should be UTF-8");
+        assert!(diskpart.starts_with("select disk 1\r\nclean\r\n"));
+        assert!(!diskpart.contains("select disk 0"));
+
+        let unattend = String::from_utf8(
+            plan.generated
+                .get(Path::new("lsw/offline-unattend.xml"))
+                .expect("offline unattend should exist")
+                .clone(),
+        )
+        .expect("offline unattend should be UTF-8");
+        assert!(unattend.contains("<InputLocale>zh-HK</InputLocale>"));
+        assert!(unattend.contains("<settings pass=\"specialize\">"));
+        assert!(unattend.contains("<RunSynchronous>"));
+        assert!(unattend.contains("C:\\ProgramData\\LSW\\setup\\install-agent.ps1"));
+        assert!(!unattend.contains("FirstLogonCommands"));
+        assert!(!unattend.contains("ProductKey"));
+        assert!(plan
+            .generated
+            .contains_key(Path::new("payload/lsw/agent.token")));
+
+        WinPeDismBackend::write_apply_seed(&plan).expect("apply seed should be written");
+        assert!(root
+            .join("winpe-apply-seed/payload/lsw/agent.token")
+            .is_file());
+        assert!(WinPeDismBackend::write_apply_seed(&plan).is_err());
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn stock_apply_does_not_enable_compact_os() {
+        let root = fixture();
+        let manifest = manifest(&root, WindowsProfile::Vanilla);
+        let install_seed = install_seed(&root, &manifest);
+        let plan = WinPeDismBackend::plan_apply(&manifest, &root, &install_seed, "en-US")
+            .expect("apply plan should be generated");
+        assert!(!plan.compact);
+        assert!(!plan.script().contains("/Compact:on"));
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn vm_plans_keep_prepare_and_apply_disk_topologies_separate() {
+        let root = fixture();
+        let manifest = manifest(&root, WindowsProfile::Slim);
+        let install_seed = install_seed(&root, &manifest);
+        let prepare_seed = WinPeDismBackend::plan(WindowsProfile::Slim, 6, &root)
+            .expect("prepare seed should plan");
+        WinPeDismBackend::write_seed(&prepare_seed).expect("prepare seed should be written");
+        let capabilities = vm_capabilities(&root);
+
+        let prepare = WinPeDismBackend::plan_vm(
+            capabilities.clone(),
+            &manifest,
+            &root,
+            WinPeDismVmPhase::Prepare,
+        )
+        .expect("prepare VM should plan");
+        let prepare_command = prepare.display_command();
+        assert!(prepare_command.contains("id=workspace"));
+        assert!(prepare_command.contains("serial=lsw-winpe-workspace"));
+        assert!(!prepare_command.contains("id=target"));
+        assert!(!prepare_command.contains("disk.qcow2"));
+        assert!(prepare_command.contains("-nic none"));
+        assert!(prepare_command.contains("winpe-seed"));
+        assert!(prepare
+            .host_preparation
+            .steps
+            .iter()
+            .any(|step| matches!(step, PreparationStep::CreateDisk { size_gib: 32, .. })));
+
+        fs::write(root.join("run/winpe-workspace.qcow2"), b"workspace")
+            .expect("workspace fixture should be written");
+        fs::write(root.join("disk.qcow2"), b"target").expect("target fixture should be written");
+        let apply_seed = WinPeDismBackend::plan_apply(&manifest, &root, &install_seed, "en-US")
+            .expect("apply seed should plan");
+        WinPeDismBackend::write_apply_seed(&apply_seed).expect("apply seed should be written");
+        let apply =
+            WinPeDismBackend::plan_vm(capabilities, &manifest, &root, WinPeDismVmPhase::Apply)
+                .expect("apply VM should plan");
+        let apply_command = apply.display_command();
+        let workspace = apply_command
+            .find("id=workspace")
+            .expect("workspace disk should be present");
+        let target = apply_command
+            .find("id=target")
+            .expect("target disk should be present");
+        assert!(workspace < target);
+        assert!(apply_command.contains("serial=lsw-system"));
+        assert!(apply_command.contains("winpe-apply-seed"));
+        assert!(apply_command.contains("-nic none"));
+
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_runner_requires_the_phase_completion_marker() {
+        let root = fixture();
+        let manifest = manifest(&root, WindowsProfile::Slim);
+        let prepare_seed = WinPeDismBackend::plan(WindowsProfile::Slim, 6, &root)
+            .expect("prepare seed should plan");
+        WinPeDismBackend::write_seed(&prepare_seed).expect("prepare seed should be written");
+        let capabilities = vm_capabilities(&root);
+        fs::write(root.join("run/winpe-workspace.qcow2"), b"workspace")
+            .expect("workspace fixture should be written");
+        fs::write(root.join("run/winpe-prepare-OVMF_VARS.fd"), b"vars")
+            .expect("firmware fixture should be written");
+        let mut plan =
+            WinPeDismBackend::plan_vm(capabilities, &manifest, &root, WinPeDismVmPhase::Prepare)
+                .expect("prepare VM should plan");
+        plan.host_preparation.steps.clear();
+        plan.invocation = CommandInvocation {
+            program: "sh".into(),
+            arguments: vec![
+                "-c".into(),
+                format!(
+                    "printf '%s\\n' 'LSW-WINPE-DISM complete' > '{}'",
+                    plan.status_log.display()
+                )
+                .into(),
+            ],
+        };
+        let result = WinPeDismBackend::run_vm(&plan, Duration::from_secs(5))
+            .expect("completion marker should succeed");
+        assert_eq!(result.phase, WinPeDismVmPhase::Prepare);
+        assert_eq!(result.status_events, vec!["LSW-WINPE-DISM complete"]);
+
+        plan.invocation.arguments = vec!["-c".into(), ":".into()];
+        assert!(WinPeDismBackend::run_vm(&plan, Duration::from_secs(5)).is_err());
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+}

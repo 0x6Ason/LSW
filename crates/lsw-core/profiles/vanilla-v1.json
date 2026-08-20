@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "name": "vanilla",
+  "experimental": false,
+  "keeps_servicing": true,
+  "compact_os": false,
+  "remove_provisioned_appx_patterns": [],
+  "preserve_components": [
+    "Windows component store (WinSxS)",
+    "Windows Update and servicing stack",
+    "Windows Installer (MSI) and MSIX/AppX deployment",
+    "PowerShell, Windows Terminal, and ConPTY dependencies",
+    "Microsoft Store, App Installer (winget), and WebView2 runtime",
+    "Windows Management Instrumentation (WMI)",
+    ".NET Framework optional-feature support",
+    "Microsoft Defender",
+    "hibernation support",
+    "Windows Recovery Environment",
+    "Windows SDK and Visual Studio Build Tools prerequisites"
+  ],
+  "warnings": []
+}

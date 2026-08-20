@@ -433,7 +433,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "win-dev".to_owned(),
             source_iso: iso,
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -483,7 +483,7 @@ mod tests {
         let mut manifest = InstanceManifest::new(InstanceSpec {
             name: "removable-instance".to_owned(),
             source_iso: iso,
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -522,7 +522,7 @@ mod tests {
         let second = InstanceManifest::new(InstanceSpec {
             name: "win-second".to_owned(),
             source_iso: iso.clone(),
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -535,7 +535,7 @@ mod tests {
         let first = InstanceManifest::new(InstanceSpec {
             name: "win-first".to_owned(),
             source_iso: iso,
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -570,7 +570,7 @@ mod tests {
             InstanceManifest::new(InstanceSpec {
                 name: name.to_owned(),
                 source_iso: iso.clone(),
-                profile: WindowsProfile::Standard,
+                profile: WindowsProfile::Vanilla,
                 cpus: 2,
                 memory_mib: 4096,
                 disk_gib: 64,
@@ -620,7 +620,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "external-port-owner".to_owned(),
             source_iso: iso,
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,

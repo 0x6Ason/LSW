@@ -7,13 +7,26 @@ use crate::{LswError, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowsProfile {
-    Standard,
+    Vanilla,
     Slim,
+    // Retained so existing beta manifests keep their runtime semantics. New
+    // beta.5 instances expose only vanilla and slim.
+    #[doc(hidden)]
     Ephemeral,
+    #[doc(hidden)]
     Secure,
 }
 
 impl WindowsProfile {
+    pub(crate) fn parse_manifest(value: &str) -> Result<Self> {
+        match value {
+            "standard" => Ok(Self::Vanilla),
+            "ephemeral" => Ok(Self::Ephemeral),
+            "secure" => Ok(Self::Secure),
+            _ => value.parse(),
+        }
+    }
+
     pub fn security(self) -> SecuritySettings {
         match self {
             Self::Secure => SecuritySettings {
@@ -23,7 +36,7 @@ impl WindowsProfile {
                 test_signing_allowed: false,
                 custom_driver_allowed: false,
             },
-            Self::Standard | Self::Slim | Self::Ephemeral => SecuritySettings {
+            Self::Vanilla | Self::Slim | Self::Ephemeral => SecuritySettings {
                 uefi: true,
                 secure_boot: false,
                 vtpm: true,
@@ -45,7 +58,7 @@ impl WindowsProfile {
 impl fmt::Display for WindowsProfile {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
-            Self::Standard => "standard",
+            Self::Vanilla => "vanilla",
             Self::Slim => "slim",
             Self::Ephemeral => "ephemeral",
             Self::Secure => "secure",
@@ -59,15 +72,11 @@ impl FromStr for WindowsProfile {
 
     fn from_str(value: &str) -> Result<Self> {
         match value {
-            "standard" => Ok(Self::Standard),
+            "vanilla" => Ok(Self::Vanilla),
             "slim" => Ok(Self::Slim),
-            "ephemeral" => Ok(Self::Ephemeral),
-            "secure" => Ok(Self::Secure),
             _ => Err(LswError::InvalidValue {
                 field: "profile",
-                reason: format!(
-                    "unknown profile {value:?}; expected standard, slim, ephemeral, or secure"
-                ),
+                reason: format!("unknown profile {value:?}; beta.5 supports vanilla or slim"),
             }),
         }
     }
@@ -87,7 +96,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secure_profile_never_enables_test_signing() {
+    fn legacy_secure_profile_never_enables_test_signing() {
         let security = WindowsProfile::Secure.security();
         assert!(security.secure_boot);
         assert!(!security.test_signing_allowed);
@@ -96,7 +105,18 @@ mod tests {
 
     #[test]
     fn every_beta_profile_preserves_servicing() {
-        assert!(WindowsProfile::Ephemeral.keeps_servicing());
+        assert!(WindowsProfile::Vanilla.keeps_servicing());
         assert!(WindowsProfile::Slim.keeps_servicing());
+    }
+
+    #[test]
+    fn standard_manifest_alias_migrates_to_vanilla() {
+        assert_eq!(
+            WindowsProfile::parse_manifest("standard").expect("alias should parse"),
+            WindowsProfile::Vanilla
+        );
+        assert!("standard".parse::<WindowsProfile>().is_err());
+        assert!("ephemeral".parse::<WindowsProfile>().is_err());
+        assert_eq!(WindowsProfile::Vanilla.to_string(), "vanilla");
     }
 }

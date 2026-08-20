@@ -17,10 +17,11 @@ mod profile;
 mod qemu;
 mod store;
 mod windows_media;
+mod winpe_dism;
 
 pub use backend::{AcceleratorCapabilities, HostPlatform, QemuBackend, VmAccelerator};
 pub use capabilities::HostCapabilities;
-pub use customization::CustomizationPlan;
+pub use customization::{CustomizationPlan, PROFILE_MANIFEST_VERSION};
 pub use error::{LswError, Result};
 pub use install_seed::{InstallSeedBuilder, InstallSeedOptions, InstallSeedPlan};
 #[cfg(not(windows))]
@@ -38,6 +39,11 @@ pub use profile::{SecuritySettings, WindowsProfile};
 pub use qemu::{CommandInvocation, CommandPlan, LaunchPhase, QemuPlanner};
 pub use store::StateStore;
 pub use windows_media::{WindowsEdition, WindowsMediaInspector};
+pub use winpe_dism::{
+    WinPeDismApplyPlan, WinPeDismApplyStage, WinPeDismBackend, WinPeDismPlan, WinPeDismRunResult,
+    WinPeDismStage, WinPeDismVmPhase, WinPeDismVmPlan, WINPE_PREPARED_IMAGE_NAME,
+    WINPE_TARGET_DISK_ID, WINPE_VM_TIMEOUT, WINPE_WORKSPACE_DISK_ID, WINPE_WORKSPACE_SIZE_GIB,
+};
 
 pub const AGENT_GUEST_PORT: u16 = 5040;
 pub const AGENT_TOKEN_FILE: &str = "agent.token";

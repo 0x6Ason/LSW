@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn planner_uses_windows_inbox_install_devices() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Standard);
+        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
         let planner = QemuPlanner::new(headless_capabilities());
         let plan = planner
             .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Install)
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn planner_uses_an_explicit_validated_accelerator_selection() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Standard);
+        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
         let mut capabilities = headless_capabilities();
         capabilities.accelerators =
             crate::AcceleratorCapabilities::none().with_available(crate::VmAccelerator::Kvm);
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn nat_network_publishes_requested_tcp_ports_on_loopback() {
-        let (mut manifest, iso) = test_manifest(WindowsProfile::Standard);
+        let (mut manifest, iso) = test_manifest(WindowsProfile::Vanilla);
         manifest.spec.network = NetworkMode::Nat;
         manifest.spec.port_forwards = vec![
             crate::PortForward::new(8080, 80).expect("ports should be valid"),

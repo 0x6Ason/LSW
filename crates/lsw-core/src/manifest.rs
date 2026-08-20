@@ -361,7 +361,7 @@ impl InstanceManifest {
         let spec = InstanceSpec {
             name: required_field(&fields, "name")?.to_owned(),
             source_iso: PathBuf::from(required_field(&fields, "source_iso")?),
-            profile: required_field(&fields, "profile")?.parse()?,
+            profile: WindowsProfile::parse_manifest(required_field(&fields, "profile")?)?,
             cpus: parse_field(&fields, "cpus")?,
             memory_mib: parse_field(&fields, "memory_mib")?,
             disk_gib: parse_field(&fields, "disk_gib")?,
@@ -493,12 +493,18 @@ fn stable_control_port(name: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
+    static ISO_FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
     fn temporary_iso() -> PathBuf {
+        // Wall-clock resolution can be coarse under emulation, while the test
+        // harness may create several ISO fixtures concurrently.
+        let fixture_id = ISO_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "lsw-manifest-test-{}-{}.iso",
+            "lsw-manifest-test-{}-{}-{fixture_id}.iso",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -571,7 +577,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "old-instance".to_owned(),
             source_iso: iso.clone(),
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -585,11 +591,13 @@ mod tests {
             .encode()
             .expect("manifest should encode")
             .replace("version=4\n", "version=1\n")
+            .replace("profile=vanilla\n", "profile=standard\n")
             .replace("network=nat\n", "")
             .replace("port_forwards=\n", "")
             .replace("idle_timeout_seconds=600\n", "");
         let migrated = InstanceManifest::decode(&legacy).expect("v1 manifest should migrate");
         assert_eq!(migrated.version, MANIFEST_VERSION);
+        assert_eq!(migrated.spec.profile, WindowsProfile::Vanilla);
         assert_eq!(migrated.spec.network, NetworkMode::Offline);
         assert!(migrated.spec.port_forwards.is_empty());
         fs::remove_file(iso).expect("temporary ISO should be removable");
@@ -601,7 +609,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "version-two".to_owned(),
             source_iso: iso.clone(),
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -629,7 +637,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "version-three".to_owned(),
             source_iso: iso.clone(),
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -655,7 +663,7 @@ mod tests {
         let base = InstanceSpec {
             name: "port-validation".to_owned(),
             source_iso: iso.clone(),
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,
@@ -699,7 +707,7 @@ mod tests {
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "port-guard".to_owned(),
             source_iso: iso.clone(),
-            profile: WindowsProfile::Standard,
+            profile: WindowsProfile::Vanilla,
             cpus: 2,
             memory_mib: 4096,
             disk_gib: 64,

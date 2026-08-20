@@ -29,6 +29,12 @@ pub struct AgentClient {
     capabilities: Vec<String>,
 }
 
+pub struct CapturedProcess {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
 impl AgentClient {
     pub fn connect(
         manifest: &InstanceManifest,
@@ -213,6 +219,67 @@ impl AgentClient {
         result
     }
 
+    pub fn run_capture(
+        mut self,
+        request: &StartRequest,
+        input: &[u8],
+        output_limit: usize,
+    ) -> Result<CapturedProcess, Box<dyn std::error::Error>> {
+        if matches!(request.kind, lsw_core::SessionKind::Shell) {
+            return Err("captured sessions cannot be interactive shells".into());
+        }
+        let controlled_session = self.has_capability(CAPABILITY_SESSION_CONTROL_V1);
+        if controlled_session {
+            write_frame(
+                &mut self.stream,
+                &Frame::new(
+                    FrameKind::SessionOptions,
+                    SessionOptions {
+                        cancel_on_disconnect: true,
+                    }
+                    .encode(),
+                ),
+            )?;
+        }
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::Start, request.encode()?),
+        )?;
+        if !input.is_empty() {
+            write_frame(
+                &mut self.stream,
+                &Frame::new(FrameKind::Stdin, input.to_vec()),
+            )?;
+        }
+        if controlled_session {
+            write_frame(
+                &mut self.stream,
+                &Frame::new(FrameKind::StdinClose, Vec::new()),
+            )?;
+        } else {
+            self.stream.shutdown(Shutdown::Write)?;
+        }
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        loop {
+            let frame = read_frame(&mut self.stream)?;
+            match frame.kind {
+                FrameKind::Stdout => append_bounded(&mut stdout, &frame.payload, output_limit)?,
+                FrameKind::Stderr => append_bounded(&mut stderr, &frame.payload, output_limit)?,
+                FrameKind::Exit => {
+                    return Ok(CapturedProcess {
+                        exit_code: decode_exit(&frame.payload)?,
+                        stdout,
+                        stderr,
+                    })
+                }
+                FrameKind::Error => return Err(agent_error(&frame.payload).into()),
+                other => return Err(format!("unexpected agent frame {other:?}").into()),
+            }
+        }
+    }
+
     pub fn put_file(
         mut self,
         source: &Path,
@@ -343,6 +410,22 @@ impl AgentClient {
     }
 }
 
+fn append_bounded(
+    destination: &mut Vec<u8>,
+    payload: &[u8],
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let new_length = destination
+        .len()
+        .checked_add(payload.len())
+        .ok_or("captured output length overflowed")?;
+    if new_length > limit {
+        return Err(format!("guest command output exceeded {limit} bytes").into());
+    }
+    destination.extend_from_slice(payload);
+    Ok(())
+}
+
 fn forward_stdin(
     stream: Arc<Mutex<TcpStream>>,
     stop: Arc<AtomicBool>,
@@ -396,15 +479,12 @@ fn forward_stdin(
 }
 
 fn send_outbound(writer: &Arc<Mutex<TcpStream>>, frame: &Frame) -> io::Result<()> {
-    let mut stream = writer.lock().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "agent stream writer lock was poisoned",
-        )
-    })?;
+    let mut stream = writer
+        .lock()
+        .map_err(|_| io::Error::other("agent stream writer lock was poisoned"))?;
     write_frame(&mut *stream, frame).map_err(|error| match error {
         lsw_core::LswError::Io(error) => error,
-        other => io::Error::new(io::ErrorKind::Other, other.to_string()),
+        other => io::Error::other(other.to_string()),
     })
 }
 
@@ -535,14 +615,15 @@ fn run_stty(arguments: &[&str]) -> io::Result<String> {
         .stdin(Stdio::inherit())
         .output()?;
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("stty {} failed with {}", arguments.join(" "), output.status),
-        ));
+        return Err(io::Error::other(format!(
+            "stty {} failed with {}",
+            arguments.join(" "),
+            output.status
+        )));
     }
     String::from_utf8(output.stdout)
         .map(|value| value.trim().to_owned())
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "stty returned non-UTF-8 output"))
+        .map_err(|_| io::Error::other("stty returned non-UTF-8 output"))
 }
 
 #[cfg(unix)]
@@ -646,6 +727,64 @@ mod tests {
             working_directory: None,
         };
         assert_eq!(client.run(&request, false).expect("run should succeed"), 0);
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn captured_run_sends_private_input_and_bounds_separate_output_streams() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            assert_eq!(
+                read_frame(&mut stream).expect("options should arrive").kind,
+                FrameKind::SessionOptions
+            );
+            assert_eq!(
+                read_frame(&mut stream).expect("start should arrive").kind,
+                FrameKind::Start
+            );
+            let input = read_frame(&mut stream).expect("private input should arrive");
+            assert_eq!(input.kind, FrameKind::Stdin);
+            assert_eq!(input.payload, b"fixture-secret\n");
+            assert_eq!(
+                read_frame(&mut stream)
+                    .expect("stdin close should arrive")
+                    .kind,
+                FrameKind::StdinClose
+            );
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Stdout, b"STATUS=licensed\n".to_vec()),
+            )
+            .expect("stdout should be sent");
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Stderr, b"diagnostic\n".to_vec()),
+            )
+            .expect("stderr should be sent");
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            )
+            .expect("exit should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let client = AgentClient {
+            stream,
+            capabilities: vec![CAPABILITY_SESSION_CONTROL_V1.to_owned()],
+        };
+        let request = StartRequest {
+            kind: lsw_core::SessionKind::Exec,
+            argv: vec!["license-client".to_owned()],
+            working_directory: None,
+        };
+        let captured = client
+            .run_capture(&request, b"fixture-secret\n", 1024)
+            .expect("capture should succeed");
+        assert_eq!(captured.exit_code, 0);
+        assert_eq!(captured.stdout, b"STATUS=licensed\n");
+        assert_eq!(captured.stderr, b"diagnostic\n");
         server.join().expect("fixture should not panic");
     }
 

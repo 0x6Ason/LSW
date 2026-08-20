@@ -142,7 +142,7 @@ impl InstallSeedBuilder {
         );
         generated.insert(
             PathBuf::from("lsw/apply-profile.ps1"),
-            profile_script(manifest).into_bytes(),
+            profile_script(manifest)?.into_bytes(),
         );
         generated.insert(
             PathBuf::from("README.txt"),
@@ -312,6 +312,7 @@ fn autounattend(manifest: &InstanceManifest, options: &InstallSeedOptions) -> St
 fn install_agent_script() -> &'static str {
     r#"$ErrorActionPreference = 'Stop'
 $AgentSource = Join-Path $PSScriptRoot 'lsw-agent.exe'
+$TokenSource = Join-Path $PSScriptRoot 'agent.token'
 if (-not (Test-Path -LiteralPath $AgentSource -PathType Leaf)) {
     Write-Warning 'lsw-agent.exe is not present on the LSW seed. Install it manually and rerun this script.'
     exit 0
@@ -322,6 +323,8 @@ $DataRoot = Join-Path $env:ProgramData 'LSW'
 $ServiceName = 'LSWAgent'
 $ServiceDisplayName = 'LSW Guest Agent'
 $ServiceAccount = 'NT SERVICE\LSWAgent'
+$LicenseServiceName = 'LSWLicenseHelper'
+$LicenseServiceDisplayName = 'LSW Windows Activation Helper'
 $ScExe = Join-Path $env:SystemRoot 'System32\sc.exe'
 
 function ConvertTo-ScBinaryPathArgument {
@@ -352,17 +355,20 @@ New-Item -ItemType Directory -Force -Path $InstallRoot, $DataRoot | Out-Null
 $AgentTarget = Join-Path $InstallRoot 'lsw-agent.exe'
 $TokenTarget = Join-Path $DataRoot 'agent.token'
 $ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($null -ne $ExistingService -and $ExistingService.Status -ne 'Stopped') {
-    if ($ExistingService.Status -ne 'StopPending') {
-        Invoke-Sc @('stop', $ServiceName)
-    }
-    $ExistingService.WaitForStatus(
-        [System.ServiceProcess.ServiceControllerStatus]::Stopped,
-        [TimeSpan]::FromSeconds(30)
-    )
-    $ExistingService.Refresh()
-    if ($ExistingService.Status -ne 'Stopped') {
-        throw 'The existing LSWAgent service did not stop before the agent was replaced.'
+foreach ($ServiceToStop in @($ServiceName, $LicenseServiceName)) {
+    $ExistingServiceToStop = Get-Service -Name $ServiceToStop -ErrorAction SilentlyContinue
+    if ($null -ne $ExistingServiceToStop -and $ExistingServiceToStop.Status -ne 'Stopped') {
+        if ($ExistingServiceToStop.Status -ne 'StopPending') {
+            Invoke-Sc @('stop', $ServiceToStop)
+        }
+        $ExistingServiceToStop.WaitForStatus(
+            [System.ServiceProcess.ServiceControllerStatus]::Stopped,
+            [TimeSpan]::FromSeconds(30)
+        )
+        $ExistingServiceToStop.Refresh()
+        if ($ExistingServiceToStop.Status -ne 'Stopped') {
+            throw ('Service {0} did not stop before the agent was replaced.' -f $ServiceToStop)
+        }
     }
 }
 
@@ -451,6 +457,30 @@ $ServiceIdentity = (New-Object System.Security.Principal.NTAccount($ServiceAccou
 )
 $Allow = [System.Security.AccessControl.AccessControlType]::Allow
 
+$LicenseCommand = ('"{0}" --license-helper --token-file "{1}" --listen 127.0.0.1:5041' -f $AgentTarget, $TokenTarget)
+$ScLicenseCommand = ConvertTo-ScBinaryPathArgument -Command $LicenseCommand
+$ExistingLicenseService = Get-Service -Name $LicenseServiceName -ErrorAction SilentlyContinue
+if ($null -eq $ExistingLicenseService) {
+    Invoke-Sc @(
+        'create', $LicenseServiceName,
+        'binPath=', $ScLicenseCommand,
+        'DisplayName=', $LicenseServiceDisplayName,
+        'start=', 'demand',
+        'obj=', 'LocalSystem'
+    )
+}
+Invoke-Sc @(
+    'config', $LicenseServiceName,
+    'binPath=', $ScLicenseCommand,
+    'DisplayName=', $LicenseServiceDisplayName,
+    'start=', 'demand',
+    'obj=', 'LocalSystem'
+)
+Invoke-Sc @('sidtype', $LicenseServiceName, 'unrestricted')
+Invoke-Sc @('description', $LicenseServiceName, 'Performs authenticated, on-demand Windows WMI activation operations for LSW.')
+$LicenseServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;{0})' -f $ServiceIdentity.Value
+Invoke-Sc @('sdset', $LicenseServiceName, $LicenseServiceSddl)
+
 $DirectoryAcl = New-Object System.Security.AccessControl.DirectorySecurity
 $DirectoryAcl.SetAccessRuleProtection($true, $false)
 $DirectoryAcl.SetOwner($Administrators)
@@ -468,7 +498,7 @@ $DirectoryAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystem
 )))
 Set-Acl -LiteralPath $DataRoot -AclObject $DirectoryAcl
 
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'agent.token') -Destination $TokenTarget -Force
+Copy-Item -LiteralPath $TokenSource -Destination $TokenTarget -Force
 
 $Acl = New-Object System.Security.AccessControl.FileSecurity
 $Acl.SetAccessRuleProtection($true, $false)
@@ -483,6 +513,18 @@ $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRul
 )))
 Set-Acl -LiteralPath $TokenTarget -AclObject $Acl
 
+# A pre-applied image stages this script below ProgramData. Remove the staged
+# token after the protected service copy exists. Read-only removable install
+# media remains untouched.
+$SetupRootFullPath = [System.IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\') + '\'
+$DataRootFullPath = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\') + '\'
+$TokenSourceFullPath = [System.IO.Path]::GetFullPath($TokenSource)
+$TokenTargetFullPath = [System.IO.Path]::GetFullPath($TokenTarget)
+if ($SetupRootFullPath.StartsWith($DataRootFullPath, [System.StringComparison]::OrdinalIgnoreCase) -and
+    -not [string]::Equals($TokenSourceFullPath, $TokenTargetFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    Remove-Item -LiteralPath $TokenSource -Force
+}
+
 if (-not (Get-NetFirewallRule -DisplayName 'LSW Guest Agent' -ErrorAction SilentlyContinue)) {
     New-NetFirewallRule -DisplayName 'LSW Guest Agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5040 -RemoteAddress 10.0.2.2 | Out-Null
 }
@@ -494,7 +536,7 @@ $StartedService.WaitForStatus(
     [System.ServiceProcess.ServiceControllerStatus]::Running,
     [TimeSpan]::FromSeconds(30)
 )
-# Catch an immediate post-start failure before FirstLogonCommands reports
+# Catch an immediate post-start failure before Windows Setup reports
 # success. Configured recovery does not begin until five seconds later.
 Start-Sleep -Milliseconds 500
 $StartedService.Refresh()
@@ -504,8 +546,8 @@ if ($StartedService.Status -ne 'Running') {
 "#
 }
 
-fn profile_script(manifest: &InstanceManifest) -> String {
-    let plan = CustomizationPlan::for_profile(manifest.spec.profile);
+fn profile_script(manifest: &InstanceManifest) -> Result<String> {
+    let plan = CustomizationPlan::for_profile(manifest.spec.profile)?;
     let patterns = plan
         .remove_provisioned_appx_patterns
         .iter()
@@ -530,10 +572,10 @@ Get-AppxProvisionedPackage -Online | Where-Object {{ $RemoveNames -contains $_.D
     } else {
         "Write-Host 'CompactOS not requested for this profile.'"
     };
-    format!(
+    Ok(format!(
         "$ErrorActionPreference = 'Stop'\r\nWrite-Host 'Applying LSW {} profile.'\r\n{}\r\n{}\r\n",
         manifest.spec.profile, removal, compact
-    )
+    ))
 }
 
 fn seed_readme(manifest: &InstanceManifest, options: &InstallSeedOptions) -> String {
@@ -611,18 +653,27 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::{InstanceSpec, NetworkMode, WindowsProfile};
 
     use super::*;
 
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
     fn fixture() -> (PathBuf, InstanceManifest) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be valid")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("lsw-seed-test-{nonce}"));
+        // Emulated guests may expose a coarse wall clock, so time alone cannot
+        // distinguish tests that the harness starts concurrently.
+        let fixture_id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "lsw-seed-test-{}-{nonce}-{fixture_id}",
+            std::process::id()
+        ));
         fs::create_dir_all(&root).expect("fixture should be created");
         let iso = root.join("windows.iso");
         fs::write(&iso, b"media").expect("ISO fixture should be written");
@@ -691,6 +742,14 @@ mod tests {
         assert!(installer.contains("'failure', $ServiceName"));
         assert!(installer.contains("$ExitCode = $LASTEXITCODE"));
         assert!(installer.contains("$ServiceIdentity"));
+        assert!(installer.contains("$LicenseServiceName = 'LSWLicenseHelper'"));
+        assert!(installer.contains("--license-helper --token-file"));
+        assert!(installer.contains("--listen 127.0.0.1:5041"));
+        assert!(installer.contains("'start=', 'demand'"));
+        assert!(installer.contains("'obj=', 'LocalSystem'"));
+        assert!(installer.contains("$LicenseServiceSddl"));
+        assert!(installer.contains("$ServiceIdentity.Value"));
+        assert!(!installer.contains("ProductKey"));
         assert!(installer.contains("$StartedService.WaitForStatus"));
         assert!(installer.contains("$StartedService.Status -ne 'Running'"));
         assert!(installer.contains("$AgentTargetFullPath"));
@@ -699,11 +758,13 @@ mod tests {
         );
         assert!(installer.contains("$TerminationDeadline"));
         assert!(installer.contains("Remove-ItemProperty -Path $RunKey -Name 'LSWAgent'"));
+        assert!(installer.contains("Remove-Item -LiteralPath $TokenSource -Force"));
+        assert!(installer.contains("$SetupRootFullPath.StartsWith($DataRootFullPath"));
         assert!(!installer.contains("New-ItemProperty"));
         assert!(!installer.contains("Start-Process"));
 
         let wait_for_stop = installer
-            .find("$ExistingService.WaitForStatus")
+            .find("$ExistingServiceToStop.WaitForStatus")
             .expect("installer should wait for the old service to stop");
         let terminate_stale_agent = installer
             .find("Invoke-CimMethod -InputObject $StaleAgent -MethodName Terminate")
