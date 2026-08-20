@@ -59,7 +59,7 @@ jobs:
           fi
 
   windows-kvm-e2e:
-    name: Windows 11 Setup, agent, ConPTY, and cold restart
+    name: Windows 11 WinPE, agent, ConPTY, and cold restart
     needs: authorize
     environment: windows-kvm-e2e
     runs-on:

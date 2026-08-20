@@ -129,17 +129,25 @@ if [ -n "$unexpected_node" ]; then
 fi
 
 for required_file in \
-    BUILDINFO.txt CHANGELOG.md LICENSE README.md SOURCE-MANIFEST.sha256 \
+    BUILDINFO.txt CHANGELOG.md LICENSE README.md THIRD_PARTY_NOTICES.md \
+    SOURCE-MANIFEST.sha256 \
     install.sh lsw lsw-agent.exe lswd \
     docs/DEVELOPMENT.md docs/WINDOWS_KVM_E2E.md \
     source/Cargo.lock source/Cargo.toml source/LICENSE source/README.md \
+    source/THIRD_PARTY_NOTICES.md \
+    source/.cargo/config.toml \
     source/crates/lsw-agent/Cargo.toml source/crates/lsw-agent/src/main.rs \
     source/crates/lsw-cli/Cargo.toml source/crates/lsw-cli/src/main.rs \
     source/crates/lsw-core/Cargo.toml source/crates/lsw-core/src/lib.rs \
     source/crates/lsw-daemon/Cargo.toml source/crates/lsw-daemon/src/main.rs \
     source/scripts/build-release.sh source/scripts/build-windows-agent.sh \
     source/scripts/normalize-pe-timestamp.py \
-    source/scripts/zig-windows-linker.sh; do
+    source/scripts/zig-windows-linker.sh \
+    source/vendor/serde-1.0.203/Cargo.toml \
+    source/vendor/serde_json-1.0.117/Cargo.toml \
+    source/vendor/ureq-2.10.1/Cargo.toml \
+    source/vendor/rustls-0.23.5/Cargo.toml \
+    source/vendor/webpki-roots-0.26.1/Cargo.toml; do
     if [ ! -f "$bundle/$required_file" ]; then
         echo "error: archive is missing $required_file" >&2
         exit 1
@@ -172,6 +180,22 @@ if ! grep -Fx 'LICENSE=GPL-3.0-or-later' "$bundle/BUILDINFO.txt" >/dev/null \
 fi
 if ! cmp -s "$bundle/LICENSE" "$bundle/source/LICENSE"; then
     echo "error: binary bundle and corresponding source contain different license texts" >&2
+    exit 1
+fi
+if ! cmp -s "$bundle/THIRD_PARTY_NOTICES.md" \
+    "$bundle/source/THIRD_PARTY_NOTICES.md"; then
+    echo "error: binary bundle and corresponding source contain different third-party notices" >&2
+    exit 1
+fi
+if ! grep -Fx 'directory = "vendor"' "$bundle/source/.cargo/config.toml" >/dev/null; then
+    echo "error: corresponding source does not use its relative vendored dependency tree" >&2
+    exit 1
+fi
+vendor_license=$(find "$bundle/source/vendor" -type f \
+    \( -iname 'license' -o -iname 'license-*' -o -iname 'copying' \) \
+    -print -quit)
+if [ -z "$vendor_license" ]; then
+    echo "error: corresponding source contains no vendored dependency license files" >&2
     exit 1
 fi
 if ! (cd "$bundle/source" && sha256sum --check ../SOURCE-MANIFEST.sha256 >/dev/null); then

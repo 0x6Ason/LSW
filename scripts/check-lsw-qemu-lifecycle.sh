@@ -132,7 +132,7 @@ PY
 export LSW_STATE_DIR="$state_root"
 "$lsw" create "$instance_name" \
     --iso "$lifecycle_root/windows-placeholder.iso" \
-    --profile standard \
+    --profile vanilla \
     --cpus 1 \
     --memory 512 \
     --disk 8 \

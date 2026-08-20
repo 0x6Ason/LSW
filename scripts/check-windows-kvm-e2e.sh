@@ -140,6 +140,10 @@ blank_password_rejected=unknown
 automatic_logon=unknown
 ovmf_code_sha256=unknown
 ovmf_vars_sha256=unknown
+official_iso_sha256=unknown
+license_status=unknown
+license_helper_start_mode=unknown
+license_helper_start_name=unknown
 
 python3 - "$LSW_STATE_DIR/instances/$instance/run/recovery-vnc.sock" <<'PY'
 import os
@@ -182,6 +186,10 @@ collect_e2e_artifacts() {
         printf 'blank_password_rejected=%s\n' "$blank_password_rejected"
         printf 'automatic_logon=%s\n' "$automatic_logon"
         printf 'iso_sha256=%s\n' "$iso_sha256"
+        printf 'official_iso_sha256=%s\n' "$official_iso_sha256"
+        printf 'license_status=%s\n' "$license_status"
+        printf 'license_helper_start_mode=%s\n' "$license_helper_start_mode"
+        printf 'license_helper_start_name=%s\n' "$license_helper_start_name"
         printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
         printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
         printf 'agent_sha256=%s\n' "$(sha256sum "$agent" | awk '{ print $1 }')"
@@ -463,6 +471,14 @@ ovmf_vars_path=$(printf '%s\n' "$doctor_output" |
     awk -v prefix='  OVMF vars:   ' 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }')
 ovmf_code_sha256=$(sha256sum -- "$ovmf_code_path" | awk '{ print $1 }')
 ovmf_vars_sha256=$(sha256sum -- "$ovmf_vars_path" | awk '{ print $1 }')
+
+media_output=$(timeout 60s "$lsw" media resolve --language English)
+official_iso_sha256=$(printf '%s\n' "$media_output" |
+    awk -F= '$1 == "SHA256" { print tolower($2); exit }')
+if [ "$official_iso_sha256" != "$iso_sha256" ]; then
+    echo "error: provisioned ISO does not match Microsoft's current published SHA-256" >&2
+    exit 1
+fi
 if [ "${LSW_E2E_NO_VIEWER:-0}" != 1 ]; then
     viewer_value=$(printf '%s\n' "$doctor_output" |
         awk -v prefix='  viewer:      ' 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }')
@@ -567,8 +583,64 @@ else
     fi
 fi
 
+for removed_transient in seed winpe-seed winpe-apply-seed run/winpe-workspace.qcow2; do
+    if [ -e "$LSW_STATE_DIR/instances/$instance/$removed_transient" ]; then
+        echo "error: WinPE transient remained after successful install: $removed_transient" >&2
+        exit 1
+    fi
+done
+if ! grep -F 'LSW-WINPE-DISM complete' \
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-prepare-serial.log" >/dev/null
+then
+    echo "error: WinPE prepare completion marker was not retained" >&2
+    exit 1
+fi
+if ! grep -F 'LSW-WINPE-DISM apply-complete' \
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-apply-serial.log" >/dev/null
+then
+    echo "error: WinPE apply completion marker was not retained" >&2
+    exit 1
+fi
+if grep -F 'LSW-WINPE-DISM failed' \
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-prepare-serial.log" \
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-apply-serial.log" >/dev/null
+then
+    echo "error: WinPE failure marker appeared in a successful install" >&2
+    exit 1
+fi
+
+license_output=$(timeout 120s "$lsw" license status "$instance")
+license_status=$(printf '%s\n' "$license_output" |
+    awk -F= '$1 == "STATUS" { print $2; exit }')
+case "$license_status" in
+    licensed|unlicensed) ;;
+    *)
+        echo "error: Windows WMI license status did not return a stable state" >&2
+        exit 1
+        ;;
+esac
+if [ "$license_status" = unlicensed ] \
+    && [ ! -f "$LSW_STATE_DIR/instances/$instance/activation-notice-shown" ]
+then
+    echo "error: unactivated install did not record its one-time notice" >&2
+    exit 1
+fi
+
+license_helper_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$Deadline=[DateTime]::UtcNow.AddSeconds(30); do { $Service=Get-CimInstance -ClassName Win32_Service -Filter "Name = '\''LSWLicenseHelper'\''"; if ($null -ne $Service -and $Service.State -eq "Stopped") { break }; Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $Deadline); if ($null -eq $Service) { exit 61 }; if ($Service.StartMode -ne "Manual") { exit 62 }; if ($Service.StartName -ine "LocalSystem") { exit 63 }; if ($Service.PathName -notlike "*--license-helper*" -or $Service.PathName -like "*ProductKey*") { exit 64 }; [Console]::Out.Write("$($Service.StartMode)|$($Service.StartName)")'
+)
+license_helper_start_mode=$(printf '%s\n' "$license_helper_output" | awk -F'|' '{ print $1 }')
+license_helper_start_name=$(printf '%s\n' "$license_helper_output" | awk -F'|' '{ print $2 }')
+if [ "$license_helper_start_mode" != Manual ] || [ "$license_helper_start_name" != LocalSystem ]; then
+    echo "error: activation helper is not a stopped demand-start LocalSystem service" >&2
+    exit 1
+fi
+
 echo "Complete normal Windows OOBE and the first administrative login in the LSW viewer."
-echo "The gate will continue automatically when the guest agent becomes ready."
+echo "The gate will continue automatically when an eligible local console user appears."
 
 deadline=$(( $(date +%s) + timeout_seconds ))
 agent_ready=0

@@ -82,7 +82,7 @@ jobs:
               gh api --paginate \
                 "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
                 --jq '.jobs[] |
-                  select(.name == "Windows 11 Setup, agent, ConPTY, and cold restart") |
+                  select(.name == "Windows 11 WinPE, agent, ConPTY, and cold restart") |
                   select(.status == "completed" and .conclusion == "success") |
                   select((.labels // []) | index("self-hosted")) |
                   select((.labels // []) | index("Linux")) |
