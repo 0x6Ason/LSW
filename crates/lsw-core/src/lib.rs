@@ -8,6 +8,8 @@ mod capabilities;
 mod customization;
 mod error;
 mod install_seed;
+#[cfg(not(windows))]
+mod iso_download;
 mod manifest;
 mod pe;
 mod preparation;
@@ -21,6 +23,11 @@ pub use capabilities::HostCapabilities;
 pub use customization::CustomizationPlan;
 pub use error::{LswError, Result};
 pub use install_seed::{InstallSeedBuilder, InstallSeedOptions, InstallSeedPlan};
+#[cfg(not(windows))]
+pub use iso_download::{
+    sha256_file, IsoDownloadEngine, IsoDownloadReport, IsoDownloader, MicrosoftIsoRequest,
+    MicrosoftIsoResolver, ResolvedWindowsIso, SecretDownloadUrl,
+};
 pub use manifest::{InstanceManifest, InstanceSpec, InstanceState, NetworkMode, PortForward};
 pub use pe::{
     PeAssessment, PeImage, PeImport, PeImportSymbol, PeKind, PeMachine, PeSection, PeSubsystem,
