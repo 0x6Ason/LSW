@@ -18,39 +18,49 @@ validation claims in the beta.5 candidate.
 
 | Component | Beta state | Responsibility |
 | --- | --- | --- |
-| `lsw` | Implemented | Instance management, installer seed, default shell, process and file commands |
+| `lsw` | Implemented | One-shot media resolution/download, instance installation, default shell, process/file and activation commands |
 | `lswd` | Implemented | User-private Unix API, QEMU/swtpm supervision, QMP reconciliation and shutdown |
 | QEMU backend | Linux runtime implemented; firmware smoke passed | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
 | Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
 | `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY sessions, capability-gated control/leases, process ownership and file transfer |
 | ConPTY transport | Implemented; E2E gated | Capability negotiation, console I/O and terminal resize; real installed-Windows validation remains |
 | PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
+| WinPE DISM backend | Integrated; E2E gated | Runs two network-disabled WinPE microVM phases using the official media's `dism.exe`: prepare a profile WIM, then partition/apply it to the private target qcow2 |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
 | Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
 ## Lifecycle
 
-1. `lsw install --iso --edition` provides the beta.5 beginner path; `lsw create`
-   remains an advanced primitive. Both validate the requested shape and store
-   manifest v4 plus a random 256-bit per-instance agent token. It does not copy
-   the ISO. Version 1 and 2 manifests migrate with no published ports; version
-   3 manifests receive the default idle-timeout setting.
-2. `lsw install` creates a read-only Setup seed if one does not exist, prepares
-   qcow2 storage and a private OVMF variable store, starts swtpm, then starts
-   QEMU in install mode. Guided installation is the default.
+1. `lsw install NAME` provides the beta.5 beginner path; `lsw create` remains an
+   advanced primitive. The installer validates the requested shape and stores
+   manifest v4 plus a random 256-bit per-instance agent token. Without `--iso`,
+   it resolves the current official Windows 11 x64 media from Microsoft,
+   downloads from an allowlisted HTTPS CDN with at most four connections, and
+   verifies Microsoft's published SHA-256. `--iso` retains a local offline
+   path. Version 1 and 2 manifests migrate with no published ports; version 3
+   manifests receive the default idle-timeout setting.
+2. The installer selects Windows 11 Pro by WIM metadata unless the user chooses
+   another edition. A network-disabled WinPE microVM uses the official media's
+   DISM to export and service a profile-specific WIM in a private workspace. A
+   second network-disabled WinPE phase partitions only the instance disk,
+   applies that WIM, stages the agent/unattend payload, and creates UEFI boot
+   files. After exact serial completion markers, LSW removes the workspace and
+   every token-bearing seed before starting the installed disk normally.
 3. `lswd` waits for the swtpm and QMP Unix sockets before reporting success. It
    owns child handles while running and reconciles a surviving VM through QMP
    after daemon restart.
-4. A normal guest shutdown leaves the base disk intact. An ephemeral instance
-   uses a fresh qcow2 backing overlay for each run and removes that overlay only
-   after QEMU has stopped.
-5. At first administrative logon, the seed installs the agent as the automatic
-   `LSWAgent` Windows service under the virtual account
+4. A normal guest shutdown leaves the base disk intact. Old preview manifests
+   using the retired `ephemeral` selector retain their disposable-overlay
+   behavior, but new beta.5 installs expose only `vanilla` and `slim`.
+5. During the first boot's `specialize` pass, the pre-applied unattend installs
+   the agent as the automatic `LSWAgent` Windows service under the virtual account
    `NT SERVICE\LSWAgent`. It removes the legacy per-user startup entry and
    restricts the guest token to SYSTEM, Administrators, and that service
    identity. Commands and ConPTY sessions therefore run in Windows Session 0
    without storing the OOBE user's password or requiring automatic logon.
    Visible desktop GUI work requires a future user-session companion.
+   A separate, demand-start LocalSystem helper accepts one authenticated guest-
+   loopback request, performs only bounded WMI licensing operations, and exits.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
    ConPTY and host stdin is a terminal, the host enters raw mode and forwards
@@ -73,7 +83,9 @@ instances/NAME/
   agent.token           private host copy
   disk.qcow2            persistent base disk
   OVMF_VARS.fd          private guest firmware variables
-  seed/                 read-only Setup files attached through QEMU vvfat
+  seed/                 transient install payload; removed before normal boot
+  winpe-seed/           transient prepare control seed
+  winpe-apply-seed/     transient apply control seed
   swtpm-state/          vTPM state
   run/                  QMP, VNC, swtpm sockets and ephemeral overlay
 ```
@@ -116,9 +128,9 @@ inherit output pipes from retaining a session. A process can deliberately use
 security boundary. On Windows, both pipe and ConPTY leaders are created
 suspended, assigned to a kill-on-close Job Object, and resumed only after
 successful assignment. A restrictive nested-job policy therefore fails the
-session closed rather than starting an unowned child. Windows-native CI covers
-Job descendant cleanup and ConPTY setup; this Linux VPS covers only the Windows
-GNU cross-build, not execution of those tests.
+session closed rather than starting an unowned child. The Windows GNU gate
+cross-builds the executable; Windows-native CI separately covers Job descendant
+cleanup and ConPTY setup.
 
 ## Headless runtime smoke boundary
 
@@ -139,8 +151,9 @@ That environment has no `/dev/kvm`, licensed Windows ISO, graphical desktop, or
 pathname Unix sockets (AF_UNIX `bind` returns `EPERM`). The firmware smoke
 therefore validates the QEMU building blocks locally, while the product daemon's
 Unix-socket lifecycle is a CI-only gate in this environment. Neither gate
-validates KVM acceleration, Windows Setup/OOBE, the installed service agent, or
-ConPTY end to end.
+validates KVM acceleration, WinPE DISM execution, Windows OOBE, the installed
+service agent, the licensing helper, or ConPTY end to end. Those are required
+by the dedicated real Windows/KVM release gate.
 
 ## Network publishing
 
@@ -178,7 +191,7 @@ The intended seamless path remains driverless first:
 4. UIPI, UAC and elevated-window boundaries are reported, not weakened.
 
 An optional guest-only accelerator may later reduce copies. It cannot be a
-requirement for the `secure` profile and would need an independently reviewed
+requirement for the driverless path and would need an independently reviewed
 signing/enrollment workflow.
 
 ## Performance priorities

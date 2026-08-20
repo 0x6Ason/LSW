@@ -22,6 +22,24 @@ scripts/check-shell.sh
 `scripts/check-shell.sh` requires Bash, Dash, and ShellCheck. It parses every
 script with the shell named by its shebang before running ShellCheck.
 
+## Apple Silicon x86_64 validation
+
+An Apple Silicon maintainer can exercise the Linux x86_64 release path in a
+full-system Lima guest. Configure the instance with `arch: x86_64` and
+`vmType: qemu`, mount the checkout writable, and install the same build
+dependencies used by CI. Inside that guest, confirm `uname -m` reports
+`x86_64`, install Rust 1.76.0 for `x86_64-unknown-linux-gnu`, and run the local
+checks above. The complete packaging check is:
+
+```sh
+LSW_WINDOWS_LINKER=mingw scripts/check-release-reproducibility.sh
+```
+
+This is full machine emulation rather than a cross-compile: the Linux CLI,
+daemon, tests, Clippy, Windows MinGW agent build, source vendoring, archive
+verification, and deterministic rebuild all execute in an x86_64 Linux guest.
+It does not provide KVM or replace the real Windows/KVM release gate.
+
 ## Headless QEMU smoke
 
 On Debian/Ubuntu, install `qemu-system-x86`, `qemu-utils`, `ovmf`, `swtpm`, and
@@ -82,19 +100,25 @@ executable with `--help`. Linux-side validation cannot execute the Windows
 binary. Neither gate exercises a managed guest session or a service-backed
 Windows ConPTY session.
 
-The beta.5 seed installs the agent as the automatic Windows service `LSWAgent`
-under the virtual account `NT SERVICE\LSWAgent`; it must not restore the old
-per-user `HKCU` startup entry. Cross-build and executable-load checks cannot
-prove that SCM registration, Session 0 ConPTY, or boot-time startup works. The
-real Windows/KVM gate therefore queries `Win32_Service`, verifies the service
-process and command identities resolve to the same `S-1-5-80-...` SID, and
-requires that SID to remain stable across a full shutdown and bare-`lsw` boot.
+The beta.5 pre-applied unattend installs the agent during `specialize` as the
+automatic Windows service `LSWAgent` under the virtual account
+`NT SERVICE\LSWAgent`; it must not restore the old per-user `HKCU` startup
+entry. It also registers the narrow, demand-start `LSWLicenseHelper` as
+LocalSystem. Cross-build and executable-load checks cannot prove SCM
+registration, Session 0 ConPTY, boot-time startup, or that helper's access
+boundary. The real Windows/KVM gate therefore queries both services, proves a
+license-status request returns the helper to `Stopped`, verifies that the agent
+service process and command identities resolve to the same `S-1-5-80-...` SID,
+and requires that SID to remain stable across a full shutdown and bare-`lsw`
+boot.
 
 ## Release bundle
 
 The release builder supports Linux x86_64 and requires GNU tar and Python 3.
 It builds the Linux CLI/daemon and Windows x86_64 agent from the checked-out
-source; it never downloads an operating-system installer or guest image.
+source. Packaging never downloads or embeds an operating-system installer or
+guest image; the installed `lsw` runtime can resolve official media directly
+from Microsoft when a user explicitly starts an installation.
 
 ```sh
 LSW_WINDOWS_LINKER=mingw scripts/build-release.sh
@@ -124,7 +148,10 @@ smoke-tests the Linux binaries when possible, and rejects common OS media and
 VM disk-image formats. On Linux x86_64 it also installs into an isolated
 temporary prefix and compares the installed binaries with the bundle.
 `SOURCE-MANIFEST.sha256` records every packaged build/source file and is checked
-before the embedded corresponding source is accepted.
+before the embedded corresponding source is accepted. `cargo vendor --locked
+--versioned-dirs` places the exact Rust dependency sources and their upstream
+license files under `source/vendor`; `source/.cargo/config.toml` makes that tree
+the offline Cargo source. The manifest covers the vendored tree too.
 
 ## GitHub Actions boundary
 
@@ -149,12 +176,16 @@ as prereleases.
 `.github/workflows/windows-kvm-e2e.yml` is the separate, attended beta release
 gate. It can run only by manual dispatch from an exact `master` commit on the
 explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. Windows media is
-pre-provisioned read-only on that runner and is verified by SHA-256; the
-workflow never downloads or uploads it. The gate captures the local OOBE user
-only for password/automatic-logon policy checks; all agent commands run as
-`NT SERVICE\LSWAgent`. After shutdown it requires a no-login cold boot, the
-same service SID, true ConPTY, detached installation media, and complete runtime
-cleanup. See
+pre-provisioned read-only on that runner. The workflow resolves Microsoft's
+current English x64 metadata and requires the provisioned file to match both
+the configured digest and Microsoft's published SHA-256; it never downloads or
+uploads the ISO payload. It requires both WinPE completion markers and removal
+of token-bearing transient media. The gate captures the local OOBE user only
+for password/automatic-logon policy checks; all agent commands run as
+`NT SERVICE\LSWAgent`. It also verifies WMI license status through the stopped,
+demand-start LocalSystem helper. After shutdown it requires a no-login cold
+boot, the same service SID, true ConPTY, detached installation media, and
+complete runtime cleanup. See
 [`WINDOWS_KVM_E2E.md`](WINDOWS_KVM_E2E.md) for runner isolation, protected
 environment, media provisioning, and operator instructions. Tagged releases
 after the existing beta.1–beta.4 tags fail closed unless this workflow has a

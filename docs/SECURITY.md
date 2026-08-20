@@ -27,23 +27,24 @@ is complete.
 - In-memory suspend uses QMP `stop`; resume requires the same reachable QEMU
   process in `paused` state. LSW does not serialize guest RAM or claim that a
   suspended instance survives QEMU or host termination.
-- Storage preparation and Setup-seed creation reject symlink destinations and
+- Storage preparation and install-seed creation reject symlink destinations and
   do not overwrite existing disks, firmware stores, seeds, or transferred files.
 
 ## Guest agent
 
-Each instance receives a random 256-bit token from `/dev/urandom`. The host copy
-never appears in `lsw show` or the manifest. Setup copies the guest copy to
+Each instance receives a random 256-bit token from the operating system. The
+host copy never appears in `lsw show` or the manifest. Installation staging
+copies the guest copy to
 `ProgramData\LSW` with an ACL for SYSTEM, Administrators, and the
 `NT SERVICE\LSWAgent` virtual service identity. No ACE is added for the
 individual OOBE user; administrators retain access through the Administrators
 group.
 
-The seed registers `LSWAgent` as an automatic Windows service. It runs in
-Session 0 under `NT SERVICE\LSWAgent`, without a stored user password or an
-automatic desktop logon. This boot-time identity is intentionally separate from
-the interactive OOBE account; visible desktop GUI integration will require a
-future user-session companion.
+The pre-applied `specialize` pass registers `LSWAgent` as an automatic Windows
+service. It runs in Session 0 under `NT SERVICE\LSWAgent`, without a stored user
+password or an automatic desktop logon. This boot-time identity is intentionally
+separate from the interactive OOBE account; visible desktop GUI integration
+will require a future user-session companion.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
 guest port 5040 only from the QEMU user-network host address. Authentication is
@@ -83,8 +84,9 @@ race. Do not treat Unix group cleanup as an adversarial containment boundary.
 On Windows, pipe and
 ConPTY children start suspended and must enter a kill-on-close Job Object before
 they resume. Assignment failure, including an incompatible nested-job policy,
-fails closed. The Windows behavior has a native CI gate, but was only
-cross-built—not executed—on this Linux VPS.
+fails closed. The Windows behavior has both cross-build and native CI gates;
+service-backed execution remains part of the dedicated Windows/KVM release
+gate.
 
 Agent powers are intentionally broad after authentication: it can execute
 arbitrary processes as the `NT SERVICE\LSWAgent` virtual account and read or
@@ -126,18 +128,34 @@ instance.
 
 | Profile | Guest Secure Boot | Test-signed custom driver policy |
 | --- | --- | --- |
-| `standard`, `slim`, `ephemeral` | Off | Permitted by profile, but not enabled or installed by beta |
-| `secure` | On | Forbidden; driverless integrations only |
+| `vanilla`, `slim` | Off | No custom driver is enabled or installed by beta.5 |
 
-The secure profile requires a key-enrolled OVMF variable template and SMM-backed
-flash protection. An empty OVMF store does not become secure merely because a
-QEMU flag is present, so `LSW_OVMF_SECURE_CODE` and `LSW_OVMF_SECURE_VARS` must
-point to the distribution's correct files.
+Old preview manifests named `standard` migrate to `vanilla`. Existing
+`ephemeral` and `secure` manifests retain their old runtime and firmware
+semantics when loaded, but those names cannot be selected for new beta.5
+instances. The old secure mode still requires a key-enrolled OVMF variable
+template and SMM-backed flash protection.
 
 LSW beta does not generate a certificate, enable Windows test signing, install a
 root certificate, or ship a custom kernel driver. Any later developer-driver
 workflow must require an explicit guest-only enrollment, keep private keys out
-of shared images, and retain a driverless secure profile.
+of shared images, and retain a driverless path.
+
+## Windows activation helper
+
+The network-facing agent remains the virtual account `NT SERVICE\LSWAgent`.
+Activation does not broaden that service to LocalSystem. The `specialize` pass
+creates a second `LSWLicenseHelper` service with `start=demand`; its service ACL
+grants the agent SID only query/start rights. The helper binds guest loopback
+port 5041, requires the existing per-instance agent token, accepts one bounded
+request, invokes the Windows WMI `InstallProductKey`/`Activate` methods, and
+exits.
+
+Product keys arrive through masked host input or `--key-stdin`, use stdin on the
+authenticated agent session, and are zero-filled in mutable buffers after use.
+They are never argv, environment variables, seed/base-image content, logs, or
+diagnostic material. PowerShell receives the WMI script through its stdin and
+its stderr is discarded so a failed script cannot echo a key.
 
 ## Remaining security work
 

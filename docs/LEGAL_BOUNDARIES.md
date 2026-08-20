@@ -6,19 +6,31 @@ LSW's original code is licensed under `GPL-3.0-or-later`. That license applies
 to LSW and derivatives of LSW; it does not grant rights to proprietary operating
 systems, firmware, hypervisors, installation media, trademarks, or user data.
 
-- LSW distributes orchestration and its own guest agent. It does not distribute
-  Windows, macOS, product keys, activation tokens, preactivated disks, modified
-  third-party ISOs, or vendor SDKs.
-- Users obtain installation media from an authorized source and remain
-  responsible for license entitlement, activation, edition and VM/device limits.
-- `--accept-license` records the user's explicit confirmation for their supplied
-  media. The generated answer file may set the documented Windows Setup
-  `AcceptEula` value from that confirmation; LSW does not silently infer consent.
+- LSW distributes orchestration and its own guest agent. It can download an
+  official ISO directly from allowlisted Microsoft HTTPS CDNs and verify the
+  SHA-256 Microsoft publishes, but it does not redistribute Windows, macOS,
+  product keys, activation tokens, preactivated disks, modified third-party
+  ISOs, or vendor SDKs.
+- Release bundles include the locked Rust dependency sources and their upstream
+  license files under `source/vendor`; `THIRD_PARTY_NOTICES.md` records the
+  attribution and corresponding-source boundary.
+- Users remain responsible for license entitlement, activation, edition and
+  VM/device limits. `--iso` accepts user-supplied authorized offline media.
+- The installation command records the user's request to install Windows. The
+  generated answer file may set the documented Windows Setup `AcceptEula`
+  value; LSW does not grant a Windows license or activation entitlement.
 - The beta does not add a `ProductKey`, bypass activation, hide required license
   pages, use `SkipMachineOOBE`, pre-create a user, or disable UAC. Normal OOBE and
   activation remain the operating system's responsibility.
-- `--unattended-index` automates supported Setup disk/image selection and wipes
-  only the instance's dedicated virtual Disk 0. The guided path is the default.
+- Optional activation installs a user-provided key only through Windows WMI.
+  The key is accepted through masked input or stdin and is excluded from host
+  and guest command lines, environment, seeds, base images, logs and diagnostic
+  bundles.
+- The default installer resolves the edition by supported WIM metadata.
+  `--unattended-index` remains an advanced compatibility selector. The WinPE
+  prepare phase cleans only a new private workspace; the apply phase cleans only
+  the instance's dedicated target qcow2. Neither plan accepts a host block
+  device.
 - The `slim` recipe runs locally and removes only an explicit list of optional
   provisioned AppX packages. It preserves Windows servicing and development
   prerequisites. Generated disks stay local unless the user separately has the

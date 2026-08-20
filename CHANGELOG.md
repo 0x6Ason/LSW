@@ -2,11 +2,15 @@
 
 ## 1.0.0-beta.5
 
-- Added the one-shot `lsw install NAME --iso PATH --edition NAME` path. It
-  checks host dependencies, reads the actual Windows edition names from the
-  ISO's install WIM/ESD, creates and prepares the instance, selects the image by
-  `/IMAGE/NAME`, creates the agent seed, starts Setup, and opens an integrated
-  private-socket installation viewer.
+- Added the one-shot `lsw install NAME` path. It resolves the current official
+  Windows 11 ISO from Microsoft, prefers aria2c with a four-connection limit,
+  falls back to a native four-range resumable downloader, refreshes expired
+  signed URLs, verifies Microsoft's exact SHA-256, selects Pro, and retains
+  `--iso` for offline media.
+- Added the network-disabled `WinPeDismBackend`: it boots the official ISO's
+  WinPE, uses real Windows DISM to export/mount/service a prepared WIM, then
+  applies it to the instance qcow2 with UEFI boot files and a boot-time agent.
+  Temporary WIM workspace and token-bearing seeds are removed after success.
 - Added `lsw doctor --fix`, `config get/set`, `logs`, `view`, redacted
   `diagnose --bundle`, safe `remove`, `shutdown --all`, and `bench --json`.
   Manifest v4 persists `idle-timeout`; `memory.max` takes effect on the next VM
@@ -14,23 +18,42 @@
 - Added Windows media metadata inspection through xorriso and wimlib, friendly
   edition aliases such as `pro`, UTF-8/UTF-16 WIM XML handling, and answer-file
   XML escaping. Numeric image indexes remain an advanced compatibility option.
+- Replaced the old public profile names with versioned declarative `vanilla`
+  and default `slim` manifests. The schema permits only bounded AppX selectors
+  and CompactOS, and enforces preservation of servicing, Defender, Store,
+  winget, WebView2, Terminal/PowerShell/ConPTY, WMI, hibernation and Recovery.
+  Old `standard` manifests migrate to `vanilla`.
 - Replaced the interactive user's `HKCU` agent startup entry with the automatic
   `LSWAgent` Windows service, running under the virtual account
   `NT SERVICE\LSWAgent`. Agent commands intentionally execute in that service
-  identity and do not require a stored user password or automatic logon.
+  identity and do not require a stored user password or automatic logon. The
+  pre-applied flow installs it during `specialize`, before interactive login.
+- Added `lsw license status/activate/open`. Product keys use masked input or
+  stdin and never argv/environment/seed/base/log/diagnostic storage. A separate
+  authenticated, guest-loopback, demand-start LocalSystem helper performs only
+  WMI `InstallProductKey`/`Activate`; the main agent remains narrow.
 - Added cleanup of QEMU pid/viewer artifacts and stale runtime sockets after a
   stopped guest, plus a guarded real Windows/KVM operator workflow covering
   Setup, OOBE user credential policy, Windows build/edition identity, the
   automatic service's configuration and stable process SID, true ConPTY, guest
   exit codes, graceful shutdown, bare-`lsw` cold restart without install media
   or an interactive login, and exact daemon/viewer/QEMU/socket/port cleanup.
-  New tagged releases fail closed unless that job passed for the exact commit;
-  beta.1–beta.4 remain grandfathered and untouched.
+  The gate also requires Microsoft's current published ISO hash, both WinPE
+  completion markers, transient cleanup, WMI license status and the activation
+  helper boundary. New tagged releases fail closed unless that job passed for
+  the exact commit; beta.1–beta.4 remain grandfathered and untouched.
 - Removed the Windows-native process-tree test's PowerShell startup timing race;
   it now observes descendant readiness through kernel Job Object membership.
 - Rewrote the README completely in English and documented beta.5 commands,
   measurable performance targets, roadmap order, legal boundaries, and honest
   hardware-validation limits.
+- Release bundles now include the complete locked Rust dependency source and
+  license files under `source/vendor`, use that tree for offline Cargo builds,
+  and cover it with the corresponding-source SHA-256 manifest.
+- Split the CLI and Windows agent entry points into focused argument,
+  installation, licensing, process-tree, ConPTY, SCM, and test modules. Public
+  ISO/WinPE APIs deny missing documentation, while platform FFI modules deny
+  undocumented unsafe blocks so lifecycle and safety invariants stay explicit.
 
 ## 1.0.0-beta.4
 

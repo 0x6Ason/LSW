@@ -1,8 +1,10 @@
 # Windows/KVM release gate
 
 The real Windows gate validates the release candidate on an explicitly
-dedicated Linux x86_64 KVM runner. It installs from operator-supplied Windows
-media, waits for normal OOBE and first login, then checks agent readiness,
+dedicated Linux x86_64 KVM runner. It resolves Microsoft's current English x64
+ISO metadata, requires the operator-supplied read-only media to match that exact
+published SHA-256, runs the network-disabled WinPE DISM prepare/apply path, and
+checks the boot-time agent before normal OOBE and first login. It then checks
 the exact automatic `LSWAgent` Windows service configuration and virtual-account
 process SID, PowerShell command execution, guest exit-code propagation,
 graceful shutdown, an interactive ConPTY shell, QEMU/daemon/viewer cleanup,
@@ -12,6 +14,12 @@ the installed guest through a bare `lsw`, proves ConPTY and service-backed agent
 execution return at the Windows sign-in screen, requires the same service SID,
 and verifies that neither the ISO nor the seed is attached to the restarted
 QEMU process.
+
+The gate also requires both WinPE serial completion markers, proves that the
+workspace and all token-bearing seeds were removed, queries WMI license status
+without a key, and verifies that `LSWLicenseHelper` returns to a stopped,
+demand-start LocalSystem state while `LSWAgent` remains the narrow virtual
+account.
 
 The workflow is deliberately manual. GitHub-hosted runners do not expose KVM,
 and the beta.5 harness requires an operator to complete OOBE in the private LSW
@@ -121,8 +129,10 @@ workflow variable enforces that reviewed value consistently; it does not by
 itself prove that an arbitrary ISO is official. The preflight rejects missing,
 workspace-local, writable, symlinked, or digest-mismatched media.
 
-The workflow never downloads the ISO, copies it into the repository, caches
-it, or uploads it as an artifact. VM disks, vTPM state, and agent credentials
+The workflow never downloads the ISO payload, copies it into the repository,
+caches it, or uploads it as an artifact. It does contact Microsoft's resolver
+and download page to obtain the current signed-link metadata and published
+SHA-256. VM disks, vTPM state, and agent credentials
 also remain on the dedicated runner. The workflow uploads only the harness's
 redacted `attestation.env`, `doctor.txt`, `bench.json`, and
 `diagnose.tar.gz` evidence for 14 days. Cargo may still use the network for
@@ -136,8 +146,9 @@ firewall if a fully controlled network boundary is required.
 3. Select `master`, enter the exact 40-character commit, and enter
    `RUN-WINDOWS-KVM-E2E` as the confirmation.
 4. Leave **keep_state** disabled for normal release validation.
-5. Approve the protected environment, then attend the LSW viewer and complete
-   normal Windows OOBE and the first administrative login.
+5. Approve the protected environment. After WinPE prepare/apply and the
+   boot-time agent checks pass, attend the LSW viewer and complete normal
+   Windows OOBE and the first administrative login.
 
 After first login, the harness owns the remaining sequence. It closes the
 viewer before the cold-restart check; do not perform a second manual sign-in.
@@ -155,11 +166,16 @@ credential into a release-gate guest.
 
 ## Guest service contract
 
-The installation seed must register exactly one service named `LSWAgent` with
+The `specialize` pass must register exactly one service named `LSWAgent` with
 `StartMode=Auto`, `State=Running`, and
 `StartName=NT SERVICE\LSWAgent`. All agent commands, including ConPTY sessions,
 intentionally run in Windows Session 0 under that virtual service account; the
 service does not impersonate the OOBE user or store that user's password.
+
+It must also register `LSWLicenseHelper` as Manual/demand-start under
+LocalSystem. The E2E status request proves that the agent SID can start it and
+that the helper exits after one authenticated WMI query. No product key is used
+by the release gate.
 
 Before the first shutdown, the harness resolves both the service process owner
 and the command process identity, requires both to equal the translated

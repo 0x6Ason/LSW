@@ -23,7 +23,8 @@ guest.
   planned for beta.7.
 - The default device model uses Windows inbox NVMe, e1000e, and VGA drivers.
   Signed VirtIO acceleration will remain optional.
-- The `secure` profile always retains a driverless path.
+- The beta.5 `vanilla` and `slim` profiles retain the driverless installation
+  and recovery path.
 - LSW manages a complete Windows kernel, so it cannot match the absolute memory
   density of a Linux namespace container. The goal is WSL-like lifecycle and
   memory behavior, not misleading container terminology.
@@ -32,11 +33,13 @@ guest.
 
 - Host runtime: Linux x86_64. KVM is strongly recommended; TCG is diagnostic
   only.
-- Guest: a user-supplied and properly licensed Windows 11 x64 installation ISO.
+- Guest: the current official Windows 11 x64 ISO downloaded from Microsoft, or
+  a user-supplied authorized ISO selected with `--iso`.
 - Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, and
   remote-viewer.
-- LSW never downloads or distributes Windows media, product keys, activation
-  data, preactivated disks, or modified Windows images.
+- LSW downloads official media directly from allowlisted Microsoft HTTPS CDNs
+  and verifies Microsoft's published SHA-256. It never redistributes Windows,
+  product keys, activation data, preactivated disks, or modified images.
 
 The backend layer can plan HVF and WHPX arguments, but macOS and Windows hosts
 are not supported deliverables in this beta.
@@ -53,40 +56,45 @@ lsw doctor --fix
 Create and start a Windows development environment in one command:
 
 ```bash
-lsw install win-dev \
-  --iso ~/Downloads/Windows11.iso \
-  --edition pro \
-  --profile slim
+lsw install win-dev
+lsw
 ```
 
 The one-shot installer performs the following steps:
 
-1. Checks the host and installs missing packages through the distribution's
+1. Checks the host and repairs missing packages through the distribution's
    package manager.
-2. Reads edition names from `sources/install.wim` or `install.esd` in the ISO.
-3. Creates the instance manifest, sparse qcow2 disk, private OVMF variables,
-   runtime directories, and vTPM state.
-4. Creates a read-only installation seed containing the answer file and the
-   matching LSW guest agent.
-5. Starts Windows Setup and opens the integrated installation viewer.
+2. Resolves the current ISO through Microsoft's session flow, downloads it with
+   aria2c or LSW's four-range resumable downloader, and verifies exact SHA-256.
+3. Selects Windows 11 Pro by inspected WIM metadata.
+4. Boots the official ISO's WinPE in a network-disabled microVM and uses its
+   real DISM to prepare the selected `slim` image.
+5. Applies the prepared WIM to the instance qcow2, stages the boot-time agent,
+   creates UEFI boot files, and deletes temporary seeds/workspace media.
+6. Boots Windows, opens the viewer when available, and verifies the agent.
 
-`--edition pro` is matched against the ISO metadata and is written to the
-answer file as `/IMAGE/NAME`; users no longer need to guess a WIM index. The
-selected edition flow wipes only that instance's dedicated virtual Disk 0.
-It never touches a host disk.
+`--edition pro` remains available to override the default and is matched against
+ISO metadata; users never need to guess a WIM index. The WinPE jobs attach only
+LSW-owned qcow2 files and never a host block device.
 
 Edition inspection temporarily extracts the ISO's install WIM/ESD into LSW's
 private state directory and removes it immediately after reading its metadata.
 Ensure the state filesystem has enough free space for that temporary file.
 
 The command records that the user is responsible for the license terms of the
-media they supplied. It does not add a product key, bypass activation, skip
+media they selected. It does not add a product key, bypass activation, skip
 OOBE, or create a prebuilt account.
 
-The installation seed registers the guest agent as the automatic Windows
-service `LSWAgent`, running as the virtual account `NT SERVICE\LSWAgent`.
-It does not add a per-user `HKCU` startup entry, store an OOBE user's password,
-or require automatic logon for a cold start.
+The pre-applied unattend registers the guest agent during `specialize` as the
+automatic Windows service `LSWAgent`, running as the virtual account
+`NT SERVICE\LSWAgent`. It does not add a per-user `HKCU` startup entry, store an
+OOBE user's password, or require automatic logon for a cold start.
+
+Offline media is still supported:
+
+```bash
+lsw install win-dev --iso ~/Downloads/Windows11.iso
+```
 
 On a headless host, pass `--no-viewer`; later, reopen the display from a Linux
 graphical session without handling a socket path:
@@ -125,6 +133,26 @@ lsw shutdown --all
 lsw diagnose win-dev --bundle
 lsw remove win-dev
 ```
+
+## Windows activation
+
+Installation does not add a product key or bypass activation. After the first
+successful environment verification, an unactivated guest receives one
+non-blocking notice. Manage activation without placing a key in shell history:
+
+```bash
+lsw license status win-dev
+lsw license activate win-dev            # masked terminal input
+lsw license activate win-dev --key-stdin
+lsw license activate win-dev --online
+lsw license open win-dev
+```
+
+The key travels through the authenticated agent channel as stdin and then over
+guest loopback to `LSWLicenseHelper`, a LocalSystem service that starts only for
+one authenticated operation. The regular agent remains `NT SERVICE\LSWAgent`.
+The helper calls Windows WMI `InstallProductKey` and `Activate`; it does not put
+the key in argv, environment, seed media, the base image, logs, or diagnostics.
 
 `memory.max` is applied to the next QEMU start. `idle-timeout` is stored in
 manifest v4 so the beta.7 memory and hibernation governor can enforce one
@@ -173,14 +201,15 @@ documented hardware.
 
 | Profile | Behavior | Guest Secure Boot |
 | --- | --- | --- |
-| `standard` | Stock Windows; servicing remains intact | Off |
+| `vanilla` | Stock Windows plus the LSW agent | Off |
 | `slim` | Removes only an explicit optional AppX allowlist and enables CompactOS | Off |
-| `ephemeral` | Slim behavior with a disposable qcow2 overlay per run | Off |
-| `secure` | Disallows test-signed custom drivers and requires key-enrolled OVMF variables | On |
 
-Every beta profile preserves WinSxS, Windows Update and the servicing stack,
-MSI/MSIX support, Defender, and common development-tool dependencies. LSW does
-not enable test signing or install a self-signed certificate by default.
+`slim` is the beta.5 default. Both profiles are embedded versioned declarative
+manifests. They preserve WinSxS, Windows Update and the servicing stack,
+MSI/MSIX, Defender, Terminal, PowerShell, ConPTY, Store, winget, WebView2, WMI,
+hibernation, Recovery, and common development-tool dependencies. LSW does not
+enable test signing or install a self-signed certificate by default. The
+experimental `minimal` and user-versioned `custom` profiles remain beta.7 work.
 
 ## Advanced commands
 
@@ -263,12 +292,16 @@ with KVM and a licensed Windows 11 ISO:
 
 ```bash
 LSW_WINDOWS_ISO=/absolute/path/Windows11.iso \
+LSW_WINDOWS_ISO_SHA256=64-character-reviewed-sha256 \
 LSW_WINDOWS_EDITION=pro \
 LSW_WINDOWS_AGENT=/absolute/path/lsw-agent.exe \
 scripts/check-windows-kvm-e2e.sh
 ```
 
-The operator completes normal OOBE in the viewer. The harness then verifies
+The harness first resolves Microsoft's current English x64 metadata, requires
+the provisioned media to match its published SHA-256, and verifies both WinPE
+completion markers plus transient-media cleanup. The operator completes normal
+OOBE in the viewer. The harness then verifies
 the Windows 11 build and requested edition, the password and automatic-logon
 policy of the active OOBE user, and the automatic `LSWAgent` service's name,
 state, startup mode, virtual-account identity, and `S-1-5-80-...` process SID.
@@ -298,8 +331,9 @@ requires a separate Windows ARM64 agent, firmware, installer path, and CI.
 
 ## Build from source
 
-The host binaries have no third-party Rust crate dependencies. The MSRV is Rust
-1.76, which is also pinned in CI:
+The host resolver uses a small pinned Rust HTTP/TLS, URL, JSON and SHA-256
+dependency set; the Windows agent does not link that host-only stack. The MSRV
+is Rust 1.76, which is also pinned in CI:
 
 ```bash
 cargo build --workspace
@@ -323,18 +357,20 @@ LSW_ZIG=/path/to/zig scripts/build-release.sh
 ```
 
 The release builder produces a Linux x86_64 archive, SHA-256 sidecar, Windows
-PE agent, exact corresponding-source snapshot, and reproducibility metadata.
-It does not download Rust targets, Zig, or operating-system media.
+PE agent, exact corresponding-source snapshot, vendored locked Rust dependency
+sources/licenses, and reproducibility metadata. It does not download Rust
+targets, Zig, or operating-system media.
 
 ## Current limitations
 
-- A real Windows Setup → OOBE → agent → ConPTY → shutdown → cold-restart
-  run still requires a KVM-capable test host and user-provided ISO.
+- A real WinPE DISM → OOBE → agent/helper → ConPTY → shutdown →
+  cold-restart run still requires the dedicated KVM-capable release host and a
+  pre-provisioned current official ISO.
 - The guest agent now runs as the automatic `LSWAgent` Windows service under
   `NT SERVICE\LSWAgent`, but that boot-time path has not yet passed the real
   Windows/KVM release gate. beta.5 must not be tagged until the exact candidate
-  passes Setup, OOBE, service identity, true ConPTY, shutdown, and no-login cold
-  restart on the dedicated hardware runner.
+  passes WinPE prepare/apply, OOBE, service/helper identity, true ConPTY,
+  shutdown, and no-login cold restart on the dedicated hardware runner.
 - The installation and recovery display uses private Unix-socket VNC internally;
   LSW opens the viewer and does not expose TCP VNC or RDP.
 - `lsw run` can start a Session 0 process, but a service-launched GUI is not a
@@ -359,6 +395,13 @@ LSW-owned code is licensed under
 macOS, or user-supplied media; those remain subject to their respective owners'
 terms.
 
+The Rust Microsoft ISO session resolver adapts the MIT-licensed request flow
+from [windows-iso-downloader/MSDL](https://github.com/starkSV/windows-iso-downloader).
+Thanks to its authors for publishing that work. See
+[third-party notices](THIRD_PARTY_NOTICES.md) for the retained attribution and
+license text. LSW neither bundles MSDL nor uses its backend, telemetry, or
+crowdsourced cache.
+
 ## Documentation
 
 - [Beta acceptance scope and known limitations](docs/BETA.md)
@@ -366,5 +409,6 @@ terms.
 - [Security model](docs/SECURITY.md)
 - [Development and release gates](docs/DEVELOPMENT.md)
 - [Real Windows/KVM release gate](docs/WINDOWS_KVM_E2E.md)
+- [WinPE DISM backend](docs/WINPE_DISM_EXPERIMENT.md)
 - [License and distribution boundaries](docs/LEGAL_BOUNDARIES.md)
 - [Design references](docs/REFERENCES.md)
