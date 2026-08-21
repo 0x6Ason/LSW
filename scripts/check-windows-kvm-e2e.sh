@@ -455,6 +455,7 @@ for capability in \
     '  swtpm:       ' \
     '  wimlib:      ' \
     '  xorriso:     ' \
+    '  7z:          ' \
     '  OVMF code:   ' \
     '  OVMF vars:   '
 do
@@ -583,27 +584,34 @@ else
     fi
 fi
 
-for removed_transient in seed winpe-seed winpe-apply-seed run/winpe-workspace.qcow2; do
+for removed_transient in \
+    seed \
+    winpe-seed \
+    winpe-apply-seed \
+    run/winpe-workspace.qcow2 \
+    run/winpe-control-root \
+    run/winpe-control.iso
+do
     if [ -e "$LSW_STATE_DIR/instances/$instance/$removed_transient" ]; then
         echo "error: WinPE transient remained after successful install: $removed_transient" >&2
         exit 1
     fi
 done
 if ! grep -F 'LSW-WINPE-DISM complete' \
-    "$LSW_STATE_DIR/instances/$instance/run/winpe-prepare-serial.log" >/dev/null
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-prepare-status/status.log" >/dev/null
 then
     echo "error: WinPE prepare completion marker was not retained" >&2
     exit 1
 fi
 if ! grep -F 'LSW-WINPE-DISM apply-complete' \
-    "$LSW_STATE_DIR/instances/$instance/run/winpe-apply-serial.log" >/dev/null
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-apply-status/status.log" >/dev/null
 then
     echo "error: WinPE apply completion marker was not retained" >&2
     exit 1
 fi
 if grep -F 'LSW-WINPE-DISM failed' \
-    "$LSW_STATE_DIR/instances/$instance/run/winpe-prepare-serial.log" \
-    "$LSW_STATE_DIR/instances/$instance/run/winpe-apply-serial.log" >/dev/null
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-prepare-status/status.log" \
+    "$LSW_STATE_DIR/instances/$instance/run/winpe-apply-status/status.log" >/dev/null
 then
     echo "error: WinPE failure marker appeared in a successful install" >&2
     exit 1

@@ -35,8 +35,8 @@ guest.
   only.
 - Guest: the current official Windows 11 x64 ISO downloaded from Microsoft, or
   a user-supplied authorized ISO selected with `--iso`.
-- Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, and
-  remote-viewer.
+- Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, a
+  UDF-capable `7z`, and remote-viewer.
 - LSW downloads official media directly from allowlisted Microsoft HTTPS CDNs
   and verifies Microsoft's published SHA-256. It never redistributes Windows,
   product keys, activation data, preactivated disks, or modified images.
@@ -67,15 +67,17 @@ The one-shot installer performs the following steps:
 2. Resolves the current ISO through Microsoft's session flow, downloads it with
    aria2c or LSW's four-range resumable downloader, and verifies exact SHA-256.
 3. Selects Windows 11 Pro by inspected WIM metadata.
-4. Boots the official ISO's WinPE in a network-disabled microVM and uses its
-   real DISM to prepare the selected `slim` image.
-5. Applies the prepared WIM to the instance qcow2, stages the boot-time agent,
-   creates UEFI boot files, and deletes temporary seeds/workspace media.
+4. Builds a private, ephemeral control ISO from the official ISO's WinPE boot
+   files, then boots it in a network-disabled microVM and uses its real DISM to
+   prepare the selected `slim` image with the boot-time agent and answer file.
+5. Applies the prepared WIM to the instance qcow2, validates the resulting
+   qcow2, creates UEFI boot files, and deletes temporary seeds/workspace media.
 6. Boots Windows, opens the viewer when available, and verifies the agent.
 
 `--edition pro` remains available to override the default and is matched against
 ISO metadata; users never need to guess a WIM index. The WinPE jobs attach only
-LSW-owned qcow2 files and never a host block device.
+LSW-owned qcow2 files, private seed/status volumes, and read-only ISO media;
+they never attach a host block device.
 
 Edition inspection temporarily extracts the ISO's install WIM/ESD into LSW's
 private state directory and removes it immediately after reading its metadata.
@@ -160,8 +162,8 @@ stable configuration contract; beta.5 does not yet hibernate automatically.
 
 `lsw diagnose --bundle` creates a support archive containing a redacted
 manifest, host capability report, daemon status, a redacted QEMU plan, and
-bounded log tails. It excludes the agent token, installation seed, Windows
-media, virtual disks, and absolute ISO/state paths.
+bounded runtime and WinPE log tails. It excludes the agent token, installation
+seed, Windows media, virtual disks, and absolute ISO/state paths.
 
 `lsw remove` refuses to remove an active instance. Shut it down first; removal
 then deletes that instance's manifest, firmware variables, local virtual disk,

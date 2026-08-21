@@ -236,6 +236,7 @@ fn print_host_report(store: &StateStore, capabilities: &HostCapabilities) {
         "  qemu-img:    {}",
         display_optional(&capabilities.qemu_img)
     );
+    println!("  setsid:      {}", display_optional(&capabilities.setsid));
     println!("  swtpm:       {}", display_optional(&capabilities.swtpm));
     println!("  aria2c:      {}", display_optional(&capabilities.aria2c));
     println!(
@@ -243,6 +244,10 @@ fn print_host_report(store: &StateStore, capabilities: &HostCapabilities) {
         display_optional(&capabilities.wimlib_imagex)
     );
     println!("  xorriso:     {}", display_optional(&capabilities.xorriso));
+    println!(
+        "  7z:          {}",
+        display_optional(&capabilities.seven_zip)
+    );
     println!(
         "  viewer:      {}",
         display_optional(&capabilities.remote_viewer)
@@ -317,11 +322,13 @@ fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
                 "--yes",
                 "qemu-system-x86",
                 "qemu-utils",
+                "util-linux",
                 "ovmf",
                 "swtpm",
                 "aria2",
                 "wimtools",
                 "xorriso",
+                "7zip",
                 "virt-viewer",
             ],
         )?;
@@ -334,11 +341,14 @@ fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
                 "--assumeyes",
                 "qemu-system-x86-core",
                 "qemu-img",
+                "util-linux",
                 "edk2-ovmf",
                 "swtpm",
                 "aria2",
                 "wimlib-utils",
                 "xorriso",
+                "p7zip",
+                "p7zip-plugins",
                 "virt-viewer",
             ],
         )?;
@@ -351,11 +361,13 @@ fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
                 "--needed",
                 "--noconfirm",
                 "qemu-desktop",
+                "util-linux",
                 "edk2-ovmf",
                 "swtpm",
                 "aria2",
                 "wimlib",
                 "xorriso",
+                "7zip",
                 "virt-viewer",
             ],
         )?;
@@ -368,17 +380,19 @@ fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
                 "install",
                 "qemu-x86",
                 "qemu-tools",
+                "util-linux",
                 "qemu-ovmf-x86_64",
                 "swtpm",
                 "aria2",
                 "wimlib",
                 "xorriso",
+                "7zip",
                 "virt-viewer",
             ],
         )?;
     } else {
         return Err(format!(
-            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, aria2, wimlib-imagex, xorriso, and remote-viewer manually"
+            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, util-linux, aria2, wimlib-imagex, xorriso, 7z, and remote-viewer manually"
         )
         .into());
     }
@@ -820,10 +834,16 @@ fn status(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
     }
     let manifest = store.load(&name)?;
     let token = store.read_agent_token(&name)?;
-    let agent = AgentClient::connect(&manifest, &token)
-        .and_then(AgentClient::probe)
-        .is_ok();
-    println!("AGENT={}", if agent { "ready" } else { "unavailable" });
+    match AgentClient::connect(&manifest, &token).and_then(AgentClient::probe) {
+        Ok(()) => println!("AGENT=ready"),
+        Err(error) => {
+            println!("AGENT=unavailable");
+            println!(
+                "AGENT_ERROR={}",
+                error.to_string().replace(['\r', '\n'], " ")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1546,6 +1566,31 @@ fn diagnose(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn st
                 &redactions,
             )?;
         }
+        for (source, filename) in [
+            ("winpe-prepare-qemu.log", "winpe-prepare-qemu.log"),
+            ("winpe-apply-qemu.log", "winpe-apply-qemu.log"),
+            ("run/winpe-prepare-serial.log", "winpe-prepare-serial.log"),
+            ("run/winpe-apply-serial.log", "winpe-apply-serial.log"),
+            (
+                "run/winpe-prepare-status/status.log",
+                "winpe-prepare-status.log",
+            ),
+            (
+                "run/winpe-apply-status/status.log",
+                "winpe-apply-status.log",
+            ),
+            (
+                "run/winpe-prepare-status/dism.log",
+                "winpe-prepare-dism.log",
+            ),
+            ("run/winpe-apply-status/dism.log", "winpe-apply-dism.log"),
+        ] {
+            copy_diagnostic_tail(
+                &instance_dir.join(source),
+                &staging.join(filename),
+                &redactions,
+            )?;
+        }
 
         let output =
             absolute_path(&output.unwrap_or_else(|| {
@@ -1578,7 +1623,7 @@ fn diagnostic_host_text(_store: &StateStore, capabilities: &HostCapabilities) ->
     format!(
         concat!(
             "lsw_version={}\nstate_root={}\nplatform={}\naccelerator={}\n",
-            "kvm={}\nqemu={}\nqemu_img={}\nswtpm={}\naria2c={}\nwimlib={}\nxorriso={}\nviewer={}\n"
+            "kvm={}\nqemu={}\nqemu_img={}\nsetsid={}\nswtpm={}\naria2c={}\nwimlib={}\nxorriso={}\nseven_zip={}\nviewer={}\n"
         ),
         env!("CARGO_PKG_VERSION"),
         "<redacted>",
@@ -1587,10 +1632,12 @@ fn diagnostic_host_text(_store: &StateStore, capabilities: &HostCapabilities) ->
         yes_no(capabilities.accelerators.supports(VmAccelerator::Kvm)),
         display_optional(&capabilities.qemu_system),
         display_optional(&capabilities.qemu_img),
+        display_optional(&capabilities.setsid),
         display_optional(&capabilities.swtpm),
         display_optional(&capabilities.aria2c),
         display_optional(&capabilities.wimlib_imagex),
         display_optional(&capabilities.xorriso),
+        display_optional(&capabilities.seven_zip),
         display_optional(&capabilities.remote_viewer),
     )
 }

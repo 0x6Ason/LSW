@@ -973,6 +973,16 @@ fn download_with_aria2(
             field: "ISO download",
             reason: "temporary destination has no filename".to_owned(),
         })?;
+    let filename = filename.to_str().ok_or_else(|| LswError::InvalidValue {
+        field: "ISO download",
+        reason: "aria2 requires a UTF-8 destination filename".to_owned(),
+    })?;
+    if filename.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        return Err(LswError::InvalidValue {
+            field: "ISO download",
+            reason: "aria2 destination filename contains a line break".to_owned(),
+        });
+    }
     validate_partial_file(temporary)?;
 
     let mut child = Command::new(aria2c)
@@ -981,7 +991,6 @@ fn download_with_aria2(
         .arg("--max-connection-per-server=4")
         .arg("--split=4")
         .arg("--min-split-size=16M")
-        .arg("--max-redirect=0")
         .arg("--max-tries=2")
         .arg("--retry-wait=2")
         .arg("--connect-timeout=20")
@@ -992,15 +1001,17 @@ fn download_with_aria2(
         .arg("--console-log-level=warn")
         .arg("--summary-interval=0")
         .arg("--quiet=true")
-        .arg(format!("--dir={}", parent.display()))
-        .arg(format!("--out={}", filename.to_string_lossy()))
+        .current_dir(parent)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
+        // Global --out is ignored when aria2 reads URIs from an input file.
+        // Keep the signed URL off argv and provide the output name as a
+        // per-URI option on the following indented line.
         stdin.write_all(resolved.download_url.expose().as_bytes())?;
-        stdin.write_all(b"\n")?;
+        stdin.write_all(format!("\n  out={filename}\n").as_bytes())?;
     }
     let status = child.wait()?;
     if !status.success() {
@@ -1623,6 +1634,62 @@ mod tests {
         )
         .expect_err("Sentinel rejection should fail");
         assert!(sentinel.to_string().contains("retry later or use --iso"));
+    }
+
+    #[test]
+    fn aria2_adapter_keeps_the_signed_url_off_argv_and_honors_the_output_name() {
+        let root = fixture();
+        let fake_aria2 = root.join("aria2c");
+        fs::write(
+            &fake_aria2,
+            "#!/bin/sh\n\
+             for argument in \"$@\"; do\n\
+               case \"$argument\" in\n\
+                 --max-redirect=*|--dir=*|--out=*) exit 91 ;;\n\
+                 *token=*) exit 92 ;;\n\
+               esac\n\
+             done\n\
+             url=\n\
+             output=\n\
+             while IFS= read -r line; do\n\
+               case \"$line\" in\n\
+                 '  out='*) output=${line#*out=} ;;\n\
+                 '  '*) ;;\n\
+                 *) url=$line ;;\n\
+               esac\n\
+             done\n\
+             case \"$url\" in\n\
+               https://software.download.prss.microsoft.com/*token=*) ;;\n\
+               *) exit 93 ;;\n\
+             esac\n\
+             [ \"$output\" = '.windows.iso.lsw-download' ] || exit 94\n\
+             printf downloaded > \"$output\"\n",
+        )
+        .expect("fake aria2 should be written");
+        fs::set_permissions(&fake_aria2, fs::Permissions::from_mode(0o700))
+            .expect("fake aria2 should be executable");
+
+        let resolved = ResolvedWindowsIso {
+            product_id: "product".to_owned(),
+            sku_id: "sku".to_owned(),
+            language: "English".to_owned(),
+            architecture: "x64".to_owned(),
+            filename: "windows.iso".to_owned(),
+            expected_sha256: "0".repeat(64),
+            expires_at: None,
+            download_url: SecretDownloadUrl::parse(
+                "https://software.download.prss.microsoft.com/windows.iso?token=secret",
+            )
+            .expect("fixture URL should be accepted"),
+        };
+        let temporary = root.join(".windows.iso.lsw-download");
+        download_with_aria2(&fake_aria2, &resolved, &temporary)
+            .expect("fake aria2 should receive a valid input-file request");
+        assert_eq!(
+            fs::read(&temporary).expect("download should exist"),
+            b"downloaded"
+        );
+        fs::remove_dir_all(root).expect("fixture should be removed");
     }
 
     #[test]

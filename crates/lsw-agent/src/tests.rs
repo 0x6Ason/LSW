@@ -859,6 +859,49 @@ fn authenticated_loopback_exec_streams_output_and_exit_status() {
     server.join().expect("agent fixture should finish");
 }
 
+#[test]
+fn nonblocking_accepted_socket_waits_for_the_bounded_handshake() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let token = "a".repeat(64);
+    let server_token = token.clone();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("server should accept");
+        stream
+            .set_nonblocking(true)
+            .expect("fixture stream should become nonblocking");
+        handle_connection(stream, &server_token).expect("delayed handshake should succeed");
+    });
+
+    let mut client = std::net::TcpStream::connect(address).expect("client should connect");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token,
+    };
+    write_frame(
+        &mut client,
+        &Frame::new(
+            FrameKind::Hello,
+            hello.encode().expect("hello should encode"),
+        ),
+    )
+    .expect("client should write HELLO");
+    assert_eq!(
+        read_frame(&mut client).expect("server should answer").kind,
+        FrameKind::HelloOk
+    );
+    write_frame(&mut client, &Frame::new(FrameKind::Ping, Vec::new()))
+        .expect("client should write PING");
+    assert_eq!(
+        read_frame(&mut client).expect("server should answer").kind,
+        FrameKind::Pong
+    );
+    server.join().expect("server should not panic");
+}
+
 #[cfg(unix)]
 #[test]
 fn authenticated_loopback_file_transfer_preserves_unicode_and_bytes() {

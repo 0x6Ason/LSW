@@ -59,12 +59,17 @@ impl<'a> DaemonClient<'a> {
             .open(&log_path)?;
         let stderr = stdout.try_clone()?;
         let daemon = daemon_program()?;
-        let mut child = Command::new(daemon)
+        let mut command = Command::new("setsid");
+        command
+            .arg(daemon)
             .env("LSW_STATE_DIR", self.store.root())
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()?;
+            .stderr(Stdio::from(stderr));
+        // util-linux setsid execs lswd in a new session without a shell or an
+        // untracked fork. A one-shot WSL launcher can then exit without sending
+        // SIGHUP to the daemon and its QEMU children.
+        let mut child = command.spawn()?;
 
         let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         loop {

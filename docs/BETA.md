@@ -16,8 +16,8 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
 - The network-disabled `WinPeDismBackend` uses real DISM from the official ISO
   to prepare a profile WIM, then applies it to the instance qcow2 in a separate
   phase. The phases use distinct disk topologies, OVMF variables, and exact
-  serial completion markers. Workspace disks and token-bearing seeds are
-  removed after success.
+  private status-volume completion markers. Workspace disks and token-bearing
+  seeds are removed after success.
 - Versioned declarative `vanilla` and default `slim` profiles. `slim` removes
   only an explicit AppX allowlist and preserves Windows Update, WinSxS,
   Defender, Store, winget, WebView2, Terminal, PowerShell, ConPTY, WMI,
@@ -60,7 +60,7 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   and authentication rejection, heartbeat liveness, and legacy half-close.
 - On a Codex VPS without KVM or Windows media, the project passed QEMU 8.2.2
   TCG with OVMF, `qemu-img`, swtpm/vTPM traffic, TCP QMP
-  `stop`/`cont`/`quit`, and two `127.0.0.1` usernet forwards to guest ports 5040
+  `stop`/`cont`/`quit`, and two `127.0.0.1` usernet forwards to guest ports 35040
   and 8080. Both forwards were released after quit, and QEMU and swtpm exited
   successfully.
 - CI has a non-skippable product-lifecycle gate using the real LSW manifest,

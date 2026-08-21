@@ -177,7 +177,7 @@ def qemu_command(arguments, qemu_fd, qmp_port, agent_port, published_port):
             "-device",
             "tpm-tis,tpmdev=tpm0",
             "-netdev",
-            "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{}-:5040,hostfwd=tcp:127.0.0.1:{}-:8080".format(
+            "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{}-:35040,hostfwd=tcp:127.0.0.1:{}-:8080".format(
                 agent_port, published_port
             ),
             "-device",

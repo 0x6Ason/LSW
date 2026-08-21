@@ -15,7 +15,7 @@ execution return at the Windows sign-in screen, requires the same service SID,
 and verifies that neither the ISO nor the seed is attached to the restarted
 QEMU process.
 
-The gate also requires both WinPE serial completion markers, proves that the
+The gate also requires both private-volume WinPE completion markers, proves that the
 workspace and all token-bearing seeds were removed, queries WMI license status
 without a key, and verifies that `LSWLicenseHelper` returns to a stopped,
 demand-start LocalSystem state while `LSWAgent` remains the narrow virtual
@@ -63,7 +63,7 @@ normally through the `kvm` group.
 Install these dependencies before registering the runner:
 
 - QEMU x86_64, `qemu-img`, OVMF, and swtpm;
-- wimlib, xorriso, and virt-viewer (`remote-viewer`);
+- wimlib, xorriso, a UDF-capable `7z`, and virt-viewer (`remote-viewer`);
 - Git, Python 3, GNU coreutils, and standard POSIX shell tools;
 - rustup with Rust 1.76.0 and the `x86_64-pc-windows-gnu` target; and
 - the MinGW-w64 x86_64 compiler.
@@ -73,7 +73,7 @@ On Debian or Ubuntu, the relevant packages include:
 ```sh
 sudo apt-get install \
   coreutils gcc-mingw-w64-x86-64 git ovmf python3 qemu-system-x86 \
-  qemu-utils swtpm util-linux virt-viewer wimtools xorriso
+  7zip qemu-utils swtpm util-linux virt-viewer wimtools xorriso
 rustup toolchain install 1.76.0 --profile minimal
 rustup target add --toolchain 1.76.0 x86_64-pc-windows-gnu
 ```

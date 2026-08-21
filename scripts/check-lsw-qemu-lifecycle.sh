@@ -168,7 +168,7 @@ assert_plan_contains 'nvme,drive=system,serial=lsw-system'
 assert_plan_contains 'e1000e,netdev=net0'
 assert_plan_contains 'emulator,id=tpm0,chardev=chrtpm'
 assert_plan_contains 'tpm-tis,tpmdev=tpm0'
-assert_plan_contains "user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:$control_port-:5040,hostfwd=tcp:127.0.0.1:$published_port-:8080"
+assert_plan_contains "user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:$control_port-:35040,hostfwd=tcp:127.0.0.1:$published_port-:8080"
 assert_plan_contains "unix:$instance_dir/run/qmp.sock,server=on,wait=off"
 assert_plan_contains "helper: $swtpm socket --tpm2"
 
@@ -208,7 +208,7 @@ assert_status_contains() {
 
 # The placeholder is intentionally not Windows media. OVMF remains alive, so
 # every host-side product lifecycle path can still be exercised truthfully.
-"$lsw" install "$instance_name" --without-agent > "$lifecycle_root/install.out"
+"$lsw" install "$instance_name" --without-agent --no-viewer > "$lifecycle_root/install.out"
 assert_status_contains 'STATE=installing' 'QMP=running' 'ACTIVE=true'
 python3 "$probe" ports bound "$control_port" "$published_port"
 python3 "$probe" qmp-tpm "$instance_dir/run/qmp.sock"

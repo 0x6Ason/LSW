@@ -195,15 +195,27 @@ mod tests {
 
     #[test]
     fn manifest_rejects_unknown_fields_and_missing_preservation_contracts() {
-        let unknown = VANILLA_PROFILE.replace(
-            "\"schema_version\": 1,",
-            "\"schema_version\": 1, \"command\": \"Remove-WindowsPackage\",",
-        );
+        let mut unknown: serde_json::Value =
+            serde_json::from_str(VANILLA_PROFILE).expect("embedded profile should be valid JSON");
+        unknown
+            .as_object_mut()
+            .expect("profile should be an object")
+            .insert(
+                "command".to_owned(),
+                serde_json::Value::String("Remove-WindowsPackage".to_owned()),
+            );
+        let unknown = serde_json::to_string(&unknown).expect("profile should serialize");
         assert!(
             CustomizationPlan::from_json(WindowsProfile::Vanilla, "vanilla", &unknown).is_err()
         );
 
-        let missing = SLIM_PROFILE.replace("    \"Microsoft Defender\",\n", "");
+        let mut missing: serde_json::Value =
+            serde_json::from_str(SLIM_PROFILE).expect("embedded profile should be valid JSON");
+        missing["preserve_components"]
+            .as_array_mut()
+            .expect("preservation contract should be an array")
+            .retain(|component| component.as_str() != Some("Microsoft Defender"));
+        let missing = serde_json::to_string(&missing).expect("profile should serialize");
         assert!(CustomizationPlan::from_json(WindowsProfile::Slim, "slim", &missing).is_err());
     }
 }

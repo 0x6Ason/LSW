@@ -101,7 +101,7 @@ install -m 0644 -- docs/ARCHITECTURE.md docs/BETA.md docs/LEGAL_BOUNDARIES.md \
     docs/DEVELOPMENT.md docs/REFERENCES.md docs/SECURITY.md \
     docs/WINDOWS_KVM_E2E.md "$staged_bundle/docs/"
 tar --exclude='*/__pycache__' --exclude='*.pyc' --exclude='*.pyo' \
-    -cf - .github .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md \
+    -cf - .github .gitattributes .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md \
     THIRD_PARTY_NOTICES.md crates docs rustfmt.toml scripts | \
     tar -xf - -C "$staged_bundle/source"
 (

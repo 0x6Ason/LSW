@@ -11,10 +11,12 @@ pub struct HostCapabilities {
     pub accelerators: AcceleratorCapabilities,
     pub qemu_system: Option<PathBuf>,
     pub qemu_img: Option<PathBuf>,
+    pub setsid: Option<PathBuf>,
     pub aria2c: Option<PathBuf>,
     pub swtpm: Option<PathBuf>,
     pub wimlib_imagex: Option<PathBuf>,
     pub xorriso: Option<PathBuf>,
+    pub seven_zip: Option<PathBuf>,
     pub remote_viewer: Option<PathBuf>,
     pub ovmf_code: Option<PathBuf>,
     pub ovmf_vars: Option<PathBuf>,
@@ -40,10 +42,12 @@ impl HostCapabilities {
             accelerators,
             qemu_system: command_in_path("qemu-system-x86_64"),
             qemu_img: command_in_path("qemu-img"),
+            setsid: command_in_path("setsid"),
             aria2c: command_in_path("aria2c"),
             swtpm: command_in_path("swtpm"),
             wimlib_imagex: command_in_path("wimlib-imagex"),
             xorriso: command_in_path("xorriso"),
+            seven_zip: command_in_path("7zz").or_else(|| command_in_path("7z")),
             remote_viewer: command_in_path("remote-viewer"),
             ovmf_code: configured_or_first_existing(
                 "LSW_OVMF_CODE",
@@ -90,10 +94,12 @@ impl HostCapabilities {
             accelerators: AcceleratorCapabilities::none(),
             qemu_system: None,
             qemu_img: None,
+            setsid: None,
             aria2c: None,
             swtpm: None,
             wimlib_imagex: None,
             xorriso: None,
+            seven_zip: None,
             remote_viewer: None,
             ovmf_code: None,
             ovmf_vars: None,
@@ -112,6 +118,9 @@ impl HostCapabilities {
         }
         if self.ovmf_code.is_none() {
             missing.push("OVMF code firmware");
+        }
+        if self.setsid.is_none() {
+            missing.push("setsid (util-linux)");
         }
         missing
     }
@@ -135,6 +144,9 @@ impl HostCapabilities {
         }
         if self.xorriso.is_none() {
             missing.push("xorriso");
+        }
+        if self.seven_zip.is_none() {
+            missing.push("7z (UDF-capable ISO extractor)");
         }
         if self.remote_viewer.is_none() {
             missing.push("remote-viewer");
@@ -174,6 +186,9 @@ impl HostCapabilities {
             } else {
                 "OVMF code firmware"
             });
+        }
+        if self.setsid.is_none() {
+            missing.push("setsid (util-linux)");
         }
         missing
     }
@@ -220,7 +235,7 @@ mod tests {
     #[test]
     fn missing_capabilities_are_reported_without_panicking() {
         let capabilities = HostCapabilities::unavailable(HostPlatform::Linux);
-        assert_eq!(capabilities.missing_for_launch().len(), 3);
+        assert_eq!(capabilities.missing_for_launch().len(), 4);
         assert_eq!(capabilities.missing_for_preparation().len(), 2);
     }
 }

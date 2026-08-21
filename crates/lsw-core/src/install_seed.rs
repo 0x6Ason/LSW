@@ -8,9 +8,13 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::{CustomizationPlan, InstanceManifest, LswError, Result, AGENT_GUEST_PORT};
+use crate::{
+    CustomizationPlan, InstanceManifest, LswError, Result, AGENT_GUEST_PORT,
+    LICENSE_HELPER_GUEST_PORT,
+};
 
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
+const LICENSE_HELPER_SCRIPT: &[u8] = include_bytes!("../assets/license-helper.ps1");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallSeedOptions {
@@ -138,7 +142,11 @@ impl InstallSeedBuilder {
         );
         generated.insert(
             PathBuf::from("lsw/install-agent.ps1"),
-            install_agent_script().as_bytes().to_vec(),
+            install_agent_script().into_bytes(),
+        );
+        generated.insert(
+            PathBuf::from("lsw/license-helper.ps1"),
+            LICENSE_HELPER_SCRIPT.to_vec(),
         );
         generated.insert(
             PathBuf::from("lsw/apply-profile.ps1"),
@@ -309,13 +317,17 @@ fn autounattend(manifest: &InstanceManifest, options: &InstallSeedOptions) -> St
     )
 }
 
-fn install_agent_script() -> &'static str {
+fn install_agent_script() -> String {
     r#"$ErrorActionPreference = 'Stop'
 $AgentSource = Join-Path $PSScriptRoot 'lsw-agent.exe'
 $TokenSource = Join-Path $PSScriptRoot 'agent.token'
+$LicenseScriptSource = Join-Path $PSScriptRoot 'license-helper.ps1'
 if (-not (Test-Path -LiteralPath $AgentSource -PathType Leaf)) {
     Write-Warning 'lsw-agent.exe is not present on the LSW seed. Install it manually and rerun this script.'
     exit 0
+}
+if (-not (Test-Path -LiteralPath $LicenseScriptSource -PathType Leaf)) {
+    throw 'license-helper.ps1 is not present on the LSW seed.'
 }
 
 $InstallRoot = Join-Path $env:ProgramFiles 'LSW'
@@ -353,7 +365,9 @@ function Invoke-Sc {
 
 New-Item -ItemType Directory -Force -Path $InstallRoot, $DataRoot | Out-Null
 $AgentTarget = Join-Path $InstallRoot 'lsw-agent.exe'
+$LicenseScriptTarget = Join-Path $InstallRoot 'license-helper.ps1'
 $TokenTarget = Join-Path $DataRoot 'agent.token'
+$LogTarget = Join-Path $DataRoot 'agent.log'
 $ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
 foreach ($ServiceToStop in @($ServiceName, $LicenseServiceName)) {
     $ExistingServiceToStop = Get-Service -Name $ServiceToStop -ErrorAction SilentlyContinue
@@ -413,6 +427,7 @@ foreach ($StaleAgent in $StaleAgents) {
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 Remove-ItemProperty -Path $RunKey -Name 'LSWAgent' -ErrorAction SilentlyContinue
 Copy-Item -LiteralPath $AgentSource -Destination $AgentTarget -Force
+Copy-Item -LiteralPath $LicenseScriptSource -Destination $LicenseScriptTarget -Force
 $AgentCommand = ('"{0}" --service --token-file "{1}"' -f $AgentTarget, $TokenTarget)
 $ScAgentCommand = ConvertTo-ScBinaryPathArgument -Command $AgentCommand
 if ($null -eq $ExistingService) {
@@ -457,7 +472,7 @@ $ServiceIdentity = (New-Object System.Security.Principal.NTAccount($ServiceAccou
 )
 $Allow = [System.Security.AccessControl.AccessControlType]::Allow
 
-$LicenseCommand = ('"{0}" --license-helper --token-file "{1}" --listen 127.0.0.1:5041' -f $AgentTarget, $TokenTarget)
+$LicenseCommand = ('"{0}" --license-helper --token-file "{1}" --listen 127.0.0.1:__LSW_LICENSE_HELPER_PORT__' -f $AgentTarget, $TokenTarget)
 $ScLicenseCommand = ConvertTo-ScBinaryPathArgument -Command $LicenseCommand
 $ExistingLicenseService = Get-Service -Name $LicenseServiceName -ErrorAction SilentlyContinue
 if ($null -eq $ExistingLicenseService) {
@@ -513,6 +528,22 @@ $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRul
 )))
 Set-Acl -LiteralPath $TokenTarget -AclObject $Acl
 
+if (-not (Test-Path -LiteralPath $LogTarget -PathType Leaf)) {
+    New-Item -ItemType File -Path $LogTarget | Out-Null
+}
+$LogAcl = New-Object System.Security.AccessControl.FileSecurity
+$LogAcl.SetAccessRuleProtection($true, $false)
+$LogAcl.SetOwner($Administrators)
+foreach ($Identity in @($System, $Administrators)) {
+    $LogAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $Identity, $FullControl, $Allow
+    )))
+}
+$LogAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $ServiceIdentity, [System.Security.AccessControl.FileSystemRights]::Modify, $Allow
+)))
+Set-Acl -LiteralPath $LogTarget -AclObject $LogAcl
+
 # A pre-applied image stages this script below ProgramData. Remove the staged
 # token after the protected service copy exists. Read-only removable install
 # media remains untouched.
@@ -526,7 +557,7 @@ if ($SetupRootFullPath.StartsWith($DataRootFullPath, [System.StringComparison]::
 }
 
 if (-not (Get-NetFirewallRule -DisplayName 'LSW Guest Agent' -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName 'LSW Guest Agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5040 -RemoteAddress 10.0.2.2 | Out-Null
+    New-NetFirewallRule -DisplayName 'LSW Guest Agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort __LSW_AGENT_GUEST_PORT__ -RemoteAddress 10.0.2.2 | Out-Null
 }
 
 & (Join-Path $PSScriptRoot 'apply-profile.ps1')
@@ -544,6 +575,11 @@ if ($StartedService.Status -ne 'Running') {
     throw 'LSWAgent did not remain running after SCM started it.'
 }
 "#
+    .replace("__LSW_AGENT_GUEST_PORT__", &AGENT_GUEST_PORT.to_string())
+    .replace(
+        "__LSW_LICENSE_HELPER_PORT__",
+        &LICENSE_HELPER_GUEST_PORT.to_string(),
+    )
 }
 
 fn profile_script(manifest: &InstanceManifest) -> Result<String> {
@@ -723,6 +759,13 @@ mod tests {
                 .clone(),
         )
         .expect("agent installer should be UTF-8");
+        let license_helper = String::from_utf8(
+            plan.generated
+                .get(Path::new("lsw/license-helper.ps1"))
+                .expect("license helper script should exist")
+                .clone(),
+        )
+        .expect("license helper script should be UTF-8");
         assert!(installer.contains("$ServiceName = 'LSWAgent'"));
         assert!(installer.contains("$ServiceDisplayName = 'LSW Guest Agent'"));
         assert!(installer.contains("$ServiceAccount = 'NT SERVICE\\LSWAgent'"));
@@ -744,7 +787,15 @@ mod tests {
         assert!(installer.contains("$ServiceIdentity"));
         assert!(installer.contains("$LicenseServiceName = 'LSWLicenseHelper'"));
         assert!(installer.contains("--license-helper --token-file"));
-        assert!(installer.contains("--listen 127.0.0.1:5041"));
+        assert!(installer.contains("$LicenseScriptSource"));
+        assert!(installer.contains("$LicenseScriptTarget"));
+        assert!(installer.contains(
+            "Copy-Item -LiteralPath $LicenseScriptSource -Destination $LicenseScriptTarget -Force"
+        ));
+        assert!(installer.contains(&format!("--listen 127.0.0.1:{LICENSE_HELPER_GUEST_PORT}")));
+        assert!(installer.contains(&format!("-LocalPort {AGENT_GUEST_PORT}")));
+        assert!(installer.contains("$LogTarget = Join-Path $DataRoot 'agent.log'"));
+        assert!(installer.contains("Set-Acl -LiteralPath $LogTarget"));
         assert!(installer.contains("'start=', 'demand'"));
         assert!(installer.contains("'obj=', 'LocalSystem'"));
         assert!(installer.contains("$LicenseServiceSddl"));
@@ -762,6 +813,11 @@ mod tests {
         assert!(installer.contains("$SetupRootFullPath.StartsWith($DataRootFullPath"));
         assert!(!installer.contains("New-ItemProperty"));
         assert!(!installer.contains("Start-Process"));
+        assert!(license_helper.contains("[Console]::In.ReadLine()"));
+        assert!(license_helper.contains("[Console]::Out.WriteLine($Value)"));
+        assert!(license_helper.contains("STATUS=unlicensed"));
+        assert!(license_helper.contains("STATUS=activation-requested"));
+        assert!(license_helper.contains("exit 1"));
 
         let wait_for_stop = installer
             .find("$ExistingServiceToStop.WaitForStatus")

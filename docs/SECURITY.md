@@ -47,7 +47,7 @@ separate from the interactive OOBE account; visible desktop GUI integration
 will require a future user-session companion.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
-guest port 5040 only from the QEMU user-network host address. Authentication is
+guest port 35040 only from the QEMU user-network host address. Authentication is
 required before process or file requests, and the agent caps concurrent sessions
 at 32 by default.
 
@@ -147,15 +147,17 @@ The network-facing agent remains the virtual account `NT SERVICE\LSWAgent`.
 Activation does not broaden that service to LocalSystem. The `specialize` pass
 creates a second `LSWLicenseHelper` service with `start=demand`; its service ACL
 grants the agent SID only query/start rights. The helper binds guest loopback
-port 5041, requires the existing per-instance agent token, accepts one bounded
+port 35041, requires the existing per-instance agent token, accepts one bounded
 request, invokes the Windows WMI `InstallProductKey`/`Activate` methods, and
 exits.
 
 Product keys arrive through masked host input or `--key-stdin`, use stdin on the
 authenticated agent session, and are zero-filled in mutable buffers after use.
 They are never argv, environment variables, seed/base-image content, logs, or
-diagnostic material. PowerShell receives the WMI script through its stdin and
-its stderr is discarded so a failed script cannot echo a key.
+diagnostic material. PowerShell runs the fixed, installed
+`license-helper.ps1`; only the bounded action is passed as an argument and a
+product key is supplied to that process through stdin. Helper stderr is
+discarded so a failed WMI operation cannot echo a key.
 
 ## Remaining security work
 

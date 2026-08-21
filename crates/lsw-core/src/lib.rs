@@ -45,7 +45,11 @@ pub use winpe_dism::{
     WINPE_TARGET_DISK_ID, WINPE_VM_TIMEOUT, WINPE_WORKSPACE_DISK_ID, WINPE_WORKSPACE_SIZE_GIB,
 };
 
-pub const AGENT_GUEST_PORT: u16 = 5040;
+// Windows reserves TCP 5040 for the Connected Devices Platform service on
+// clean installations. Keep LSW outside both that system-service collision
+// and Windows' default dynamic client-port range (49152-65535).
+pub const AGENT_GUEST_PORT: u16 = 35040;
+pub const LICENSE_HELPER_GUEST_PORT: u16 = 35041;
 pub const AGENT_TOKEN_FILE: &str = "agent.token";
 pub const DAEMON_PROTOCOL_VERSION: u16 = 2;
 pub const MANIFEST_FILE: &str = "instance.lsw";

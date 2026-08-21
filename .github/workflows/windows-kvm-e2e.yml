@@ -127,7 +127,7 @@ jobs:
             awk cargo findmnt git grep id python3 qemu-img \
             qemu-system-x86_64 realpath remote-viewer rustc rustup \
             script setsid sha256sum stat swtpm timeout tr \
-            wimlib-imagex xorriso \
+            7z wimlib-imagex xorriso \
             x86_64-w64-mingw32-gcc; do
             if ! command -v "$command" >/dev/null 2>&1; then
               echo "error: required runner command was not found: $command" >&2

@@ -23,14 +23,16 @@ use lsw_core::{
     CAPABILITY_SESSION_LEASE_V1, SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
-use lsw_core::{TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_TERMINAL_RESIZE_V1};
+use lsw_core::{
+    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_TERMINAL_RESIZE_V1, LICENSE_HELPER_GUEST_PORT,
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_SESSIONS: usize = 32;
 #[cfg(windows)]
-const LICENSE_HELPER_PORT: u16 = 5041;
+const LICENSE_HELPER_PORT: u16 = LICENSE_HELPER_GUEST_PORT;
 #[cfg(windows)]
 const LICENSE_HELPER_SERVICE: &str = "LSWLicenseHelper";
 
@@ -47,8 +49,33 @@ fn main() -> ExitCode {
 fn write_stderr(message: std::fmt::Arguments<'_>) {
     // Windows services commonly have no valid standard handles. Logging must
     // remain best-effort so a missing console cannot unwind the service main.
+    #[cfg(windows)]
+    append_windows_service_log(message);
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "{message}");
+}
+
+#[cfg(windows)]
+fn append_windows_service_log(message: std::fmt::Arguments<'_>) {
+    const MAX_LOG_BYTES: u64 = 64 * 1024;
+
+    let Some(program_data) = env::var_os("ProgramData") else {
+        return;
+    };
+    let path = PathBuf::from(program_data).join("LSW").join("agent.log");
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= MAX_LOG_BYTES) {
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path);
+    }
+    let Ok(mut log) = fs::OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let _ = writeln!(log, "{timestamp} {message}");
 }
 
 #[cfg(windows)]
@@ -153,6 +180,10 @@ fn run_license_helper(
     loop {
         match listener.accept() {
             Ok((mut stream, peer)) if peer.ip().is_loopback() => {
+                // A socket accepted from the stoppable nonblocking listener can
+                // inherit nonblocking mode on Windows. The bounded helper
+                // protocol uses ordinary blocking reads with explicit timeouts.
+                stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(10)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(120)))?;
                 if handle_license_helper_connection(&mut stream, &token)? {
@@ -245,63 +276,22 @@ fn perform_windows_license_operation(
     action: &str,
     key: &[u8],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    const STATUS_SCRIPT: &[u8] = br#"$ErrorActionPreference = 'Stop'
-$ApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f'
-$Product = Get-CimInstance -ClassName SoftwareLicensingProduct | Where-Object {
-    $_.ApplicationID -eq $ApplicationId -and $_.Name -like 'Windows*' -and $null -ne $_.PartialProductKey
-} | Sort-Object -Property LicenseStatus -Descending | Select-Object -First 1
-if ($null -eq $Product -or $Product.LicenseStatus -ne 1) {
-    Write-Output 'STATUS=unlicensed'
-} else {
-    Write-Output 'STATUS=licensed'
-}
-if ($null -ne $Product) { Write-Output ('LICENSE_STATUS={0}' -f $Product.LicenseStatus) }
-"#;
-    const ACTIVATE_PREFIX: &[u8] = br#"$ErrorActionPreference = 'Stop'
-$Key = '"#;
-    const ACTIVATE_SUFFIX: &[u8] = br#"'
-$Service = Get-CimInstance -ClassName SoftwareLicensingService
-$Install = Invoke-CimMethod -InputObject $Service -MethodName InstallProductKey -Arguments @{ ProductKey = $Key }
-if ($Install.ReturnValue -ne 0) { throw 'InstallProductKey failed' }
-$ApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f'
-$PartialKey = $Key.Substring($Key.Length - 5)
-$Product = Get-CimInstance -ClassName SoftwareLicensingProduct | Where-Object {
-    $_.ApplicationID -eq $ApplicationId -and $_.PartialProductKey -eq $PartialKey
-} | Select-Object -First 1
-if ($null -eq $Product) { throw 'Installed Windows product was not found' }
-$Activation = Invoke-CimMethod -InputObject $Product -MethodName Activate
-if ($Activation.ReturnValue -ne 0) { throw 'Activate failed' }
-Write-Output 'STATUS=activation-requested'
-"#;
-    const ONLINE_SCRIPT: &[u8] = br#"$ErrorActionPreference = 'Stop'
-$ApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f'
-$Product = Get-CimInstance -ClassName SoftwareLicensingProduct | Where-Object {
-    $_.ApplicationID -eq $ApplicationId -and $_.Name -like 'Windows*' -and $null -ne $_.PartialProductKey
-} | Sort-Object -Property LicenseStatus -Descending | Select-Object -First 1
-if ($null -eq $Product) { throw 'No installed Windows product key was found' }
-$Activation = Invoke-CimMethod -InputObject $Product -MethodName Activate
-if ($Activation.ReturnValue -ne 0) { throw 'Activate failed' }
-Write-Output 'STATUS=activation-requested'
-"#;
-
-    let mut script = match action {
-        "status" => STATUS_SCRIPT.to_vec(),
-        "online" => ONLINE_SCRIPT.to_vec(),
-        "activate" if valid_product_key(key) => {
-            let mut script = ACTIVATE_PREFIX.to_vec();
-            script.extend_from_slice(key);
-            script.extend_from_slice(ACTIVATE_SUFFIX);
-            script
-        }
-        _ => return Err("unsupported activation helper operation".into()),
-    };
-    let result = run_license_powershell(&script);
-    script.fill(0);
-    result
+    if !matches!(action, "status" | "online") && !(action == "activate" && valid_product_key(key)) {
+        return Err("unsupported activation helper operation".into());
+    }
+    run_license_powershell(action, key)
 }
 
 #[cfg(windows)]
-fn run_license_powershell(script: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+fn run_license_powershell(action: &str, key: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+    let script = env::current_exe()?.with_file_name("license-helper.ps1");
+    let metadata = fs::symlink_metadata(&script)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 64 * 1024
+    {
+        return Err("the installed activation helper script is invalid".into());
+    }
     let mut child = Command::new("powershell.exe")
         .args([
             "-NoLogo",
@@ -309,18 +299,23 @@ fn run_license_powershell(script: &[u8]) -> Result<String, Box<dyn std::error::E
             "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-Command",
-            "-",
+            "-File",
         ])
+        .arg(&script)
+        .arg(action)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
-    child
+    let mut stdin = child
         .stdin
         .take()
-        .ok_or("PowerShell stdin was unavailable")?
-        .write_all(script)?;
+        .ok_or("PowerShell stdin was unavailable")?;
+    if !key.is_empty() {
+        stdin.write_all(key)?;
+        stdin.write_all(b"\n")?;
+    }
+    drop(stdin);
     let output = child.wait_with_output()?;
     if !output.status.success() {
         return Err("Windows WMI licensing operation failed".into());
@@ -328,7 +323,11 @@ fn run_license_powershell(script: &[u8]) -> Result<String, Box<dyn std::error::E
     if output.stdout.len() > 16 * 1024 {
         return Err("Windows WMI licensing response was too large".into());
     }
-    Ok(String::from_utf8(output.stdout)?)
+    let output = String::from_utf8(output.stdout)?;
+    if !output.lines().any(|line| line.starts_with("STATUS=")) {
+        return Err("Windows WMI licensing operation returned no status".into());
+    }
+    Ok(output)
 }
 
 fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Error>> {
@@ -595,6 +594,11 @@ fn handle_connection(
     mut stream: TcpStream,
     expected_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Windows can propagate a listening socket's nonblocking mode to accepted
+    // sockets. Service mode makes the listener nonblocking so SCM stop signals
+    // remain responsive; each independent session must return to blocking I/O
+    // before its bounded handshake starts.
+    stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
     stream.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
@@ -1100,15 +1104,22 @@ fn bridge_process(
         session_end,
         SessionEnd::Disconnected | SessionEnd::LeaseExpired
     );
-    let _ = input_shutdown.shutdown(if session_end == SessionEnd::LeaseExpired {
-        Shutdown::Both
-    } else {
-        Shutdown::Read
-    });
-    join_input_bridge(input_thread)?;
-    join_bridge(stdout_thread, peer_unavailable)?;
-    join_bridge(stderr_thread, peer_unavailable)?;
-    finish_session(&writer, session_end, status.code().unwrap_or(255))
+    if peer_unavailable {
+        let _ = input_shutdown.shutdown(Shutdown::Both);
+    }
+    let result = (|| {
+        join_bridge(stdout_thread, peer_unavailable)?;
+        join_bridge(stderr_thread, peer_unavailable)?;
+        finish_session(&writer, session_end, status.code().unwrap_or(255))
+    })();
+    // On Windows, shutting down only the read half of one duplicated socket
+    // handle does not reliably wake a blocking recv on another handle. Send
+    // the final output/EXIT first, then close both directions so the input
+    // bridge cannot retain a completed session until its next heartbeat.
+    let _ = input_shutdown.shutdown(Shutdown::Both);
+    let input_result = join_input_bridge(input_thread);
+    result?;
+    input_result
 }
 
 #[cfg(windows)]
@@ -1811,7 +1822,7 @@ impl Configuration {
                 "--help" | "-h" => {
                     println!(
                         "lsw-agent --token-file PATH [--listen IP:PORT] [--max-sessions N] [--once] [--service]\n\
-                         The default listener is 0.0.0.0:5040 inside the restricted guest network.\n\
+                         The default listener is 0.0.0.0:35040 inside the restricted guest network.\n\
                          --service runs LSWAgent under the Windows Service Control Manager."
                     );
                     std::process::exit(0);

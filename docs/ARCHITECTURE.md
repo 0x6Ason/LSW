@@ -41,11 +41,13 @@ validation claims in the beta.5 candidate.
    manifests receive the default idle-timeout setting.
 2. The installer selects Windows 11 Pro by WIM metadata unless the user chooses
    another edition. A network-disabled WinPE microVM uses the official media's
-   DISM to export and service a profile-specific WIM in a private workspace. A
-   second network-disabled WinPE phase partitions only the instance disk,
-   applies that WIM, stages the agent/unattend payload, and creates UEFI boot
-   files. After exact serial completion markers, LSW removes the workspace and
-   every token-bearing seed before starting the installed disk normally.
+   DISM to export and service a profile-specific WIM in a private workspace,
+   stages the agent/unattend payload while that WIM is mounted, and commits it.
+   A second network-disabled WinPE phase partitions only the instance disk,
+   applies that WIM, creates UEFI boot files, and validates the resulting qcow2.
+   After exact markers on private writable status volumes, LSW removes
+   the workspace, ephemeral control ISO, and every token-bearing seed before
+   marking the instance installed and starting its disk normally.
 3. `lswd` waits for the swtpm and QMP Unix sockets before reporting success. It
    owns child handles while running and reconciles a surviving VM through QMP
    after daemon restart.
@@ -87,7 +89,8 @@ instances/NAME/
   winpe-seed/           transient prepare control seed
   winpe-apply-seed/     transient apply control seed
   swtpm-state/          vTPM state
-  run/                  QMP, VNC, swtpm sockets and ephemeral overlay
+  run/                  QMP/VNC/swtpm sockets, retained WinPE logs/status,
+                        and transient control media during installation
 ```
 
 ## Control and guest protocols
@@ -138,7 +141,7 @@ On the Codex VPS, Ubuntu's QEMU 8.2.2, OVMF and swtpm packages were staged in a
 temporary root because they were not preinstalled. With TCG, the test created
 and checked a qcow2 disk, entered OVMF, observed vTPM command traffic, drove TCP
 QMP through `stop`, `cont` and `quit`, and connected to two loopback-only usernet
-host-forward endpoints targeting guest ports 5040 and 8080. Both host ports were
+host-forward endpoints targeting guest ports 35040 and 8080. Both host ports were
 released after QMP quit, and QEMU and swtpm exited with status zero. CI now
 repeats a timeout-bounded version of this firmware-level smoke with distribution
 packages. A second, non-skippable CI gate uses the actual `lsw`

@@ -52,16 +52,13 @@ impl Supervisor {
                 .get_mut(&name)
                 .and_then(|managed| managed.qemu.try_wait().ok().flatten());
             if let Some(status) = exit {
+                let shutdown_requested = shutdown_was_requested(&self.store, &name);
                 if let Some(mut managed) = self.processes.remove(&name) {
                     stop_helpers(&mut managed.helpers);
                     remove_shutdown_marker(&self.store, &name);
                     cleanup_stopped_runtime_artifacts(&self.store, &name);
                     self.remove_ephemeral_overlay(&name);
-                    let next = if status.success() {
-                        InstanceState::Stopped
-                    } else {
-                        InstanceState::Failed
-                    };
+                    let next = state_after_qemu_exit(shutdown_requested, status.success());
                     if let Err(error) = self.set_state(&name, next) {
                         eprintln!("lswd: could not update {name:?} after QEMU exit: {error}");
                     }
@@ -76,6 +73,7 @@ impl Supervisor {
                     .any(|helper| helper.try_wait().ok().flatten().is_some())
             });
             if helper_exited {
+                let shutdown_requested = shutdown_was_requested(&self.store, &name);
                 if let Some(mut managed) = self.processes.remove(&name) {
                     let _ = managed.qemu.kill();
                     let _ = managed.qemu.wait();
@@ -84,8 +82,13 @@ impl Supervisor {
                 remove_shutdown_marker(&self.store, &name);
                 cleanup_stopped_runtime_artifacts(&self.store, &name);
                 self.remove_ephemeral_overlay(&name);
-                if let Err(error) = self.set_state(&name, InstanceState::Failed) {
-                    eprintln!("lswd: could not mark {name:?} failed after helper exit: {error}");
+                let next = if shutdown_requested {
+                    InstanceState::Stopped
+                } else {
+                    InstanceState::Failed
+                };
+                if let Err(error) = self.set_state(&name, next) {
+                    eprintln!("lswd: could not update {name:?} after helper exit: {error}");
                 }
             }
         }
@@ -290,11 +293,7 @@ impl Supervisor {
                     manifest.state,
                     InstanceState::Running | InstanceState::Installing | InstanceState::Suspended
                 ) {
-                    let requested = self
-                        .store
-                        .instance_dir(name)?
-                        .join("run/shutdown.requested")
-                        .is_file();
+                    let requested = shutdown_was_requested(&self.store, name);
                     let state = if requested {
                         InstanceState::Stopped
                     } else {
@@ -532,6 +531,27 @@ fn write_shutdown_marker(instance_dir: &Path) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn shutdown_was_requested(store: &StateStore, name: &str) -> bool {
+    let Ok(path) = store
+        .instance_dir(name)
+        .map(|directory| directory.join("run/shutdown.requested"))
+    else {
+        return false;
+    };
+    matches!(
+        fs::symlink_metadata(path),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+    )
+}
+
+fn state_after_qemu_exit(shutdown_requested: bool, exit_success: bool) -> InstanceState {
+    if shutdown_requested || exit_success {
+        InstanceState::Stopped
+    } else {
+        InstanceState::Failed
+    }
+}
+
 fn remove_shutdown_marker(store: &StateStore, name: &str) {
     let Ok(path) = store
         .instance_dir(name)
@@ -712,5 +732,12 @@ mod tests {
             "win"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn requested_shutdown_wins_qemu_exit_status() {
+        assert_eq!(state_after_qemu_exit(true, false), InstanceState::Stopped);
+        assert_eq!(state_after_qemu_exit(false, true), InstanceState::Stopped);
+        assert_eq!(state_after_qemu_exit(false, false), InstanceState::Failed);
     }
 }

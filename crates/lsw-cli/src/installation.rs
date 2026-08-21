@@ -221,6 +221,12 @@ fn install_new_instance(
     cleanup_winpe_preinstallation(&instance_dir)?;
     println!("Prepared Windows image applied to the instance disk.");
 
+    // The two WinPE phases install a bootable Windows image without going
+    // through the daemon's legacy ISO-install phase. Publish that completed
+    // transition before requesting a normal run; the daemon deliberately
+    // rejects Run for a still-Configured instance.
+    mark_winpe_install_complete(store, &manifest)?;
+
     start_named_instance(store, name, LaunchPhase::Run)?;
     if !parsed.no_viewer {
         launch_installation_viewer(store, name)?;
@@ -304,7 +310,13 @@ fn run_winpe_preinstallation(
         "Preparing {} with official WinPE DISM (network disabled)...",
         edition.name
     );
-    let prepare = WinPeDismBackend::plan(manifest.spec.profile, edition.index, instance_dir)?;
+    let prepare = WinPeDismBackend::plan_with_guest_setup(
+        manifest,
+        edition.index,
+        instance_dir,
+        install_seed,
+        locale,
+    )?;
     WinPeDismBackend::write_seed(&prepare)?;
     let prepare_vm = WinPeDismBackend::plan_vm(
         capabilities.clone(),
@@ -319,7 +331,7 @@ fn run_winpe_preinstallation(
     );
 
     println!("Applying the prepared image to the LSW-owned qcow2 disk...");
-    let apply = WinPeDismBackend::plan_apply(manifest, instance_dir, install_seed, locale)?;
+    let apply = WinPeDismBackend::plan_apply(manifest, instance_dir)?;
     WinPeDismBackend::write_apply_seed(&apply)?;
     let apply_vm = WinPeDismBackend::plan_vm(
         capabilities.clone(),
@@ -336,7 +348,12 @@ fn run_winpe_preinstallation(
 }
 
 fn cleanup_winpe_preinstallation(instance_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    for directory in ["seed", "winpe-seed", "winpe-apply-seed"] {
+    for directory in [
+        "seed",
+        "winpe-seed",
+        "winpe-apply-seed",
+        "run/winpe-control-root",
+    ] {
         remove_transient_path(&instance_dir.join(directory), true)?;
     }
     for file in [
@@ -345,9 +362,27 @@ fn cleanup_winpe_preinstallation(instance_dir: &Path) -> Result<(), Box<dyn std:
         "run/winpe-apply-OVMF_VARS.fd",
         "run/winpe-prepare-qmp.sock",
         "run/winpe-apply-qmp.sock",
+        "run/winpe-control.iso",
     ] {
         remove_transient_path(&instance_dir.join(file), false)?;
     }
+    Ok(())
+}
+
+fn mark_winpe_install_complete(
+    store: &StateStore,
+    manifest: &InstanceManifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if manifest.state != InstanceState::Configured {
+        return Err(format!(
+            "refusing to complete WinPE installation from unexpected state {}",
+            manifest.state
+        )
+        .into());
+    }
+    let mut installed = manifest.clone();
+    installed.state = InstanceState::Stopped;
+    store.update(&installed)?;
     Ok(())
 }
 
@@ -422,6 +457,9 @@ fn ensure_install_dependencies(
     if needs_media_tools && capabilities.xorriso.is_none() {
         missing.push("xorriso");
     }
+    if needs_media_tools && capabilities.seven_zip.is_none() {
+        missing.push("7z (UDF-capable ISO extractor)");
+    }
     if needs_viewer && capabilities.remote_viewer.is_none() {
         missing.push("remote-viewer");
     }
@@ -439,6 +477,9 @@ fn ensure_install_dependencies(
         }
         if needs_media_tools && capabilities.xorriso.is_none() {
             remaining.push("xorriso");
+        }
+        if needs_media_tools && capabilities.seven_zip.is_none() {
+            remaining.push("7z (UDF-capable ISO extractor)");
         }
         if needs_viewer && capabilities.remote_viewer.is_none() {
             remaining.push("remote-viewer");
@@ -564,4 +605,55 @@ fn find_windows_agent() -> Option<PathBuf> {
             metadata.file_type().is_file() && !metadata.file_type().is_symlink()
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use lsw_core::NetworkMode;
+
+    use super::*;
+
+    #[test]
+    fn completed_winpe_install_transitions_to_stopped_before_normal_run() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = env::temp_dir().join(format!("lsw-install-transition-{nonce}"));
+        fs::create_dir(&root).expect("fixture root should be created");
+        let iso = root.join("windows.iso");
+        fs::write(&iso, b"fixture media").expect("fixture ISO should be written");
+        let manifest = InstanceManifest::new(InstanceSpec {
+            name: format!("winpe-transition-{}", std::process::id()),
+            source_iso: iso,
+            profile: WindowsProfile::Slim,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("fixture manifest should be valid");
+        let store = StateStore::new(root.join("state"));
+        store.create(&manifest).expect("instance should be stored");
+
+        mark_winpe_install_complete(&store, &manifest)
+            .expect("completed WinPE install should become runnable");
+        assert_eq!(
+            store
+                .load(&manifest.spec.name)
+                .expect("updated instance should load")
+                .state,
+            InstanceState::Stopped
+        );
+
+        let mut unexpected = manifest.clone();
+        unexpected.state = InstanceState::Running;
+        assert!(mark_winpe_install_complete(&store, &unexpected).is_err());
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
 }

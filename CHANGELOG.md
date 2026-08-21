@@ -8,16 +8,27 @@
   signed URLs, verifies Microsoft's exact SHA-256, selects Pro, and retains
   `--iso` for offline media.
 - Added the network-disabled `WinPeDismBackend`: it boots the official ISO's
-  WinPE, uses real Windows DISM to export/mount/service a prepared WIM, then
-  applies it to the instance qcow2 with UEFI boot files and a boot-time agent.
-  Temporary WIM workspace and token-bearing seeds are removed after success.
+  WinPE through an ephemeral no-prompt control ISO, uses real Windows DISM to
+  export/mount/service a prepared WIM, stages the boot-time agent and answer
+  file inside that WIM, then applies it to the instance qcow2 with UEFI boot
+  files. Private status volumes retain bounded completion evidence; temporary
+  control media, WIM workspace, and token-bearing seeds are removed after
+  success.
+- Kept DISM mount/export/commit integrity checks but deliberately avoided
+  `/Mount-Image /Optimize`: repeated Windows 11 25H2 KVM installs reached
+  `PROCESS1_INITIALIZATION_FAILED (0x6B)` on the optimized path, while the
+  ordinary mount completed specialize and brought the SCM agent online. The
+  pre-applied payload now has a tested six-file allowlist that includes the
+  static activation helper, and the installer preserves the inherited Program
+  Files ACL instead of replacing it during specialize.
 - Added `lsw doctor --fix`, `config get/set`, `logs`, `view`, redacted
   `diagnose --bundle`, safe `remove`, `shutdown --all`, and `bench --json`.
   Manifest v4 persists `idle-timeout`; `memory.max` takes effect on the next VM
   start. Automatic idle hibernation remains beta.7 work.
-- Added Windows media metadata inspection through xorriso and wimlib, friendly
-  edition aliases such as `pro`, UTF-8/UTF-16 WIM XML handling, and answer-file
-  XML escaping. Numeric image indexes remain an advanced compatibility option.
+- Added Windows media metadata inspection through xorriso, a UDF-capable `7z`
+  fallback, and wimlib; friendly edition aliases such as `pro`; UTF-8/UTF-16
+  WIM XML handling; and answer-file XML escaping. Numeric image indexes remain
+  an advanced compatibility option.
 - Replaced the old public profile names with versioned declarative `vanilla`
   and default `slim` manifests. The schema permits only bounded AppX selectors
   and CompactOS, and enforces preservation of servicing, Defender, Store,
@@ -28,10 +39,23 @@
   `NT SERVICE\LSWAgent`. Agent commands intentionally execute in that service
   identity and do not require a stored user password or automatic logon. The
   pre-applied flow installs it during `specialize`, before interactive login.
+- Moved the guest agent and activation-helper listeners to ports 35040/35041
+  after clean Windows 11 testing found TCP 5040 occupied by the Connected
+  Devices Platform service. SCM sessions now restore blocking mode on accepted
+  sockets, completed commands close both duplicated socket directions without
+  waiting for the 30-second heartbeat, and bounded service errors are retained
+  in the ACL-protected `C:\ProgramData\LSW\agent.log`.
 - Added `lsw license status/activate/open`. Product keys use masked input or
   stdin and never argv/environment/seed/base/log/diagnostic storage. A separate
   authenticated, guest-loopback, demand-start LocalSystem helper performs only
-  WMI `InstallProductKey`/`Activate`; the main agent remains narrow.
+  WMI `InstallProductKey`/`Activate`; the main agent remains narrow. The helper
+  runs a fixed, size-bounded script installed with the agent; the requested
+  action is its only argument and a product key remains stdin-only.
+- Detached daemon startup now enters a new session with `setsid`, so a one-shot
+  `wsl.exe lsw start` cannot hang up `lswd` and its VM when that invocation
+  exits. Graceful shutdown records intent before QEMU/helper cleanup, ensuring
+  the supervisor classifies the resulting exit as `stopped` and removes only
+  live runtime PID/socket/viewer markers.
 - Added cleanup of QEMU pid/viewer artifacts and stale runtime sockets after a
   stopped guest, plus a guarded real Windows/KVM operator workflow covering
   Setup, OOBE user credential policy, Windows build/edition identity, the

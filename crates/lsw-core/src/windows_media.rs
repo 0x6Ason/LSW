@@ -48,11 +48,13 @@ impl WindowsMediaInspector {
                 reason: format!("{} is not a regular file", iso.display()),
             });
         }
-        let xorriso = self
-            .capabilities
-            .xorriso
-            .as_ref()
-            .ok_or_else(|| LswError::MissingCapabilities(vec!["xorriso"]))?;
+        let xorriso = self.capabilities.xorriso.as_ref();
+        let seven_zip = self.capabilities.seven_zip.as_ref();
+        if xorriso.is_none() && seven_zip.is_none() {
+            return Err(LswError::MissingCapabilities(vec![
+                "xorriso or 7z (UDF-capable ISO extractor)",
+            ]));
+        }
         let wimlib = self
             .capabilities
             .wimlib_imagex
@@ -77,25 +79,49 @@ impl WindowsMediaInspector {
             ("/sources/install.esd", "install.esd"),
         ] {
             let destination = temporary.0.join(filename);
-            let output = Command::new(xorriso)
-                .args(["-osirrox", "on", "-indev"])
-                .arg(iso)
-                .args(["-extract", source])
-                .arg(&destination)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .output()?;
-            if output.status.success() && destination.is_file() {
-                extracted = Some(destination);
-                break;
+            if let Some(xorriso) = xorriso {
+                let output = Command::new(xorriso)
+                    .args(["-osirrox", "on", "-indev"])
+                    .arg(iso)
+                    .args(["-extract", source])
+                    .arg(&destination)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .output()?;
+                if output.status.success() && destination.is_file() {
+                    extracted = Some(destination.clone());
+                    break;
+                }
+                errors.push(format!(
+                    "xorriso: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+                let _ = fs::remove_file(&destination);
             }
-            errors.push(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-            let _ = fs::remove_file(destination);
+            if let Some(seven_zip) = seven_zip {
+                let output = Command::new(seven_zip)
+                    .args(["e", "-y", "-bd", "-bso0", "-bsp0"])
+                    .arg(format!("-o{}", temporary.0.display()))
+                    .arg(iso)
+                    .arg(source.trim_start_matches('/'))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .output()?;
+                if output.status.success() && destination.is_file() {
+                    extracted = Some(destination.clone());
+                    break;
+                }
+                errors.push(format!(
+                    "7z: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+                let _ = fs::remove_file(&destination);
+            }
         }
         let extracted = extracted.ok_or_else(|| LswError::InvalidValue {
             field: "Windows installation media",
             reason: format!(
-                "could not extract sources/install.wim or sources/install.esd with xorriso{}",
+                "could not extract sources/install.wim or sources/install.esd with xorriso/7z{}",
                 compact_errors(&errors)
             ),
         })?;
@@ -255,6 +281,13 @@ fn set_private_directory_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("fixture executable should be written");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("fixture executable should be executable");
+    }
+
     #[test]
     fn parses_wim_xml_and_matches_friendly_edition_aliases() {
         let xml = r#"<WIM><IMAGE INDEX="1"><NAME>Windows 11 Home</NAME><WINDOWS><EDITIONID>Core</EDITIONID></WINDOWS></IMAGE><IMAGE INDEX="6"><NAME>Windows 11 Pro</NAME><WINDOWS><EDITIONID>Professional</EDITIONID></WINDOWS></IMAGE></WIM>"#;
@@ -273,5 +306,54 @@ mod tests {
             bytes.extend(unit.to_le_bytes());
         }
         assert_eq!(decode_xml(&bytes).expect("UTF-16 should decode"), "<WIM/>");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn udf_media_falls_back_from_xorriso_to_seven_zip() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lsw-udf-media-test-{nonce}"));
+        fs::create_dir(&root).expect("fixture should be created");
+        let iso = root.join("windows.iso");
+        fs::write(&iso, b"UDF fixture").expect("fixture ISO should be written");
+
+        let xorriso = root.join("xorriso");
+        write_executable(&xorriso, "#!/bin/sh\nexit 1\n");
+        let seven_zip = root.join("7z");
+        write_executable(
+            &seven_zip,
+            "#!/bin/sh\n\
+             output=\n\
+             source=\n\
+             for argument in \"$@\"; do\n\
+               case \"$argument\" in\n\
+                 -o*) output=${argument#-o} ;;\n\
+                 sources/install.wim) source=install.wim ;;\n\
+               esac\n\
+             done\n\
+             [ -n \"$output\" ] && [ \"$source\" = install.wim ] || exit 2\n\
+             printf wim > \"$output/$source\"\n",
+        );
+        let wimlib = root.join("wimlib-imagex");
+        write_executable(
+            &wimlib,
+            "#!/bin/sh\n\
+             printf %s '<WIM><IMAGE INDEX=\"6\"><NAME>Windows 11 Pro</NAME><WINDOWS><EDITIONID>Professional</EDITIONID></WINDOWS></IMAGE></WIM>'\n",
+        );
+
+        let mut capabilities = HostCapabilities::unavailable(crate::HostPlatform::Linux);
+        capabilities.xorriso = Some(xorriso);
+        capabilities.seven_zip = Some(seven_zip);
+        capabilities.wimlib_imagex = Some(wimlib);
+        let editions = WindowsMediaInspector::new(capabilities)
+            .inspect(&iso, &root.join("scratch"))
+            .expect("7z should expose the install WIM from UDF media");
+        assert_eq!(editions.len(), 1);
+        assert_eq!(editions[0].index, 6);
+        assert!(editions[0].matches("pro"));
+        fs::remove_dir_all(root).expect("fixture should be removed");
     }
 }

@@ -60,7 +60,7 @@ non-system installation; the individual `LSW_QEMU_SYSTEM`, `LSW_QEMU_IMG`,
 
 The Codex VPS run staged official Ubuntu packages and passed this path with
 QEMU 8.2.2, TCG, OVMF, swtpm/vTPM, TCP QMP, and two loopback host-forward
-endpoints targeting guest ports 5040 and 8080. The endpoints were released
+endpoints targeting guest ports 35040 and 8080. The endpoints were released
 after quit and both QEMU and swtpm exited with status zero. `/dev/kvm` and a
 Windows ISO were unavailable, so Windows Setup, agent login, and ConPTY were
 not exercised.
