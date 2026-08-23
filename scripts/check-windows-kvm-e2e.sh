@@ -869,6 +869,7 @@ cached_unattend_removed=true
 setup_payload_removed=true
 automatic_logon=false
 
+pid_file="$LSW_STATE_DIR/instances/$instance/run/qemu.pid"
 clone_instance="${instance}-clone"
 clone_source_pid=$(awk 'NR == 1 { print $1 }' "$pid_file")
 clone_agent_port=$(
@@ -1321,7 +1322,6 @@ if [ -n "$artifact_dir" ]; then
     chmod 600 "$artifact_dir/bench.json"
 fi
 
-pid_file="$LSW_STATE_DIR/instances/$instance/run/qemu.pid"
 qemu_pid=
 agent_port=$(
     "$lsw" show "$instance" |
