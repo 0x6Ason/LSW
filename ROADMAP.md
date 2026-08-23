@@ -48,11 +48,18 @@ and gives desktop work a safe file-sharing foundation.
 - Establish the Windows interactive-user companion and authenticated bulk
   transport needed by later GUI, clipboard, and drag-and-drop work without
   weakening the Session 0 service boundary.
-- Add `lsw user setup` and an optional post-install prompt for a permanent
-  standard Windows desktop user. Terminal-only installs may defer it. Username
-  validation and masked password confirmation must be local; the password must
-  never enter argv, environment, the manifest, installation seed, logs, or
-  diagnostics. Administrator membership requires a separate explicit choice.
+- After the agent becomes ready, make interactive `lsw install` enter a
+  WSL-style registration flow before returning: create a permanent standard
+  Windows desktop user and make it the instance's default interactive identity.
+  Do not silently reuse the temporary `LSWSetup` account or derive a username
+  from the Linux host without confirmation.
+- Add `lsw user setup [NAME]` for deferred and recovery setup. Interactive users
+  may explicitly defer; noninteractive automation must either use a dedicated
+  secure credential-input path or pass `--defer-user-setup`. Username validation
+  and masked password confirmation must be local. The agent must create the
+  account through native Windows account APIs, and the password must never enter
+  argv, environment, the manifest, installation seed, logs, or diagnostics.
+  Administrator membership requires a separate explicit choice.
 - Do not enable Windows AutoLogon. A desktop session may request the password at
   launch or use an explicitly enabled Linux Secret Service/keyring entry; the
   normal SCM agent must remain usable before any interactive user signs in.
