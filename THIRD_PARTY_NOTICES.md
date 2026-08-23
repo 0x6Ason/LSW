@@ -8,6 +8,14 @@ under `source/vendor/`, plus an offline Cargo source configuration. This keeps
 the binary bundle's corresponding source self-contained instead of relying on
 the crates.io service at rebuild time.
 
+## Windows Subsystem for Linux UX acknowledgement
+
+LSW's name and command-line lifecycle conventions are inspired by the
+MIT-licensed [Microsoft WSL project](https://github.com/microsoft/WSL). Thanks
+to Microsoft and the WSL contributors for publishing that naming and UX
+reference. LSW does not incorporate WSL source code and is not affiliated with
+or endorsed by Microsoft.
+
 ## windows-iso-downloader / MSDL
 
 LSW's Rust implementation of the Microsoft Windows ISO session flow is based

@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Unit]
+Description=LSW local Windows runtime daemon
+Requires=lswd.socket
+After=lswd.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lswd
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/lsw
+
+[Install]
+Also=lswd.socket

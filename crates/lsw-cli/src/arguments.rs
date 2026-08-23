@@ -6,9 +6,13 @@
 //! explicit path values, while all state mutation remains in command modules.
 
 use std::ffi::OsString;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
-use lsw_core::{InstallSeedOptions, NetworkMode, PortForward, WindowsProfile};
+use lsw_core::{
+    control_port_for_instance, InstallSeedOptions, NetworkMode, PortForward, WindowsProfile,
+    AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START,
+};
 
 use super::absolute_path;
 
@@ -23,7 +27,7 @@ pub(super) struct InstallArguments {
     pub(super) memory_mib: u32,
     pub(super) disk_gib: Option<u32>,
     pub(super) network: NetworkMode,
-    pub(super) port_forwards: Vec<PortForward>,
+    pub(super) port_forwards: Vec<PortForwardRequest>,
     pub(super) allow_unsupported_requirements: bool,
     pub(super) seed: InstallSeedOptions,
     pub(super) without_agent: bool,
@@ -100,9 +104,8 @@ impl InstallArguments {
                     parsed.create_option_seen = true;
                 }
                 "--publish" => {
-                    parsed
-                        .port_forwards
-                        .push(next_value(arguments, &mut index, argument)?.parse()?);
+                    let value = next_value(arguments, &mut index, argument)?;
+                    parsed.port_forwards.push(parse_publish(value)?);
                     parsed.create_option_seen = true;
                 }
                 "--locale" => {
@@ -170,7 +173,7 @@ pub(super) struct CreateArguments {
     pub(super) memory_mib: u32,
     pub(super) disk_gib: Option<u32>,
     pub(super) network: NetworkMode,
-    pub(super) port_forwards: Vec<PortForward>,
+    pub(super) port_forwards: Vec<PortForwardRequest>,
     pub(super) accept_license: bool,
     pub(super) allow_unsupported_requirements: bool,
 }
@@ -209,7 +212,8 @@ impl CreateArguments {
                 "--disk" => disk_gib = Some(parse_number(arguments, &mut index, option)?),
                 "--network" => network = next_value(arguments, &mut index, option)?.parse()?,
                 "--publish" => {
-                    port_forwards.push(next_value(arguments, &mut index, option)?.parse()?);
+                    let value = next_value(arguments, &mut index, option)?;
+                    port_forwards.push(parse_publish(value)?);
                 }
                 "--accept-license" => accept_license = true,
                 "--allow-unsupported-requirements" => allow_unsupported_requirements = true,
@@ -231,6 +235,70 @@ impl CreateArguments {
             allow_unsupported_requirements,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum PortForwardRequest {
+    Fixed(PortForward),
+    Dynamic(u16),
+}
+
+fn parse_publish(value: &str) -> Result<PortForwardRequest, Box<dyn std::error::Error>> {
+    let (host, guest) = value
+        .split_once(':')
+        .ok_or("--publish requires HOST:GUEST or auto:GUEST")?;
+    if host != "auto" && host != "0" {
+        return Ok(PortForwardRequest::Fixed(value.parse()?));
+    }
+    let guest_port = guest
+        .parse::<u16>()
+        .map_err(|error| format!("invalid guest port in {value:?}: {error}"))?;
+    if guest_port == 0 {
+        return Err("published guest port must be between 1 and 65535".into());
+    }
+    Ok(PortForwardRequest::Dynamic(guest_port))
+}
+
+pub(super) fn resolve_port_forwards(
+    requests: &[PortForwardRequest],
+    instance_name: &str,
+) -> Result<Vec<PortForward>, Box<dyn std::error::Error>> {
+    let mut resolved = Vec::with_capacity(requests.len());
+    let reserved_control_port = control_port_for_instance(instance_name)?;
+    let fixed_host_ports = requests
+        .iter()
+        .filter_map(|request| match request {
+            PortForwardRequest::Fixed(forward) => Some(forward.host_port),
+            PortForwardRequest::Dynamic(_) => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for request in requests {
+        let guest_port = match request {
+            PortForwardRequest::Fixed(forward) => {
+                resolved.push(*forward);
+                continue;
+            }
+            PortForwardRequest::Dynamic(guest_port) => guest_port,
+        };
+        let mut selected = None;
+        for _ in 0..32 {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            let host_port = listener.local_addr()?.port();
+            if host_port != reserved_control_port
+                && !(AGENT_CONTROL_PORT_START..AGENT_CONTROL_PORT_END_EXCLUSIVE)
+                    .contains(&host_port)
+                && !fixed_host_ports.contains(&host_port)
+                && resolved
+                    .iter()
+                    .all(|forward| forward.host_port != host_port)
+            {
+                selected = Some(PortForward::new(host_port, *guest_port)?);
+                break;
+            }
+        }
+        resolved.push(selected.ok_or("could not allocate a unique dynamic host port")?);
+    }
+    Ok(resolved)
 }
 
 pub(super) fn next_value<'a>(

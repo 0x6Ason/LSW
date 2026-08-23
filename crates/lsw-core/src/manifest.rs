@@ -10,6 +10,8 @@ use crate::{LswError, Result, WindowsProfile};
 
 const MANIFEST_VERSION: u32 = 4;
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
+pub const AGENT_CONTROL_PORT_START: u16 = 42_000;
+pub const AGENT_CONTROL_PORT_END_EXCLUSIVE: u16 = 44_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NetworkMode {
@@ -122,16 +124,17 @@ impl InstanceSpec {
             });
         }
 
-        let control_port = stable_control_port(&self.name);
         let mut host_ports = BTreeSet::new();
         for forward in &self.port_forwards {
             PortForward::new(forward.host_port, forward.guest_port)?;
-            if forward.host_port == control_port {
+            if (AGENT_CONTROL_PORT_START..AGENT_CONTROL_PORT_END_EXCLUSIVE)
+                .contains(&forward.host_port)
+            {
                 return Err(LswError::InvalidValue {
                     field: "published ports",
                     reason: format!(
-                        "host port {} is reserved for the LSW agent of instance {:?}",
-                        forward.host_port, self.name
+                        "host port {} is reserved for LSW agent control",
+                        forward.host_port
                     ),
                 });
             }
@@ -272,7 +275,7 @@ impl InstanceManifest {
 
         Ok(Self {
             version: MANIFEST_VERSION,
-            control_port: stable_control_port(&spec.name),
+            control_port: control_port_for_instance(&spec.name)?,
             spec,
             state: InstanceState::Configured,
             created_unix_seconds,
@@ -381,7 +384,7 @@ impl InstanceManifest {
         spec.validate()?;
 
         let control_port = parse_field(&fields, "control_port")?;
-        let expected_control_port = stable_control_port(&spec.name);
+        let expected_control_port = control_port_for_instance(&spec.name)?;
         if control_port != expected_control_port {
             return Err(LswError::InvalidManifest(format!(
                 "control port {control_port} does not match the deterministic port {expected_control_port} for {:?}",
@@ -487,7 +490,13 @@ fn stable_control_port(name: &str) -> u16 {
     let hash = name.bytes().fold(2_166_136_261_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
     });
-    42_000 + (hash % 2_000) as u16
+    AGENT_CONTROL_PORT_START
+        + (hash % u32::from(AGENT_CONTROL_PORT_END_EXCLUSIVE - AGENT_CONTROL_PORT_START)) as u16
+}
+
+pub fn control_port_for_instance(name: &str) -> Result<u16> {
+    validate_instance_name(name)?;
+    Ok(stable_control_port(name))
 }
 
 #[cfg(test)]

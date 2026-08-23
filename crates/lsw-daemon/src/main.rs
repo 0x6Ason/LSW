@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(not(unix))]
 compile_error!("lswd 1.0 beta currently requires a Unix host");
 
 mod qmp;
+#[allow(unsafe_code)]
+mod socket_activation;
 mod supervisor;
 
 use std::env;
@@ -39,10 +41,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let store = StateStore::new(state_root()?);
     store.initialize()?;
     let socket_path = socket_path(&store);
-    prepare_socket_path(&socket_path)?;
-
-    let listener = UnixListener::bind(&socket_path)?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+    let listener = if let Some(listener) = socket_activation::inherited_listener(&socket_path)? {
+        validate_socket_path(&socket_path)?;
+        listener
+    } else {
+        prepare_socket_path(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        listener
+    };
     listener.set_nonblocking(true)?;
     println!("lswd listening on {}", socket_path.display());
 
@@ -63,6 +70,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => eprintln!("lswd: accept failed: {error}"),
         }
     }
+}
+
+fn validate_socket_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path
+        .parent()
+        .ok_or("daemon socket path does not have a parent directory")?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() || parent_metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "socket directory {} must be a private directory",
+            parent.display()
+        )
+        .into());
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "activated socket {} must be a private Unix socket",
+            path.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), Box<dyn std::error::Error>> {

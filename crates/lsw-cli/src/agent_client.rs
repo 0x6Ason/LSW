@@ -13,12 +13,15 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
-    decode_exit, decode_file_length, encode_file_length, read_frame, write_frame, ClientHello,
-    FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest, ServerHello, SessionLease,
-    SessionOptions, StartRequest, TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_CONPTY_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
-    CAPABILITY_TERMINAL_RESIZE_V1,
+    decode_exit, decode_file_length, decode_process_id, encode_file_length, read_frame,
+    write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest,
+    ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions, SessionSignal,
+    StartRequest, TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
+    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1,
+    CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1,
 };
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,9 +88,18 @@ impl AgentClient {
     }
 
     pub fn run(
+        self,
+        request: &StartRequest,
+        connect_stdin: bool,
+    ) -> Result<i32, Box<dyn std::error::Error>> {
+        self.run_with_environment(request, connect_stdin, &ProcessEnvironment::default())
+    }
+
+    pub fn run_with_environment(
         mut self,
         request: &StartRequest,
         connect_stdin: bool,
+        environment: &ProcessEnvironment,
     ) -> Result<i32, Box<dyn std::error::Error>> {
         let shell_session = matches!(request.kind, lsw_core::SessionKind::Shell);
         let conpty_available = self.has_capability(CAPABILITY_CONPTY_V1);
@@ -127,6 +139,15 @@ impl AgentClient {
                     &Frame::new(FrameKind::SessionLease, lease.encode()),
                 )?;
             }
+            if !environment.is_empty() {
+                self.require_capability(CAPABILITY_PROCESS_ENVIRONMENT_V1)?;
+                write_frame(
+                    &mut self.stream,
+                    &Frame::new(FrameKind::ProcessEnvironment, environment.encode()?),
+                )?;
+            }
+        } else if !environment.is_empty() {
+            return Err("guest agent does not support process environment injection".into());
         }
         if terminal.is_some() {
             let terminal_request = TerminalStartRequest {
@@ -147,6 +168,15 @@ impl AgentClient {
         let terminal_active = terminal.is_some();
         let outbound = Arc::new(Mutex::new(self.stream.try_clone()?));
         let session_stop = Arc::new(AtomicBool::new(false));
+        let signal_bridge =
+            if controlled_session && self.has_capability(CAPABILITY_SESSION_SIGNAL_V1) {
+                Some(spawn_signal_bridge(
+                    Arc::clone(&outbound),
+                    Arc::clone(&session_stop),
+                )?)
+            } else {
+                None
+            };
         let heartbeat_bridge = session_lease
             .map(|lease| spawn_heartbeat_bridge(Arc::clone(&outbound), lease.heartbeat_interval()));
         let input_thread = if connect_stdin {
@@ -203,6 +233,9 @@ impl AgentClient {
             let _ = send_outbound(&outbound, &Frame::new(FrameKind::SessionCancel, Vec::new()));
         }
         session_stop.store(true, Ordering::Release);
+        if let Some(signal_bridge) = signal_bridge {
+            signal_bridge.stop();
+        }
         if let Some((stop, heartbeat_thread)) = heartbeat_bridge {
             let _ = stop.send(());
             let _ = heartbeat_thread.join();
@@ -219,11 +252,69 @@ impl AgentClient {
         result
     }
 
+    pub fn run_detached(
+        mut self,
+        request: &StartRequest,
+        environment: &ProcessEnvironment,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        if request.kind != SessionKind::Run {
+            return Err("detached mode requires a run request".into());
+        }
+        self.require_capability(CAPABILITY_SESSION_CONTROL_V1)?;
+        self.require_capability(CAPABILITY_DETACHED_RUN_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(
+                FrameKind::SessionOptions,
+                SessionOptions {
+                    cancel_on_disconnect: false,
+                }
+                .encode(),
+            ),
+        )?;
+        if !environment.is_empty() {
+            self.require_capability(CAPABILITY_PROCESS_ENVIRONMENT_V1)?;
+            write_frame(
+                &mut self.stream,
+                &Frame::new(FrameKind::ProcessEnvironment, environment.encode()?),
+            )?;
+        }
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::SessionDetach, Vec::new()),
+        )?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::Start, request.encode()?),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::Started => Ok(decode_process_id(&response.payload)?),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            other => Err(format!("agent returned unexpected {other:?} detached response").into()),
+        }
+    }
+
     pub fn run_capture(
+        self,
+        request: &StartRequest,
+        input: &[u8],
+        output_limit: usize,
+    ) -> Result<CapturedProcess, Box<dyn std::error::Error>> {
+        self.run_capture_with_environment(
+            request,
+            input,
+            output_limit,
+            &ProcessEnvironment::default(),
+        )
+    }
+
+    pub fn run_capture_with_environment(
         mut self,
         request: &StartRequest,
         input: &[u8],
         output_limit: usize,
+        environment: &ProcessEnvironment,
     ) -> Result<CapturedProcess, Box<dyn std::error::Error>> {
         if matches!(request.kind, lsw_core::SessionKind::Shell) {
             return Err("captured sessions cannot be interactive shells".into());
@@ -240,6 +331,15 @@ impl AgentClient {
                     .encode(),
                 ),
             )?;
+            if !environment.is_empty() {
+                self.require_capability(CAPABILITY_PROCESS_ENVIRONMENT_V1)?;
+                write_frame(
+                    &mut self.stream,
+                    &Frame::new(FrameKind::ProcessEnvironment, environment.encode()?),
+                )?;
+            }
+        } else if !environment.is_empty() {
+            return Err("guest agent does not support process environment injection".into());
         }
         write_frame(
             &mut self.stream,
@@ -494,6 +594,47 @@ fn shutdown_outbound(writer: &Arc<Mutex<TcpStream>>) {
     }
 }
 
+struct SignalBridge {
+    handle: SignalHandle,
+    thread: thread::JoinHandle<()>,
+}
+
+impl SignalBridge {
+    fn stop(self) {
+        self.handle.close();
+        let _ = self.thread.join();
+    }
+}
+
+fn spawn_signal_bridge(
+    writer: Arc<Mutex<TcpStream>>,
+    stop: Arc<AtomicBool>,
+) -> io::Result<SignalBridge> {
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    let handle = signals.handle();
+    let thread = thread::spawn(move || {
+        for signal in signals.forever() {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            let signal = if signal == SIGINT {
+                SessionSignal::Interrupt
+            } else {
+                SessionSignal::Terminate
+            };
+            if send_outbound(
+                &writer,
+                &Frame::new(FrameKind::SessionSignal, signal.encode()),
+            )
+            .is_err()
+            {
+                return;
+            }
+        }
+    });
+    Ok(SignalBridge { handle, thread })
+}
+
 fn spawn_heartbeat_bridge(
     writer: Arc<Mutex<TcpStream>>,
     interval: Duration,
@@ -727,6 +868,119 @@ mod tests {
             working_directory: None,
         };
         assert_eq!(client.run(&request, false).expect("run should succeed"), 0);
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn controlled_run_sends_environment_and_working_directory() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            assert_eq!(
+                read_frame(&mut stream).expect("options should arrive").kind,
+                FrameKind::SessionOptions
+            );
+            let environment = read_frame(&mut stream).expect("environment should arrive");
+            assert_eq!(environment.kind, FrameKind::ProcessEnvironment);
+            assert_eq!(
+                ProcessEnvironment::decode(&environment.payload)
+                    .expect("environment should decode")
+                    .variables,
+                vec![("LSW_FIXTURE".to_owned(), "hello world".to_owned())]
+            );
+            let start = read_frame(&mut stream).expect("start should arrive");
+            assert_eq!(start.kind, FrameKind::Start);
+            assert_eq!(
+                StartRequest::decode(&start.payload)
+                    .expect("start should decode")
+                    .working_directory
+                    .as_deref(),
+                Some("C:\\work")
+            );
+            assert_eq!(
+                read_frame(&mut stream)
+                    .expect("stdin close should arrive")
+                    .kind,
+                FrameKind::StdinClose
+            );
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Exit, lsw_core::encode_exit(17)),
+            )
+            .expect("exit should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let client = AgentClient {
+            stream,
+            capabilities: vec![
+                CAPABILITY_SESSION_CONTROL_V1.to_owned(),
+                CAPABILITY_PROCESS_ENVIRONMENT_V1.to_owned(),
+            ],
+        };
+        let request = StartRequest {
+            kind: SessionKind::Exec,
+            argv: vec!["fixture-command".to_owned()],
+            working_directory: Some("C:\\work".to_owned()),
+        };
+        let environment =
+            ProcessEnvironment::new(vec![("LSW_FIXTURE".to_owned(), "hello world".to_owned())])
+                .expect("environment should be valid");
+        assert_eq!(
+            client
+                .run_with_environment(&request, false, &environment)
+                .expect("run should succeed"),
+            17
+        );
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn detached_run_uses_the_explicit_handshake_and_returns_the_pid() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let options = read_frame(&mut stream).expect("options should arrive");
+            assert_eq!(options.kind, FrameKind::SessionOptions);
+            assert!(
+                !SessionOptions::decode(&options.payload)
+                    .expect("options should decode")
+                    .cancel_on_disconnect
+            );
+            assert_eq!(
+                read_frame(&mut stream)
+                    .expect("detach marker should arrive")
+                    .kind,
+                FrameKind::SessionDetach
+            );
+            let start = read_frame(&mut stream).expect("start should arrive");
+            assert_eq!(start.kind, FrameKind::Start);
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Started, lsw_core::encode_process_id(4242)),
+            )
+            .expect("started response should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let client = AgentClient {
+            stream,
+            capabilities: vec![
+                CAPABILITY_SESSION_CONTROL_V1.to_owned(),
+                CAPABILITY_DETACHED_RUN_V1.to_owned(),
+            ],
+        };
+        let request = StartRequest {
+            kind: SessionKind::Run,
+            argv: vec!["fixture-command".to_owned()],
+            working_directory: None,
+        };
+        assert_eq!(
+            client
+                .run_detached(&request, &ProcessEnvironment::default())
+                .expect("detached run should succeed"),
+            4242
+        );
         server.join().expect("fixture should not panic");
     }
 

@@ -129,15 +129,40 @@ After `lsw install` returns:
 lsw use win-dev
 lsw                         # enter PowerShell in the default instance
 lsw exec -- cmd.exe /c ver
-lsw exec -- powershell.exe -NoProfile -Command "New-Item -ItemType Directory -Force C:\src | Out-Null"
+lsw exec --cwd 'C:\src' --env BUILD_MODE=release -- cmd.exe /d /c build.cmd
+lsw run --detach -- powershell.exe -NoProfile -File 'C:\src\worker.ps1'
 lsw push ./main.rs 'C:\src\main.rs'
+lsw push --recursive ./project 'C:\src\project'
+lsw sync --watch ./project 'C:\src\project'
 lsw pull 'C:\src\build\app.exe' ./app.exe
 ```
 
-`lsw exec` waits and returns the real guest exit code. `lsw run` currently uses
-the same Session 0 transport and waits; it is not a visible desktop launcher.
-Detached process semantics arrive in beta.6. Visible GUI launch requires the
-future user-session companion described in the roadmap.
+`lsw exec` and ordinary `lsw run` wait and return guest exit codes 0–255
+unchanged. Windows has a 32-bit exit-code space; when a value cannot be
+represented by a Unix shell, LSW prints the exact unsigned decimal and
+hexadecimal Windows value and returns 255. For controlled noninteractive
+sessions, host `SIGINT` and `SIGTERM` terminate the owned Windows Job and return
+130 and 143 respectively. `run --detach` returns the guest PID after a
+successful start handshake, disconnects from its standard streams, and lets the
+agent retain lifecycle ownership until the process exits.
+
+Recursive transfer refuses host symlinks, guest reparse points, traversal, and
+implicit overwrite. `sync` is intentionally host-to-guest and additive:
+changed/new files are atomically replaced, while deletion on the host does not
+delete the guest copy. `--watch` polls a bounded local snapshot every 750 ms and
+retries failed changes.
+
+Path conversion is explicit and syntactic; it does not make the independent
+guest disk a host mount:
+
+```bash
+lsw path -w /mnt/c/Users/Jason/project
+lsw path -u 'C:\Users\Jason\project'
+```
+
+Use `push`, `pull`, or `sync` when content must cross the VM boundary. Visible
+GUI launch still requires the future user-session companion described in the
+roadmap.
 
 ## Daily management
 
@@ -271,6 +296,12 @@ lsw install win-web \
   --publish 8443:443
 ```
 
+Let LSW select an available host port when a fixed port is unnecessary:
+
+```bash
+lsw install win-web --publish auto:8080
+```
+
 Published ports bind only to `127.0.0.1`. LSW rejects duplicates, ports already
 owned by another instance or local process, agent-port collisions, and port
 publishing with the `offline` network mode.
@@ -289,10 +320,35 @@ user credential.
 A later user-session companion will be required for visible desktop GUI
 processes, clipboard, audio, and per-window integration.
 
-Controlled sessions distinguish stdin EOF, authenticated cancellation, and
-disconnect cleanup. The capability-gated session lease is bounded to 1–300
-seconds; the default client requests 120 seconds and sends a heartbeat every
-30 seconds. Lease expiry closes the transport and reclaims owned processes.
+Controlled sessions distinguish stdin EOF, authenticated cancellation,
+interrupt/terminate signals, detached start acknowledgement, and disconnect
+cleanup. Working-directory and environment frames are capability-gated and
+validated before process creation. Environment keys are case-insensitively
+unique to match Windows semantics. The capability-gated session lease is
+bounded to 1–300 seconds; the default client requests 120 seconds and sends a
+heartbeat every 30 seconds. Lease expiry closes the transport and reclaims
+owned processes.
+
+Generate completion without installing a shell framework:
+
+```bash
+lsw completion bash >~/.local/share/bash-completion/completions/lsw
+lsw completion zsh >~/.local/share/zsh/site-functions/_lsw
+lsw completion fish >~/.config/fish/completions/lsw.fish
+lsw completion powershell >~/.config/powershell/lsw-completion.ps1
+```
+
+The release bundle also ships hardened `lswd.service` and `lswd.socket` user
+units. A default-prefix install places them in the user systemd data directory;
+enable on-demand startup with:
+
+```bash
+systemctl --user enable --now lswd.socket
+```
+
+The CLI first connects to the private socket, so a listening systemd socket
+activates `lswd` without a separate login-time daemon. Direct CLI autostart
+remains available when the socket unit is not enabled.
 
 On Unix, a child enters a separate process group before `exec`; ordinary
 descendants remaining in that group are reclaimed on exit, cancellation,
@@ -334,28 +390,18 @@ runtime cleanup.
 
 ## Roadmap
 
-- beta.6: fully specified `exec` semantics, including working-directory and
-  environment injection, signal and Ctrl-C propagation, and exact exit codes;
-  detached `run`; recursive/resumable transfer and workspace watch sync; Linux
-  ↔ Windows path translation; dynamic ports; shell completion; and systemd
-  user socket activation.
-  - Add one progress-event contract for download, WinPE preparation, DISM
-    application, first boot, Windows setup, agent installation, and final
-    verification. The terminal UI reports percentages only for measurable work;
-    specialize, OOBE, and cleanup use truthful named stages with elapsed time.
-  - Reduce installation latency by benchmarking a fast-compressed intermediate
-    WIM, exposing an explicit speed-versus-size CompactOS policy, and caching a
-    reusable prepared image keyed by the exact ISO SHA-256, edition,
-    architecture, profile manifest, and LSW/agent version. Per-instance answer
-    files, authentication tokens, and other secrets are injected only after the
-    cached image is applied and are never stored in that cache.
-  - Keep Windows DISM as the canonical servicing and application backend.
-    Alternative direct-apply backends remain experimental until real
-    Windows/KVM E2E proves ACL, extended-attribute, reparse-point, update,
-    servicing, and cold-restart fidelity.
-- beta.7: sealed base images, linked clones, optional signed VirtIO networking,
-  ballooning and vsock, memory-pressure governor, Windows hibernation, automatic
-  resume, guest TRIM, discard, and compaction.
+- beta.6: implemented truthful install/OOBE progress; working-directory and
+  environment injection;
+  signal propagation and exact exit status; detached `run`; recursive transfer
+  and additive workspace watch sync; explicit Linux ↔ Windows path conversion;
+  dynamic loopback ports; shell completion; and systemd user socket activation.
+- beta.7: prepared/sealed base images keyed by exact ISO/profile/agent identity,
+  per-instance secret injection, linked clones, optional signed VirtIO
+  networking, ballooning and vsock, memory-pressure governor, Windows
+  hibernation, automatic resume, guest TRIM, discard, and compaction. Windows
+  DISM remains canonical; alternative direct-apply backends stay experimental
+  until real Windows/KVM proves ACL, reparse-point, update, servicing, and
+  cold-restart fidelity.
 - beta.8: driverless per-HWND Windows Graphics Capture transported to independent
   Wayland windows, with X11 fallback, input, resize, DPI, clipboard, audio, and
   notifications. Shared-memory/GPU acceleration remains optional.
@@ -439,10 +485,11 @@ license text. LSW neither bundles MSDL nor uses its backend, telemetry, or
 crowdsourced cache.
 
 LSW's name and its WSL-like lifecycle and terminal UX are inspired by
-[Microsoft's WSL project](https://github.com/microsoft/WSL). Thanks to Microsoft
-and the WSL contributors for that naming and UX reference. LSW is an independent
-project, is not affiliated with or endorsed by Microsoft, and does not
-incorporate WSL source code merely by following those interaction conventions.
+[Microsoft's MIT-licensed WSL project](https://github.com/microsoft/WSL).
+Thanks to Microsoft and the WSL contributors for that naming and UX reference.
+LSW is an independent project, is not affiliated with or endorsed by Microsoft,
+and does not incorporate WSL source code merely by following those interaction
+conventions.
 
 ## Documentation
 

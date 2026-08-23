@@ -17,7 +17,9 @@ is complete.
 - State and instance directories are mode 0700; tokens, manifests, logs and
   firmware stores are mode 0600 on Unix.
 - `lswd` listens on a mode-0600 Unix socket below a mode-0700 directory. It
-  refuses to replace a non-socket path.
+  refuses to replace a non-socket path. Socket activation accepts exactly one
+  PID-scoped descriptor only when its pathname and permissions match that
+  configured private socket.
 - The same Unix user can control all of that user's instances. There is no
   multi-user authorization server in this beta.
 - Requests and responses are size-limited and escaped. Commands are parsed into
@@ -76,6 +78,14 @@ socket in both directions before waiting for I/O bridges, then reclaims the
 session-owned process group/Job. Peers without both capabilities retain legacy
 behavior.
 
+The process-environment capability rejects NUL, `=`, oversized payloads, and
+case-insensitive duplicate names before spawn. Values are not logged or stored
+by LSW, but they are visible to the guest process and to principals with normal
+Windows process-inspection authority; environment injection is not a secret
+store. Authenticated interrupt and terminate frames stop the owned Job and
+return 130/143. Detached mode nulls standard streams but retains Job ownership,
+so an agent or VM exit still terminates the detached process tree.
+
 On Unix, LSW places the child in a fresh process group before `exec` and cleans
 every process still in that group after normal leader exit, cancellation,
 disconnect, protocol error, or lease expiry. A guest process can deliberately
@@ -94,16 +104,20 @@ gate.
 Agent powers are intentionally broad after authentication: it can execute
 arbitrary processes as the `NT SERVICE\LSWAgent` virtual account and read or
 create files that service identity can access. It does not impersonate a desktop
-user. Protect the host token and state backups accordingly. Transfers
-reject symlinks and existing destinations and verify declared byte counts before
-committing a temporary file.
+user. Protect the host token and state backups accordingly. Single-file
+transfers reject existing destinations and verify declared byte counts before
+committing a temporary file. Recursive traversal rejects host symlinks, guest
+reparse points, and unsafe relative components. Explicit `sync` updates use a
+unique guest temporary file plus atomic rename; the operation is additive and
+never turns a host deletion into a guest deletion.
 
 ## Network policy
 
 `nat` is the create default: QEMU user networking permits guest egress. The
 agent port is always forwarded to host loopback; an instance may additionally
 request repeatable TCP mappings with `--publish HOST:GUEST`. Every published
-listener is explicitly bound to `127.0.0.1`. Validation rejects zero or
+listener is explicitly bound to `127.0.0.1`. `auto:GUEST` and `0:GUEST` are
+resolved to a nonzero loopback port before persistence. Manifest validation rejects zero or
 duplicate host ports, collision with the reserved agent port, collision with
 another instance, ports already bound by another local process at creation
 time, and all publishing in `offline` mode.

@@ -19,10 +19,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
-    read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind,
-    ServerHello, SessionKind, SessionLease, SessionLeaseState, SessionOptions, StartRequest,
-    TerminalStartRequest, AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_SESSION_CONTROL_V1,
-    CAPABILITY_SESSION_LEASE_V1, SESSION_CANCEL_EXIT_CODE,
+    encode_process_id, read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame,
+    FrameKind, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
+    SessionOptions, SessionSignal, StartRequest, TerminalStartRequest, AGENT_GUEST_PORT,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
+    SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
 use lsw_core::{
@@ -552,6 +554,7 @@ impl SessionMode {
 #[derive(Debug, Eq, PartialEq)]
 enum SessionControlEvent {
     Cancel,
+    Signal(SessionSignal),
     Disconnect,
     Heartbeat(Instant),
     ProtocolError(String),
@@ -561,6 +564,7 @@ enum SessionControlEvent {
 enum SessionEnd {
     Normal,
     Cancelled,
+    Signalled(i32),
     Disconnected,
     LeaseExpired,
     ProtocolError(String),
@@ -652,7 +656,9 @@ fn handle_connection(
         write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
         return Ok(());
     }
-    let (request_frame, session_mode) = if request_frame.kind == FrameKind::SessionOptions {
+    let (request_frame, session_mode, environment, detached) = if request_frame.kind
+        == FrameKind::SessionOptions
+    {
         let options = match SessionOptions::decode(&request_frame.payload) {
             Ok(options) => options,
             Err(error) => {
@@ -674,23 +680,76 @@ fn handle_connection(
         } else {
             None
         };
+        if request_frame.kind == FrameKind::SessionLease {
+            send_error(
+                &mut stream,
+                "SESSION_OPTIONS accepts only one SESSION_LEASE",
+            )?;
+            return Err("client sent duplicate SESSION_LEASE frames".into());
+        }
+        let environment = if request_frame.kind == FrameKind::ProcessEnvironment {
+            let environment = match ProcessEnvironment::decode(&request_frame.payload) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    send_error(&mut stream, &error.to_string())?;
+                    return Err(error.into());
+                }
+            };
+            request_frame = read_frame(&mut stream)?;
+            environment
+        } else {
+            ProcessEnvironment::default()
+        };
+        let detached = if request_frame.kind == FrameKind::SessionDetach {
+            if !request_frame.payload.is_empty() {
+                send_error(&mut stream, "SESSION_DETACH payload must be empty")?;
+                return Err("client sent an invalid SESSION_DETACH payload".into());
+            }
+            request_frame = read_frame(&mut stream)?;
+            true
+        } else {
+            false
+        };
         if !matches!(
             request_frame.kind,
             FrameKind::Start | FrameKind::TerminalStart
         ) {
             send_error(
                 &mut stream,
-                "SESSION_OPTIONS may be followed by one SESSION_LEASE, then must be followed by START or TERMINAL_START",
+                "SESSION_OPTIONS must be followed by optional SESSION_LEASE, PROCESS_ENVIRONMENT, and SESSION_DETACH frames, then START or TERMINAL_START",
             )?;
             return Err("client sent an invalid controlled-session request".into());
         }
-        (request_frame, SessionMode::Controlled { options, lease })
+        (
+            request_frame,
+            SessionMode::Controlled { options, lease },
+            environment,
+            detached,
+        )
     } else {
-        (request_frame, SessionMode::Legacy)
+        (
+            request_frame,
+            SessionMode::Legacy,
+            ProcessEnvironment::default(),
+            false,
+        )
     };
     match request_frame.kind {
-        FrameKind::Start => run_process_request(stream, &request_frame.payload, session_mode),
+        FrameKind::Start => run_process_request(
+            stream,
+            &request_frame.payload,
+            session_mode,
+            &environment,
+            detached,
+        ),
         FrameKind::TerminalStart => {
+            if detached || !environment.is_empty() {
+                send_error(
+                    &mut stream,
+                    "terminal sessions do not accept detached mode or environment injection",
+                )?;
+                return Err("client sent invalid terminal-session options".into());
+            }
             run_terminal_request(stream, &request_frame.payload, session_mode)
         }
         FrameKind::FilePut => receive_file(stream, &request_frame.payload),
@@ -710,6 +769,9 @@ fn agent_capabilities() -> Vec<String> {
         "file-transfer-v1".to_owned(),
         CAPABILITY_SESSION_CONTROL_V1.to_owned(),
         CAPABILITY_SESSION_LEASE_V1.to_owned(),
+        CAPABILITY_PROCESS_ENVIRONMENT_V1.to_owned(),
+        CAPABILITY_DETACHED_RUN_V1.to_owned(),
+        CAPABILITY_SESSION_SIGNAL_V1.to_owned(),
     ];
     #[cfg(windows)]
     let capabilities = {
@@ -725,9 +787,15 @@ fn run_process_request(
     mut stream: TcpStream,
     payload: &[u8],
     session_mode: SessionMode,
+    environment: &ProcessEnvironment,
+    detached: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = StartRequest::decode(payload)?;
-    let mut child = match spawn_request(&request) {
+    if detached && request.kind != SessionKind::Run {
+        send_error(&mut stream, "detached mode requires a RUN request")?;
+        return Err("client requested detached mode for a non-run session".into());
+    }
+    let mut child = match spawn_request(&request, environment, detached) {
         Ok(child) => child,
         Err(error) => {
             send_error(&mut stream, &format!("could not start process: {error}"))?;
@@ -735,6 +803,30 @@ fn run_process_request(
         }
     };
 
+    if detached {
+        let process_id = child.id();
+        let reaper = thread::Builder::new()
+            .name(format!("lsw-agent-detached-{process_id}"))
+            .spawn(move || {
+                if let Err(error) = child.wait_and_cleanup() {
+                    write_stderr(format_args!(
+                        "lsw-agent: detached process {process_id} cleanup failed: {error}"
+                    ));
+                }
+            });
+        if let Err(error) = reaper {
+            send_error(
+                &mut stream,
+                &format!("could not retain detached process: {error}"),
+            )?;
+            return Err(error.into());
+        }
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Started, encode_process_id(process_id)),
+        )?;
+        return Ok(());
+    }
     bridge_process(&mut child, stream, session_mode)?;
     Ok(())
 }
@@ -943,28 +1035,36 @@ impl SessionChild {
         }
     }
 
+    fn id(&self) -> u32 {
+        self.process.id()
+    }
+
     fn try_wait_and_cleanup(&mut self) -> io::Result<Option<ExitStatus>> {
         let Some(status) = self.process.try_wait()? else {
             return Ok(None);
         };
-        self.terminate_tree()?;
+        self.terminate_tree(SESSION_CANCEL_EXIT_CODE)?;
         Ok(Some(status))
     }
 
     fn wait_and_cleanup(&mut self) -> io::Result<ExitStatus> {
         let status = self.process.wait()?;
-        self.terminate_tree()?;
+        self.terminate_tree(SESSION_CANCEL_EXIT_CODE)?;
         Ok(status)
     }
 
     /// Returns the leader status and whether this call won the race to issue
     /// process-tree termination.
     fn terminate(&mut self) -> io::Result<(ExitStatus, bool)> {
+        self.terminate_with(SESSION_CANCEL_EXIT_CODE)
+    }
+
+    fn terminate_with(&mut self, exit_code: i32) -> io::Result<(ExitStatus, bool)> {
         if let Some(status) = self.process.try_wait()? {
-            self.terminate_tree()?;
+            self.terminate_tree(exit_code)?;
             return Ok((status, false));
         }
-        self.terminate_tree()?;
+        self.terminate_tree(exit_code)?;
         Ok((self.process.wait()?, true))
     }
 
@@ -972,11 +1072,11 @@ impl SessionChild {
     /// reused after its last member exits, so a later signal from Drop could
     /// otherwise target an unrelated group. A successful cleanup disarms it;
     /// a failed cleanup restores it only so Drop can make one best-effort retry.
-    fn terminate_tree(&mut self) -> io::Result<()> {
+    fn terminate_tree(&mut self, exit_code: i32) -> io::Result<()> {
         let Some(tree) = self.tree.take() else {
             return Ok(());
         };
-        match tree.terminate(SESSION_CANCEL_EXIT_CODE) {
+        match tree.terminate(exit_code) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.tree = Some(tree);
@@ -987,7 +1087,7 @@ impl SessionChild {
 
     #[cfg(all(test, unix))]
     fn kill(&mut self) -> io::Result<()> {
-        self.terminate_tree()
+        self.terminate_tree(SESSION_CANCEL_EXIT_CODE)
     }
 
     #[cfg(all(test, unix))]
@@ -1005,7 +1105,7 @@ impl Drop for SessionChild {
         if self.tree.is_none() {
             return;
         }
-        if self.terminate_tree().is_ok() {
+        if self.terminate_tree(SESSION_CANCEL_EXIT_CODE).is_ok() {
             let _ = self.process.wait();
         }
     }
@@ -1025,21 +1125,34 @@ mod process_tree;
 #[path = "process_tree_fallback.rs"]
 mod process_tree;
 
-fn spawn_request(request: &StartRequest) -> Result<SessionChild, Box<dyn std::error::Error>> {
+fn spawn_request(
+    request: &StartRequest,
+    environment: &ProcessEnvironment,
+    detached: bool,
+) -> Result<SessionChild, Box<dyn std::error::Error>> {
     match request.kind {
-        SessionKind::Shell => spawn_shell(request),
+        SessionKind::Shell => spawn_shell(request, environment),
         SessionKind::Exec | SessionKind::Run => {
             let (program, arguments) = request
                 .argv
                 .split_first()
                 .ok_or("command request did not contain a program")?;
-            spawn_program(program, arguments, request.working_directory.as_deref())
-                .map_err(Into::into)
+            spawn_program(
+                program,
+                arguments,
+                request.working_directory.as_deref(),
+                environment,
+                detached,
+            )
+            .map_err(Into::into)
         }
     }
 }
 
-fn spawn_shell(request: &StartRequest) -> Result<SessionChild, Box<dyn std::error::Error>> {
+fn spawn_shell(
+    request: &StartRequest,
+    environment: &ProcessEnvironment,
+) -> Result<SessionChild, Box<dyn std::error::Error>> {
     let mut last_not_found = None;
     for candidate in &request.argv {
         let shell_arguments = match candidate.to_ascii_lowercase().as_str() {
@@ -1052,6 +1165,8 @@ fn spawn_shell(request: &StartRequest) -> Result<SessionChild, Box<dyn std::erro
             candidate,
             shell_arguments,
             request.working_directory.as_deref(),
+            environment,
+            false,
         ) {
             Ok(child) => return Ok(child),
             Err(error) if error.kind() == io::ErrorKind::NotFound => last_not_found = Some(error),
@@ -1067,13 +1182,27 @@ fn spawn_program(
     program: &str,
     arguments: &[impl AsRef<std::ffi::OsStr>],
     working_directory: Option<&str>,
+    environment: &ProcessEnvironment,
+    detached: bool,
 ) -> io::Result<SessionChild> {
     let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(arguments).envs(
+        environment
+            .variables
+            .iter()
+            .map(|(name, value)| (name, value)),
+    );
+    if detached {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    } else {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
     if let Some(directory) = working_directory {
         command.current_dir(directory);
     }
@@ -1214,6 +1343,15 @@ fn wait_for_child(
                 let (status, terminated) = terminate_child(child)?;
                 return Ok((status, cancel_session_end(terminated)));
             }
+            Ok(SessionControlEvent::Signal(signal)) => {
+                let (status, terminated) = child.terminate_with(signal.exit_code())?;
+                let end = if terminated {
+                    SessionEnd::Signalled(signal.exit_code())
+                } else {
+                    SessionEnd::Normal
+                };
+                return Ok((status, end));
+            }
             Ok(SessionControlEvent::Disconnect) => {
                 return Ok((terminate_child(child)?.0, SessionEnd::Disconnected))
             }
@@ -1315,6 +1453,7 @@ fn wait_for_terminal_process(
         }
         let session_end = match controls.try_recv() {
             Ok(SessionControlEvent::Cancel) => SessionEnd::Cancelled,
+            Ok(SessionControlEvent::Signal(signal)) => SessionEnd::Signalled(signal.exit_code()),
             Ok(SessionControlEvent::Disconnect) => SessionEnd::Disconnected,
             Ok(SessionControlEvent::ProtocolError(message)) => SessionEnd::ProtocolError(message),
             Ok(SessionControlEvent::Heartbeat(observed_at)) => {
@@ -1350,7 +1489,11 @@ fn wait_for_terminal_process(
             job.terminate(SESSION_CANCEL_EXIT_CODE)?;
             return Ok((code, SessionEnd::Normal));
         }
-        if let Err(error) = job.terminate(SESSION_CANCEL_EXIT_CODE) {
+        let termination_code = match session_end {
+            SessionEnd::Signalled(code) => code,
+            _ => SESSION_CANCEL_EXIT_CODE,
+        };
+        if let Err(error) = job.terminate(termination_code) {
             if let Some(code) = windows_conpty::wait_for_process_timeout(process, 0)? {
                 return Ok((code, SessionEnd::Normal));
             }
@@ -1444,6 +1587,30 @@ fn spawn_input_bridge(
                     }
                     drop(child_stdin.take());
                     let _ = control_sender.send(SessionControlEvent::Cancel);
+                    return;
+                }
+                Ok(frame) if frame.kind == FrameKind::SessionSignal => {
+                    if !session_mode.is_controlled() {
+                        report_protocol_error(
+                            &control_sender,
+                            session_mode,
+                            "SESSION_SIGNAL requires a controlled session",
+                        );
+                        return;
+                    }
+                    let signal = match SessionSignal::decode(&frame.payload) {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            report_protocol_error(
+                                &control_sender,
+                                session_mode,
+                                &error.to_string(),
+                            );
+                            return;
+                        }
+                    };
+                    drop(child_stdin.take());
+                    let _ = control_sender.send(SessionControlEvent::Signal(signal));
                     return;
                 }
                 Ok(frame) if frame.kind == FrameKind::SessionHeartbeat => {
@@ -1569,6 +1736,28 @@ fn spawn_terminal_input_bridge(
                     let _ = control_sender.send(SessionControlEvent::Cancel);
                     return Ok(());
                 }
+                Ok(frame) if frame.kind == FrameKind::SessionSignal => {
+                    if !session_mode.is_controlled() {
+                        return terminal_bridge_failure(
+                            &control_sender,
+                            session_mode,
+                            "SESSION_SIGNAL requires a controlled session".to_owned(),
+                        );
+                    }
+                    let signal = match SessionSignal::decode(&frame.payload) {
+                        Ok(signal) => signal,
+                        Err(error) => {
+                            return terminal_bridge_failure(
+                                &control_sender,
+                                session_mode,
+                                error.to_string(),
+                            )
+                        }
+                    };
+                    drop(input.take());
+                    let _ = control_sender.send(SessionControlEvent::Signal(signal));
+                    return Ok(());
+                }
                 Ok(frame) if frame.kind == FrameKind::SessionHeartbeat => {
                     if session_mode.lease().is_none() || !frame.payload.is_empty() {
                         report_protocol_error(
@@ -1680,6 +1869,9 @@ fn finish_session(
             writer,
             &Frame::new(FrameKind::Exit, encode_exit(SESSION_CANCEL_EXIT_CODE)),
         ),
+        SessionEnd::Signalled(code) => {
+            send_shared(writer, &Frame::new(FrameKind::Exit, encode_exit(code)))
+        }
         SessionEnd::Disconnected => Ok(()),
         // The socket was shut down before joining the output bridges so a
         // half-open peer that stopped reading cannot retain this session slot.

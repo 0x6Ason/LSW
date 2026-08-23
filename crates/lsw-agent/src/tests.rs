@@ -15,7 +15,8 @@ fn shell_fallback_reaches_a_known_program() {
         argv: vec!["definitely-not-an-lsw-shell".to_owned(), "sh".to_owned()],
         working_directory: None,
     };
-    let mut child = spawn_request(&request).expect("sh fallback should start");
+    let mut child = spawn_request(&request, &ProcessEnvironment::default(), false)
+        .expect("sh fallback should start");
     child.kill().expect("fixture process should stop");
     assert!(
         child.tree.is_none(),
@@ -205,6 +206,8 @@ fn windows_pipe_job_terminates_a_spawned_descendant() {
         "cmd.exe",
         &["/D", "/Q", "/C", "ping.exe -n 30 127.0.0.1 >NUL"],
         None,
+        &ProcessEnvironment::default(),
+        false,
     )
     .expect("cmd should start inside a Job Object");
     let leader = child.process.id();
@@ -562,6 +565,125 @@ fn authenticated_cancel_terminates_a_controlled_process() {
     );
     drop(stream);
     assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_environment_and_working_directory_reach_the_child() {
+    let root = std::env::temp_dir().join(format!("lsw-agent-env-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("working directory should be created");
+    let (mut stream, done, active_sessions) = controlled_test_connection("e".repeat(64));
+    send_session_options(&mut stream);
+    let environment = ProcessEnvironment::new(vec![(
+        "LSW_TEST_ENV".to_owned(),
+        "environment-ok".to_owned(),
+    )])
+    .expect("environment should validate");
+    write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::ProcessEnvironment,
+            environment.encode().expect("environment should encode"),
+        ),
+    )
+    .expect("environment should be sent");
+    let request = StartRequest {
+        kind: SessionKind::Exec,
+        argv: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s|%s' \"$LSW_TEST_ENV\" \"$PWD\"".to_owned(),
+        ],
+        working_directory: Some(root.to_string_lossy().into_owned()),
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Start, request.encode().unwrap()),
+    )
+    .expect("start should be sent");
+    let (stdout, code) = collect_process(&mut stream);
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8(stdout).expect("output should be UTF-8"),
+        format!("environment-ok|{}", root.display())
+    );
+    drop(stream);
+    assert_session_released(done, active_sessions);
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_signal_terminates_the_process_tree_with_exact_status() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("f".repeat(64));
+    send_session_options(&mut stream);
+    send_waiting_descendant_tree(&mut stream);
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionSignal, SessionSignal::Interrupt.encode()),
+    )
+    .expect("signal should be sent");
+    assert_eq!(collect_process(&mut stream).1, 130);
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_run_survives_the_client_disconnect_until_completion() {
+    let root = std::env::temp_dir().join(format!("lsw-agent-detach-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("fixture directory should be created");
+    let marker = root.join("complete.marker");
+    let (mut stream, done, active_sessions) = controlled_test_connection("a".repeat(64));
+    write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::SessionOptions,
+            SessionOptions {
+                cancel_on_disconnect: false,
+            }
+            .encode(),
+        ),
+    )
+    .expect("session options should be sent");
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionDetach, Vec::new()),
+    )
+    .expect("detach request should be sent");
+    let request = StartRequest {
+        kind: SessionKind::Run,
+        argv: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("sleep 1; printf complete > '{}'", marker.display()),
+        ],
+        working_directory: None,
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Start, request.encode().unwrap()),
+    )
+    .expect("start should be sent");
+    let started = read_frame(&mut stream).expect("start acknowledgement should arrive");
+    assert_eq!(started.kind, FrameKind::Started);
+    assert!(lsw_core::decode_process_id(&started.payload).unwrap() > 0);
+    drop(stream);
+    done.recv_timeout(Duration::from_millis(500))
+        .expect("detached start should release its connection slot promptly")
+        .expect("server session should succeed");
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(&marker).expect("detached process should write marker"),
+        "complete"
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
 }
 
 #[cfg(unix)]

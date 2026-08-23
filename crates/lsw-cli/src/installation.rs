@@ -27,7 +27,7 @@ use crate::progress::{ProgressEvent, ProgressRenderer};
 
 use super::{
     absolute_path, fix_host_dependencies, launch_installation_viewer, resolve_name,
-    show_activation_notice_once, start_named_instance, InstallArguments,
+    resolve_port_forwards, show_activation_notice_once, start_named_instance, InstallArguments,
 };
 
 pub(super) fn install_instance(
@@ -269,7 +269,7 @@ fn install_new_instance(
             .disk_gib
             .unwrap_or_else(|| parsed.profile.default_disk_gib()),
         network: parsed.network,
-        port_forwards: parsed.port_forwards,
+        port_forwards: resolve_port_forwards(&parsed.port_forwards, name)?,
         license_accepted: true,
         allow_unsupported_requirements: parsed.allow_unsupported_requirements,
     };

@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[Unit]
+Description=LSW local Windows runtime socket
+
+[Socket]
+ListenStream=%h/.local/share/lsw/run/lswd.sock
+FileDescriptorName=lswd
+DirectoryMode=0700
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

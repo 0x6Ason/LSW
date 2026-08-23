@@ -132,15 +132,18 @@ for required_file in \
     BUILDINFO.txt CHANGELOG.md LICENSE README.md THIRD_PARTY_NOTICES.md \
     SOURCE-MANIFEST.sha256 \
     install.sh lsw lsw-agent.exe lswd \
+    systemd/lswd.service systemd/lswd.socket \
     docs/DEVELOPMENT.md docs/WINDOWS_KVM_E2E.md \
     source/Cargo.lock source/Cargo.toml source/LICENSE source/README.md \
     source/THIRD_PARTY_NOTICES.md \
+    source/contrib/systemd/lswd.service source/contrib/systemd/lswd.socket \
     source/.cargo/config.toml \
     source/crates/lsw-agent/Cargo.toml source/crates/lsw-agent/src/main.rs \
     source/crates/lsw-cli/Cargo.toml source/crates/lsw-cli/src/main.rs \
     source/crates/lsw-core/Cargo.toml source/crates/lsw-core/src/lib.rs \
     source/crates/lsw-daemon/Cargo.toml source/crates/lsw-daemon/src/main.rs \
     source/scripts/build-release.sh source/scripts/build-windows-agent.sh \
+    source/scripts/check-systemd-socket-activation.sh \
     source/scripts/normalize-pe-timestamp.py \
     source/scripts/zig-windows-linker.sh \
     source/vendor/serde-1.0.203/Cargo.toml \

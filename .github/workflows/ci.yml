@@ -142,6 +142,8 @@ jobs:
           rustup default 1.76.0
       - name: Build the LSW host runtime
         run: cargo build --locked -p lsw-cli -p lsw-daemon
+      - name: Exercise systemd socket activation
+        run: scripts/check-systemd-socket-activation.sh
       - name: Boot a transport-adapted OVMF and vTPM VM under TCG
         run: scripts/check-qemu-smoke.sh
       - name: Exercise the actual LSW planner and daemon lifecycle

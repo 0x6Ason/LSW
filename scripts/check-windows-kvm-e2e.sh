@@ -16,7 +16,7 @@ keep_state=${LSW_E2E_KEEP_STATE:-0}
 expected_iso_sha256=${LSW_WINDOWS_ISO_SHA256:-}
 e2e_no_viewer=${LSW_E2E_NO_VIEWER:-1}
 
-for required_command in awk chmod date grep kill mkdir mktemp mv python3 rm setsid sha256sum sleep timeout tr uname; do
+for required_command in awk chmod cmp date grep kill mkdir mktemp mv python3 rm setsid sha256sum sleep timeout tr uname; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "error: required command $required_command was not found" >&2
         exit 1
@@ -130,6 +130,7 @@ cold_daemon_pid_file="$e2e_root/cold-daemon.pid"
 export LSW_DAEMON="$autospawn_blocker"
 daemon_pid=
 viewer_pid=
+sync_pid=
 artifacts_collected=0
 guest_build=unknown
 guest_edition=unknown
@@ -148,6 +149,11 @@ cached_unattend_removed=unknown
 setup_payload_removed=unknown
 automatic_logon=unknown
 ovmf_code_sha256=unknown
+exec_context_verified=unknown
+signal_status=unknown
+detached_run_verified=unknown
+recursive_transfer_verified=unknown
+watch_sync_verified=unknown
 ovmf_vars_sha256=unknown
 official_iso_sha256=unknown
 license_status=unknown
@@ -287,6 +293,11 @@ collect_e2e_artifacts() {
         printf 'cached_unattend_removed=%s\n' "$cached_unattend_removed"
         printf 'setup_payload_removed=%s\n' "$setup_payload_removed"
         printf 'automatic_logon=%s\n' "$automatic_logon"
+        printf 'exec_context_verified=%s\n' "$exec_context_verified"
+        printf 'signal_status=%s\n' "$signal_status"
+        printf 'detached_run_verified=%s\n' "$detached_run_verified"
+        printf 'recursive_transfer_verified=%s\n' "$recursive_transfer_verified"
+        printf 'watch_sync_verified=%s\n' "$watch_sync_verified"
         printf 'iso_sha256=%s\n' "$iso_sha256"
         printf 'official_iso_sha256=%s\n' "$official_iso_sha256"
         printf 'license_status=%s\n' "$license_status"
@@ -349,6 +360,19 @@ terminate_viewer() {
             ;;
     esac
     viewer_pid=
+}
+
+terminate_sync() {
+    case "$sync_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            kill -TERM "-$sync_pid" 2>/dev/null \
+                || kill -TERM "$sync_pid" 2>/dev/null \
+                || :
+            wait "$sync_pid" 2>/dev/null || :
+            ;;
+    esac
+    sync_pid=
 }
 
 adopt_cold_daemon_if_present() {
@@ -524,6 +548,7 @@ cleanup_e2e() {
     if ! terminate_viewer; then
         cleanup_failed=1
     fi
+    terminate_sync
     if ! terminate_daemon; then
         cleanup_failed=1
     fi
@@ -888,6 +913,168 @@ if [ "$guest_status" -ne 37 ]; then
     echo "error: guest exit code 37 became host exit code $guest_status" >&2
     exit 1
 fi
+
+exec_environment="LSW_BETA6_ENV_$$"
+# PowerShell, not the host shell, expands $env in the guest command.
+# shellcheck disable=SC2016
+exec_context=$(
+    "$lsw" exec "$instance" \
+        --cwd 'C:\Windows\Temp' \
+        --env "LSW_E2E_VALUE=$exec_environment" \
+        -- powershell.exe -NoLogo -NoProfile -Command \
+        '[Console]::Out.WriteLine((Get-Location).Path+"|"+$env:LSW_E2E_VALUE)'
+)
+if ! printf '%s\n' "$exec_context" | tr -d '\r' \
+    | grep -Fxi "C:\Windows\Temp|$exec_environment" >/dev/null
+then
+    echo "error: exec did not preserve its working directory and environment" >&2
+    exit 1
+fi
+exec_context_verified=true
+echo "beta.6 cwd and environment injection passed."
+
+set +e
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    'Start-Sleep -Seconds 120' >"$e2e_root/signal.stdout" 2>"$e2e_root/signal.stderr" &
+signal_pid=$!
+sleep 2
+kill -TERM "$signal_pid"
+wait "$signal_pid"
+signal_status=$?
+set -e
+if [ "$signal_status" -ne 143 ]; then
+    echo "error: SIGTERM returned $signal_status instead of exact status 143" >&2
+    cat "$e2e_root/signal.stderr" >&2
+    exit 1
+fi
+echo "beta.6 SIGTERM propagation returned exact status 143."
+
+guest_detached_marker="C:\Windows\Temp\beta6-detached-$$.txt"
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "if (Test-Path -LiteralPath '$guest_detached_marker') { Remove-Item -LiteralPath '$guest_detached_marker' -Force }"
+detached_output=$(
+    "$lsw" run "$instance" --detach -- powershell.exe -NoLogo -NoProfile -Command \
+        "Start-Sleep -Milliseconds 500; Set-Content -LiteralPath '$guest_detached_marker' -Value 'DETACHED_OK' -NoNewline"
+)
+if ! printf '%s\n' "$detached_output" \
+    | grep -E "^Started detached process [1-9][0-9]* in \"$instance\"\.$" >/dev/null
+then
+    echo "error: detached run did not return a guest process ID" >&2
+    exit 1
+fi
+attempt=0
+detached_marker=
+while [ "$attempt" -lt 100 ]; do
+    detached_marker=$(
+        "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+            "if (Test-Path -LiteralPath '$guest_detached_marker') { Get-Content -LiteralPath '$guest_detached_marker' -Raw }" \
+            2>/dev/null || :
+    )
+    if [ "$(printf '%s' "$detached_marker" | tr -d '\r')" = DETACHED_OK ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if [ "$(printf '%s' "$detached_marker" | tr -d '\r')" != DETACHED_OK ]; then
+    echo "error: detached guest process did not survive client disconnect" >&2
+    exit 1
+fi
+detached_run_verified=true
+echo "beta.6 detached run completed after client disconnect."
+
+transfer_source="$e2e_root/transfer-source"
+transfer_pull="$e2e_root/transfer-pull"
+guest_transfer="C:\Windows\Temp\beta6-transfer-$$"
+mkdir -p -- "$transfer_source/nested"
+printf 'root-file\n' >"$transfer_source/root.txt"
+printf 'nested-file\n' >"$transfer_source/nested/file with space.txt"
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "if (Test-Path -LiteralPath '$guest_transfer') { Remove-Item -LiteralPath '$guest_transfer' -Recurse -Force }"
+"$lsw" push "$instance" --recursive "$transfer_source" "$guest_transfer"
+"$lsw" pull "$instance" --recursive "$guest_transfer" "$transfer_pull"
+cmp "$transfer_source/root.txt" "$transfer_pull/root.txt"
+cmp "$transfer_source/nested/file with space.txt" \
+    "$transfer_pull/nested/file with space.txt"
+recursive_transfer_verified=true
+echo "beta.6 recursive push and pull round-trip passed."
+
+sync_source="$e2e_root/sync-source"
+sync_log="$e2e_root/sync.log"
+guest_sync="C:\Windows\Temp\beta6-sync-$$"
+mkdir -p -- "$sync_source"
+printf 'sync-one' >"$sync_source/value.txt"
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "if (Test-Path -LiteralPath '$guest_sync') { Remove-Item -LiteralPath '$guest_sync' -Recurse -Force }"
+setsid "$lsw" sync "$instance" --watch "$sync_source" "$guest_sync" \
+    >"$sync_log" 2>&1 &
+sync_pid=$!
+attempt=0
+sync_value=
+while [ "$attempt" -lt 100 ]; do
+    sync_value=$(
+        "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+            "if (Test-Path -LiteralPath '$guest_sync\value.txt') { Get-Content -LiteralPath '$guest_sync\value.txt' -Raw }" \
+            2>/dev/null || :
+    )
+    if [ "$(printf '%s' "$sync_value" | tr -d '\r')" = sync-one ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if [ "$(printf '%s' "$sync_value" | tr -d '\r')" != sync-one ]; then
+    echo "error: sync --watch did not complete its initial tree upload" >&2
+    cat "$sync_log" >&2
+    exit 1
+fi
+printf 'sync-two' >"$sync_source/value.txt"
+mkdir -p -- "$sync_source/new-directory"
+printf 'new-file' >"$sync_source/new-directory/new.txt"
+attempt=0
+sync_value=
+sync_new_value=
+while [ "$attempt" -lt 100 ]; do
+    sync_value=$(
+        "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+            "Get-Content -LiteralPath '$guest_sync\value.txt' -Raw" 2>/dev/null || :
+    )
+    sync_new_value=$(
+        "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+            "if (Test-Path -LiteralPath '$guest_sync\new-directory\new.txt') { Get-Content -LiteralPath '$guest_sync\new-directory\new.txt' -Raw }" \
+            2>/dev/null || :
+    )
+    if [ "$(printf '%s' "$sync_value" | tr -d '\r')" = sync-two ] \
+        && [ "$(printf '%s' "$sync_new_value" | tr -d '\r')" = new-file ]
+    then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+if [ "$(printf '%s' "$sync_value" | tr -d '\r')" != sync-two ] \
+    || [ "$(printf '%s' "$sync_new_value" | tr -d '\r')" != new-file ]
+then
+    echo "error: sync --watch did not propagate a changed file and new directory" >&2
+    cat "$sync_log" >&2
+    exit 1
+fi
+rm -- "$sync_source/value.txt"
+sleep 2
+sync_value=$(
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        "Get-Content -LiteralPath '$guest_sync\value.txt' -Raw"
+)
+if [ "$(printf '%s' "$sync_value" | tr -d '\r')" != sync-two ]; then
+    echo "error: additive sync unexpectedly deleted the remote file" >&2
+    exit 1
+fi
+watch_sync_verified=true
+echo "beta.6 additive sync --watch passed."
+terminate_sync
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "foreach (\$Path in '$guest_detached_marker','$guest_transfer','$guest_sync') { if (Test-Path -LiteralPath \$Path) { Remove-Item -LiteralPath \$Path -Recurse -Force } }"
+
 if [ -n "$artifact_dir" ]; then
     "$lsw" bench "$instance" --json >"$artifact_dir/bench.json"
     chmod 600 "$artifact_dir/bench.json"

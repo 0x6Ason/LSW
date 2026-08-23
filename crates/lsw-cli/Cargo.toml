@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 lsw-core = { path = "../lsw-core" }
+signal-hook = "=0.3.17"

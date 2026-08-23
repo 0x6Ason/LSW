@@ -42,6 +42,19 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   cancel/disconnect cleanup, and legacy fallback. Capability-gated
   `session-lease-v1` provides 1-300 second leases, with a standard 120-second
   lease and 30-second heartbeat.
+- Capability-gated process environment, detached-start acknowledgement, and
+  interrupt/terminate frames. The client exposes `--cwd`, repeated `--env`, and
+  `run --detach`; Windows process groups remain owned by a kill-on-close Job.
+  Exact Windows 32-bit exit values stay intact on the wire, while the Unix CLI
+  explains values that cannot fit its 0-255 process status.
+- Recursive upload/download and additive `sync --watch`, with host-symlink,
+  guest-reparse-point, traversal, overwrite, and bounded-output checks. New and
+  changed files use guest-side atomic replacement; host deletions never imply a
+  destructive guest deletion.
+- Explicit drive-path conversion, dynamic host-loopback port allocation, and
+  Bash/Zsh/Fish/PowerShell completion generation.
+- Strict systemd-compatible user socket activation and packaged hardened unit
+  files, covered with a real `systemd-socket-activate` process/socket smoke.
 - Unix children enter a dedicated process group before `exec`; remaining group
   members are cleaned up after normal leader exit, cancellation, disconnect,
   protocol failure, or lease expiry. Windows children must enter a
@@ -81,7 +94,7 @@ still pass the dedicated Windows/KVM gate.
 
 Ordinary source and GitHub-hosted runners do not provide a real Windows 11/KVM
 environment. The following workloads run only on a dedicated,
-isolated Linux x86_64 self-hosted release runner. Beta.5 must not be described
+isolated Linux x86_64 self-hosted release runner. Beta.6 must not be described
 as hardware-attested until they succeed:
 
 - Microsoft's current published English x64 SHA must exactly match the
@@ -126,6 +139,12 @@ as hardware-attested until they succeed:
   remains after normal leader reaping. Windows Job Objects enforce ownership,
   but a host nested-job policy that rejects assignment makes the session fail
   closed. Neither mechanism is a guest security sandbox.
+- `sync` is intentionally one-way and additive, not a bidirectional conflict
+  resolver. It does not delete remote files when a host file disappears. Tree
+  transfer does not follow host symlinks or guest reparse points.
+- `run --detach` discards process standard streams and keeps the process owned
+  by the agent's Job. It does not turn a Session 0 process into a visible desktop
+  application.
 - There is no per-HWND Wayland/X11 compositor bridge, clipboard, audio, GPU
   acceleration, or shared-memory graphics driver. `lsw run` starts a guest
   process but does not create a Linux-native application window.
@@ -161,8 +180,9 @@ as hardware-attested until they succeed:
    payload are gone, with no console user or automatic login. Verify `LSWAgent`
    is Auto/Running with StartName `NT SERVICE\LSWAgent`. Under the service identity,
    test ConPTY Unicode, Ctrl, resize, stdin EOF, cancellation, disconnect and
-   lease expiry; exit-code propagation; descendant cleanup; 1 GiB transfer; and
-   concurrent commands. After full shutdown, use bare `lsw` to
+   lease expiry; cwd/environment injection; signal and exit-code propagation;
+   detached completion; descendant cleanup; recursive transfer; watch sync;
+   1 GiB transfer; and concurrent commands. After full shutdown, use bare `lsw` to
    verify cold-boot recovery with no interactive console user, no ISO/seed, and
    an unchanged service SID.
 4. Run `lsw license status`; verify the helper is Manual/LocalSystem and returns

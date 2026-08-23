@@ -7,10 +7,13 @@ compile_error!("the LSW 1.0 beta CLI currently requires a Unix host");
 
 mod agent_client;
 mod arguments;
+mod completion;
 mod daemon_client;
 mod installation;
 mod license;
+mod path_translation;
 mod progress;
+mod transfer;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -24,15 +27,17 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_client::AgentClient;
-use arguments::{next_value, parse_number, CreateArguments, InstallArguments};
+use arguments::{
+    next_value, parse_number, resolve_port_forwards, CreateArguments, InstallArguments,
+};
 use daemon_client::DaemonClient;
 use installation::install_instance;
 use license::{license, show_activation_notice_once};
 use lsw_core::{
     CustomizationPlan, HostCapabilities, InstallSeedBuilder, InstallSeedOptions, InstanceManifest,
     InstanceSpec, InstanceState, LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver,
-    PeImage, PeImportSymbol, Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest,
-    StateStore, VmAccelerator, WindowsProfile,
+    PeImage, PeImportSymbol, ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner,
+    SessionKind, StartRequest, StateStore, VmAccelerator, WindowsProfile,
 };
 
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -76,6 +81,14 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
             media(remaining)?;
             return Ok(0);
         }
+        "path" => {
+            path_translation::command(remaining)?;
+            return Ok(0);
+        }
+        "completion" => {
+            completion::command(remaining)?;
+            return Ok(0);
+        }
         _ => {}
     }
 
@@ -107,8 +120,9 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "shell" => return shell(&store, remaining),
         "exec" => return guest_command(&store, remaining, SessionKind::Exec),
         "run" => return guest_command(&store, remaining, SessionKind::Run),
-        "push" => push_file(&store, remaining)?,
-        "pull" => pull_file(&store, remaining)?,
+        "push" => transfer::push(&store, remaining)?,
+        "pull" => transfer::pull(&store, remaining)?,
+        "sync" => transfer::sync(&store, remaining)?,
         unknown => {
             return Err(format!("unknown command {unknown:?}; run `lsw help`").into());
         }
@@ -646,6 +660,7 @@ fn push_json_string(output: &mut String, value: &str) {
 fn create(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = CreateArguments::parse(arguments)?;
     let profile = parsed.profile;
+    let port_forwards = resolve_port_forwards(&parsed.port_forwards, &parsed.name)?;
     let spec = InstanceSpec {
         name: parsed.name,
         source_iso: absolute_path(&parsed.iso)?,
@@ -656,7 +671,7 @@ fn create(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
             .disk_gib
             .unwrap_or_else(|| profile.default_disk_gib()),
         network: parsed.network,
-        port_forwards: parsed.port_forwards,
+        port_forwards,
         license_accepted: parsed.accept_license,
         allow_unsupported_requirements: parsed.allow_unsupported_requirements,
     };
@@ -912,85 +927,137 @@ fn guest_command(
     arguments: &[OsString],
     kind: SessionKind,
 ) -> Result<u8, Box<dyn std::error::Error>> {
-    let command_name = match kind {
-        SessionKind::Run => "run",
-        SessionKind::Exec => "exec",
-        SessionKind::Shell => "shell",
-    };
-    let usage = format!("usage: lsw {command_name} [NAME] -- COMMAND [ARG ...]");
-    let separator = arguments
-        .iter()
-        .position(|argument| argument == OsStr::new("--"))
-        .ok_or_else(|| usage.clone())?;
-    if separator > 1 || separator + 1 >= arguments.len() {
-        return Err(usage.into());
-    }
-    let requested = arguments[..separator]
-        .first()
-        .map(|value| value.to_str().ok_or("instance name must be valid UTF-8"))
-        .transpose()?;
-    let name = resolve_name(store, requested)?;
-    let argv = arguments[separator + 1..]
-        .iter()
-        .map(|value| {
-            value
-                .to_str()
-                .map(str::to_owned)
-                .ok_or("guest arguments must be valid UTF-8")
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let request = StartRequest {
-        kind,
-        argv,
-        working_directory: None,
-    };
+    let parsed = GuestCommandArguments::parse(arguments, kind)?;
+    let name = resolve_name(store, parsed.requested.as_deref())?;
     let client = connect_agent(store, &name)?;
-    guest_exit_code(client.run(&request, true)?)
-}
-
-fn push_file(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    let (requested, source, destination) = transfer_arguments(arguments, "push")?;
-    let name = resolve_name(store, requested)?;
-    let source = PathBuf::from(source);
-    let destination = destination
-        .to_str()
-        .ok_or("guest destination must be valid UTF-8")?;
-    let bytes = connect_agent(store, &name)?.put_file(&source, destination)?;
-    println!(
-        "Transferred {bytes} bytes from {} to {name}:{}",
-        source.display(),
-        destination
-    );
-    Ok(())
-}
-
-fn pull_file(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    let (requested, source, destination) = transfer_arguments(arguments, "pull")?;
-    let name = resolve_name(store, requested)?;
-    let source = source.to_str().ok_or("guest source must be valid UTF-8")?;
-    let destination = PathBuf::from(destination);
-    let bytes = connect_agent(store, &name)?.get_file(source, &destination)?;
-    println!(
-        "Transferred {bytes} bytes from {name}:{} to {}",
-        source,
-        destination.display()
-    );
-    Ok(())
-}
-
-fn transfer_arguments<'a>(
-    arguments: &'a [OsString],
-    command: &str,
-) -> Result<(Option<&'a str>, &'a OsStr, &'a OsStr), Box<dyn std::error::Error>> {
-    match arguments {
-        [source, destination] => Ok((None, source.as_os_str(), destination.as_os_str())),
-        [name, source, destination] => Ok((
-            Some(name.to_str().ok_or("instance name must be valid UTF-8")?),
-            source.as_os_str(),
-            destination.as_os_str(),
-        )),
-        _ => Err(format!("usage: lsw {command} [NAME] SOURCE DESTINATION").into()),
+    if parsed.detached {
+        let process_id = client.run_detached(&parsed.request, &parsed.environment)?;
+        println!("Started detached process {process_id} in {name:?}.");
+        Ok(0)
+    } else {
+        guest_exit_code(client.run_with_environment(&parsed.request, true, &parsed.environment)?)
     }
+}
+
+#[derive(Debug)]
+struct GuestCommandArguments {
+    requested: Option<String>,
+    request: StartRequest,
+    environment: ProcessEnvironment,
+    detached: bool,
+}
+
+impl GuestCommandArguments {
+    fn parse(
+        arguments: &[OsString],
+        kind: SessionKind,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let command_name = match kind {
+            SessionKind::Run => "run",
+            SessionKind::Exec => "exec",
+            SessionKind::Shell => "shell",
+        };
+        let usage = format!(
+            "usage: lsw {command_name} [NAME] [--cwd PATH] [--env KEY=VALUE]{} -- COMMAND [ARG ...]",
+            if kind == SessionKind::Run {
+                " [--detach]"
+            } else {
+                ""
+            }
+        );
+        let separator = arguments
+            .iter()
+            .position(|argument| argument == OsStr::new("--"))
+            .ok_or_else(|| usage.clone())?;
+        if separator + 1 >= arguments.len() {
+            return Err(usage.into());
+        }
+        let mut requested = None;
+        let mut working_directory = None;
+        let mut environment = Vec::new();
+        let mut detached = false;
+        let mut index = 0;
+        while index < separator {
+            let argument = arguments[index]
+                .to_str()
+                .ok_or("guest options must be valid UTF-8")?;
+            match argument {
+                "--cwd" | "-C" => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| usage.clone())?;
+                    if value.is_empty() || working_directory.replace(value.to_owned()).is_some() {
+                        return Err(
+                            "--cwd requires one non-empty path and may appear only once".into()
+                        );
+                    }
+                }
+                "--env" | "-e" => {
+                    index += 1;
+                    let value = arguments
+                        .get(index)
+                        .and_then(|value| value.to_str())
+                        .ok_or_else(|| usage.clone())?;
+                    environment.push(parse_guest_environment(value)?);
+                }
+                "--detach" if kind == SessionKind::Run => {
+                    if detached {
+                        return Err("--detach was supplied more than once".into());
+                    }
+                    detached = true;
+                }
+                _ if argument.starts_with("--cwd=") => {
+                    let value = argument.trim_start_matches("--cwd=");
+                    if value.is_empty() || working_directory.replace(value.to_owned()).is_some() {
+                        return Err(
+                            "--cwd requires one non-empty path and may appear only once".into()
+                        );
+                    }
+                }
+                _ if argument.starts_with("--env=") => {
+                    environment.push(parse_guest_environment(
+                        argument.trim_start_matches("--env="),
+                    )?);
+                }
+                _ if argument.starts_with('-') => return Err(usage.into()),
+                _ => {
+                    if requested.replace(argument.to_owned()).is_some() {
+                        return Err(usage.into());
+                    }
+                }
+            }
+            index += 1;
+        }
+        let argv = arguments[separator + 1..]
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or("guest arguments must be valid UTF-8")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            requested,
+            request: StartRequest {
+                kind,
+                argv,
+                working_directory,
+            },
+            environment: ProcessEnvironment::new(environment)?,
+            detached,
+        })
+    }
+}
+
+fn parse_guest_environment(value: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (name, value) = value.split_once('=').ok_or("--env requires KEY=VALUE")?;
+    if name.is_empty() {
+        return Err("--env requires a non-empty variable name".into());
+    }
+    Ok((name.to_owned(), value.to_owned()))
 }
 
 fn connect_agent(
@@ -1052,10 +1119,11 @@ fn guest_exit_code(code: i32) -> Result<u8, Box<dyn std::error::Error>> {
     if (0..=255).contains(&code) {
         Ok(code as u8)
     } else {
-        Err(
-            format!("guest returned exit code {code}, which cannot be represented by the host")
-                .into(),
-        )
+        let windows_code = code as u32;
+        eprintln!(
+            "lsw: guest exit code {windows_code} (0x{windows_code:08X}) cannot be represented by a Unix shell; returning 255"
+        );
+        Ok(255)
     }
 }
 
@@ -1952,6 +2020,8 @@ fn print_help() {
         "  lsw inspect FILE [--imports] [--json]\n",
         "  lsw profile PROFILE\n",
         "  lsw media resolve [--language LANGUAGE]\n",
+        "  lsw path <--windows|-w|--unix|-u> PATH\n",
+        "  lsw completion <bash|zsh|fish|powershell>\n",
         "  lsw create NAME --iso PATH --accept-license [OPTIONS]\n",
         "  lsw prepare NAME [--execute]\n",
         "  lsw seed NAME [--locale LOCALE] [--agent PATH] [--unattended-index N] [--execute]\n",
@@ -1978,10 +2048,11 @@ fn print_help() {
         "  lsw resume [NAME]\n",
         "  lsw stop [NAME] [--force]\n",
         "  lsw shell [NAME]\n",
-        "  lsw exec [NAME] -- COMMAND [ARG ...]\n",
-        "  lsw run [NAME] -- PROGRAM [ARG ...]\n",
-        "  lsw push [NAME] HOST_FILE WINDOWS_PATH\n",
-        "  lsw pull [NAME] WINDOWS_PATH HOST_FILE\n",
+        "  lsw exec [NAME] [--cwd PATH] [-e KEY=VALUE] -- COMMAND [ARG ...]\n",
+        "  lsw run [NAME] [--cwd PATH] [-e KEY=VALUE] [--detach] -- PROGRAM [ARG ...]\n",
+        "  lsw push [NAME] [--recursive] HOST_PATH WINDOWS_PATH\n",
+        "  lsw pull [NAME] [--recursive] WINDOWS_PATH HOST_PATH\n",
+        "  lsw sync [NAME] [--watch] HOST_DIRECTORY WINDOWS_DIRECTORY\n",
         "  lsw daemon [start|status]\n",
         "  lsw                    enter the default instance shell\n\n",
         "CREATE OPTIONS:\n",
@@ -1991,6 +2062,7 @@ fn print_help() {
         "  --disk GIB           virtual disk size (profile default: 64)\n",
         "  --network MODE       nat (default) or offline\n",
         "  --publish HOST:GUEST publish a TCP guest port on host loopback; repeatable\n",
+        "  --publish auto:GUEST allocate an available host loopback port\n",
         "  --accept-license     confirm acceptance of the supplied media's license\n",
         "  --allow-unsupported-requirements\n",
         "                       permit an explicitly unsupported small VM\n\n",

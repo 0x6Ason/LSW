@@ -413,6 +413,18 @@ mod tests {
 
     use super::*;
 
+    fn available_published_port() -> u16 {
+        loop {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("port should bind");
+            let port = listener.local_addr().expect("address should exist").port();
+            if !(crate::AGENT_CONTROL_PORT_START..crate::AGENT_CONTROL_PORT_END_EXCLUSIVE)
+                .contains(&port)
+            {
+                return port;
+            }
+        }
+    }
+
     #[test]
     fn store_rejects_traversal_names() {
         let store = StateStore::new(std::env::temp_dir().join("lsw-store-name-test"));
@@ -519,6 +531,7 @@ mod tests {
         fs::create_dir_all(&root).expect("test root should be created");
         fs::write(&iso, b"test media").expect("test ISO should be created");
 
+        let shared_port = available_published_port();
         let second = InstanceManifest::new(InstanceSpec {
             name: "win-second".to_owned(),
             source_iso: iso.clone(),
@@ -527,7 +540,9 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
-            port_forwards: Vec::new(),
+            port_forwards: vec![
+                crate::PortForward::new(shared_port, 8081).expect("published port should be valid")
+            ],
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -540,8 +555,9 @@ mod tests {
             memory_mib: 4096,
             disk_gib: 64,
             network: NetworkMode::Nat,
-            port_forwards: vec![crate::PortForward::new(second.control_port, 8080)
-                .expect("published port should be valid")],
+            port_forwards: vec![
+                crate::PortForward::new(shared_port, 8080).expect("published port should be valid")
+            ],
             license_accepted: true,
             allow_unsupported_requirements: false,
         })
@@ -581,9 +597,13 @@ mod tests {
             })
             .expect("manifest should be valid")
         };
-        let first = build_manifest("port-owner-one");
+        let mut first = build_manifest("port-owner-one");
         let mut second = build_manifest("port-owner-two");
         assert_ne!(first.control_port, second.control_port);
+        let shared_port = available_published_port();
+        first.spec.port_forwards = vec![
+            crate::PortForward::new(shared_port, 8080).expect("published port should be valid")
+        ];
 
         let store = StateStore::new(root.join("state"));
         store
@@ -592,8 +612,9 @@ mod tests {
         store
             .create(&second)
             .expect("second instance should be stored");
-        second.spec.port_forwards = vec![crate::PortForward::new(first.control_port, 8080)
-            .expect("published port should be valid")];
+        second.spec.port_forwards = vec![
+            crate::PortForward::new(shared_port, 8081).expect("published port should be valid")
+        ];
         assert!(store.update(&second).is_err());
         assert!(store
             .load("port-owner-two")

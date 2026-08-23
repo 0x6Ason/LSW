@@ -1,7 +1,27 @@
 # Changelog
 
-## 1.0.0-beta.6 (in development)
+## 1.0.0-beta.6
 
+- Added complete remote process semantics. `exec` and `run` accept one guest
+  working directory and repeated, case-insensitively unique environment values;
+  authenticated `SIGINT`/`SIGTERM` forwarding returns exact 130/143 status;
+  ordinary Windows exit codes are preserved on the protocol, with explicit
+  decimal/hex reporting when the Unix 0-255 process status cannot represent
+  them. `run --detach` uses a capability-gated start acknowledgement and returns
+  the guest PID without making a Session 0 GUI visible.
+- Added recursive `push`/`pull` and additive host-to-guest `sync --watch`.
+  Recursive traversal rejects host symlinks, guest reparse points, unsafe paths,
+  and implicit overwrite. Watch sync atomically replaces changed files, creates
+  new directories, retries failed updates, and deliberately preserves remote
+  files after local deletion.
+- Added explicit `lsw path -w/-u` drive-path conversion, repeatable dynamic
+  `--publish auto:GUEST`/`0:GUEST` loopback allocation, and dependency-free
+  completion generation for Bash, Zsh, Fish, and PowerShell.
+- Added strict systemd user socket activation. `lswd` accepts exactly one
+  PID-scoped, optionally named descriptor only when its private Unix path and
+  permissions match the configured daemon socket. Release bundles include
+  hardened service/socket units and an end-to-end activation smoke test, while
+  direct CLI daemon autostart remains compatible.
 - Added a single terminal progress model for official ISO transfer and SHA-256
   verification, WinPE preparation and application, and unattended Windows
   first boot. Interactive terminals receive an in-place progress bar for
@@ -22,6 +42,10 @@
   first boot or verification was interrupted. A stopped instance with no seed
   resumes normal Windows boot and authenticated setup verification without
   reattaching installation media.
+- Expanded the real Windows/KVM exact-commit gate to cover cwd/environment,
+  host signal status, detached completion, recursive round-trip transfer, and
+  live additive workspace sync in addition to OOBE, SCM, ConPTY, activation,
+  shutdown, and cold restart.
 
 ## 1.0.0-beta.5
 

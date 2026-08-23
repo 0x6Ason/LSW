@@ -91,18 +91,20 @@ staged_bundle="$staging_directory/$bundle_name"
 staged_tar="$staging_directory/$bundle_name.tar"
 staged_archive="$staging_directory/$bundle_name.tar.gz"
 staged_checksum="$staged_archive.sha256"
-install -d -m 0755 -- "$staged_bundle/docs" "$staged_bundle/source"
+install -d -m 0755 -- "$staged_bundle/docs" "$staged_bundle/source" "$staged_bundle/systemd"
 install -m 0755 -- "$cargo_target_directory/release/lsw" "$staged_bundle/lsw"
 install -m 0755 -- "$cargo_target_directory/release/lswd" "$staged_bundle/lswd"
 install -m 0644 -- "$windows_agent" "$staged_bundle/lsw-agent.exe"
 install -m 0755 -- scripts/install.sh "$staged_bundle/install.sh"
+install -m 0644 -- contrib/systemd/lswd.service contrib/systemd/lswd.socket \
+    "$staged_bundle/systemd/"
 install -m 0644 -- README.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md "$staged_bundle/"
 install -m 0644 -- docs/ARCHITECTURE.md docs/BETA.md docs/LEGAL_BOUNDARIES.md \
     docs/DEVELOPMENT.md docs/REFERENCES.md docs/SECURITY.md \
     docs/WINDOWS_KVM_E2E.md "$staged_bundle/docs/"
 tar --exclude='*/__pycache__' --exclude='*.pyc' --exclude='*.pyo' \
     -cf - .github .gitattributes .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md \
-    THIRD_PARTY_NOTICES.md crates docs rustfmt.toml scripts | \
+    THIRD_PARTY_NOTICES.md contrib crates docs rustfmt.toml scripts | \
     tar -xf - -C "$staged_bundle/source"
 (
     cd "$staged_bundle/source"

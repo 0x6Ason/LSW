@@ -22,7 +22,7 @@ fn create_accepts_repeated_tcp_publish_options() {
     .collect::<Vec<_>>();
     let parsed = CreateArguments::parse(&arguments).expect("create options should parse");
     assert_eq!(
-        parsed.port_forwards,
+        resolve_port_forwards(&parsed.port_forwards, &parsed.name).expect("ports should resolve"),
         vec![
             PortForward::new(8080, 80).expect("ports should be valid"),
             PortForward::new(8443, 443).expect("ports should be valid"),
@@ -44,6 +44,89 @@ fn create_rejects_malformed_tcp_publish_option() {
     .map(OsString::from)
     .collect::<Vec<_>>();
     assert!(CreateArguments::parse(&arguments).is_err());
+}
+
+#[test]
+fn create_allocates_dynamic_loopback_ports() {
+    let arguments = [
+        "win-dev",
+        "--iso",
+        "windows.iso",
+        "--accept-license",
+        "--publish",
+        "auto:8080",
+        "--publish",
+        "0:8443",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    let parsed = CreateArguments::parse(&arguments).expect("dynamic ports should parse");
+    let forwards =
+        resolve_port_forwards(&parsed.port_forwards, &parsed.name).expect("ports should resolve");
+    assert_eq!(forwards.len(), 2);
+    assert_eq!(forwards[0].guest_port, 8080);
+    assert_eq!(forwards[1].guest_port, 8443);
+    assert_ne!(forwards[0].host_port, 0);
+    assert_ne!(forwards[0].host_port, forwards[1].host_port);
+    assert_ne!(
+        forwards[0].host_port,
+        lsw_core::control_port_for_instance(&parsed.name).unwrap()
+    );
+}
+
+#[test]
+fn guest_exec_parses_cwd_and_repeated_environment() {
+    let arguments = [
+        "win-dev",
+        "--cwd=C:\\work tree",
+        "-e",
+        "MODE=release",
+        "--env=EMPTY=",
+        "--",
+        "cmd.exe",
+        "/C",
+        "exit 23",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    let parsed = GuestCommandArguments::parse(&arguments, SessionKind::Exec)
+        .expect("exec arguments should parse");
+    assert_eq!(parsed.requested.as_deref(), Some("win-dev"));
+    assert_eq!(
+        parsed.request.working_directory.as_deref(),
+        Some("C:\\work tree")
+    );
+    assert_eq!(parsed.request.argv, vec!["cmd.exe", "/C", "exit 23"]);
+    assert_eq!(
+        parsed.environment.variables,
+        vec![
+            ("MODE".to_owned(), "release".to_owned()),
+            ("EMPTY".to_owned(), String::new()),
+        ]
+    );
+    assert!(!parsed.detached);
+}
+
+#[test]
+fn detach_is_run_only_and_environment_names_are_case_insensitive() {
+    let detached = ["--detach", "--", "worker.exe"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(
+        GuestCommandArguments::parse(&detached, SessionKind::Run)
+            .expect("run detach should parse")
+            .detached
+    );
+    assert!(GuestCommandArguments::parse(&detached, SessionKind::Exec).is_err());
+
+    let duplicate_environment = ["-e", "Path=one", "-e", "PATH=two", "--", "cmd.exe"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(GuestCommandArguments::parse(&duplicate_environment, SessionKind::Exec).is_err());
 }
 
 #[test]

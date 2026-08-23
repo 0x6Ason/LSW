@@ -99,7 +99,10 @@ instances/NAME/
 ## Control and guest protocols
 
 The daemon protocol is newline-delimited, versioned by `PING`, bounded, and
-available only on a mode-0600 socket in a mode-0700 directory. Mutations are
+available only on a mode-0600 socket in a mode-0700 directory. `lswd` can bind
+that socket directly or accept exactly one PID-scoped descriptor through the
+systemd activation environment; an inherited descriptor must resolve to the
+same private pathname before use. Mutations are
 strict commands (`START`, `SUSPEND`, `RESUME`, `STOP`) rather than shell strings.
 QEMU state is read and changed through negotiated QMP commands, never by
 trusting a PID file.
@@ -107,7 +110,8 @@ trusting a PID file.
 The agent protocol uses a five-byte binary frame header, an 8 MiB frame limit,
 explicit UTF-8 string lengths, a protocol version, and constant-time comparison
 of the per-instance token. Capability strings negotiate ConPTY, terminal resize,
-`session-control-v1`, and `session-lease-v1` without breaking older pipe-only
+`session-control-v1`, `session-lease-v1`, `process-environment-v1`,
+`detached-run-v1`, and `session-signal-v1` without breaking older pipe-only
 agents. Host forwarding binds to `127.0.0.1`; commands and file payloads are
 binary-safe. Upload and download destinations are never overwritten implicitly.
 
@@ -125,6 +129,20 @@ standard client requests 120 seconds and sends a heartbeat every 30 seconds;
 expiry closes both directions of the socket before output bridges are joined
 and reclaims the owned process group/Job. Capability negotiation leaves older
 or inconsistently advertising peers on the legacy path.
+
+Process environment and detach frames are valid only in the controlled-session
+preamble. Environment payloads are bounded, reject NUL and `=`, and treat names
+case-insensitively. Detached mode is limited to `RUN`, nulls standard streams,
+and returns a bounded process ID only after the Windows child has entered its
+Job. Signal frames are authenticated session-control messages; interrupt and
+terminate map to exact status 130 and 143 after the owned process tree stops.
+
+Recursive transfer is composed from bounded single-file protocol operations.
+Remote directory discovery runs a fixed PowerShell program with paths supplied
+only through the validated environment frame; paths are emitted as hexadecimal
+UTF-8 fields so whitespace cannot change framing. Watch sync uploads a unique
+temporary peer and renames it into place, which keeps each observed file update
+atomic without defining destructive mirror semantics.
 
 On Unix the child enters a new process group in the pre-`exec` path. LSW signals
 that group after a normal leader exit and on cancellation, disconnect, protocol
@@ -166,11 +184,15 @@ by the dedicated real Windows/KVM release gate.
 QEMU user networking always forwards the private per-instance agent port to
 host loopback. A manifest may additionally contain repeatable TCP mappings from
 `--publish HOST:GUEST`; these are rendered as loopback-only QEMU `hostfwd`
-entries. Validation rejects port zero, duplicate host ports, the instance's
+entries. Validation rejects persisted port zero, duplicate host ports, the instance's
 reserved agent port, collisions with another instance or an already-bound local
 listener at creation time, and publishing in `offline` mode. This feature does
 not expose UDP, bind a LAN address, or provide transport authentication for the
 guest application.
+
+At the CLI boundary, `auto:GUEST` and `0:GUEST` ask the kernel for an available
+loopback port before manifest validation; the selected nonzero value is then
+persisted and subjected to the same collision checks as an explicit port.
 
 ## PE inspection
 

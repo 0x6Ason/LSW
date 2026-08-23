@@ -68,6 +68,7 @@ not exercised.
 CI also builds `lsw` and `lswd` and runs:
 
 ```sh
+scripts/check-systemd-socket-activation.sh
 LSW_QEMU_LIFECYCLE_REQUIRE=1 scripts/check-lsw-qemu-lifecycle.sh
 ```
 
@@ -110,7 +111,9 @@ boundary. The real Windows/KVM gate therefore queries both services, proves a
 license-status request returns the helper to `Stopped`, verifies that the agent
 service process and command identities resolve to the same `S-1-5-80-...` SID,
 and requires that SID to remain stable across a full shutdown and bare-`lsw`
-boot.
+boot. The exact-commit gate also exercises beta.6 cwd/environment injection,
+SIGTERM status, detached completion, recursive tree round-trip, and live
+additive `sync --watch` against that service-backed guest.
 
 ## Release bundle
 

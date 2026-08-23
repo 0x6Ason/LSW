@@ -30,7 +30,10 @@ pub use iso_download::{
     IsoDownloadReport, IsoDownloader, MicrosoftIsoRequest, MicrosoftIsoResolver,
     ResolvedWindowsIso, SecretDownloadUrl,
 };
-pub use manifest::{InstanceManifest, InstanceSpec, InstanceState, NetworkMode, PortForward};
+pub use manifest::{
+    control_port_for_instance, InstanceManifest, InstanceSpec, InstanceState, NetworkMode,
+    PortForward, AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START,
+};
 pub use pe::{
     PeAssessment, PeImage, PeImport, PeImportSymbol, PeKind, PeMachine, PeSection, PeSubsystem,
     PeSupportLevel,
@@ -56,12 +59,13 @@ pub const AGENT_TOKEN_FILE: &str = "agent.token";
 pub const DAEMON_PROTOCOL_VERSION: u16 = 2;
 pub const MANIFEST_FILE: &str = "instance.lsw";
 pub use agent_protocol::{
-    constant_time_token_eq, decode_exit, decode_file_length, decode_resize, encode_exit,
-    encode_file_length, encode_resize, read_frame, write_frame, ClientHello, FileGetRequest,
-    FilePutRequest, Frame, FrameKind, ServerHello, SessionKind, SessionLease, SessionLeaseState,
-    SessionOptions, StartRequest, TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_CONPTY_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
-    CAPABILITY_TERMINAL_RESIZE_V1, DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS, MAX_FRAME_BYTES,
-    MAX_SESSION_LEASE_TIMEOUT_MILLIS, MAX_TERMINAL_DIMENSION, MIN_SESSION_LEASE_TIMEOUT_MILLIS,
-    SESSION_CANCEL_EXIT_CODE,
+    constant_time_token_eq, decode_exit, decode_file_length, decode_process_id, decode_resize,
+    encode_exit, encode_file_length, encode_process_id, encode_resize, read_frame, write_frame,
+    ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, ProcessEnvironment, ServerHello,
+    SessionKind, SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
+    TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
+    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1,
+    CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS, MAX_FRAME_BYTES, MAX_SESSION_LEASE_TIMEOUT_MILLIS,
+    MAX_TERMINAL_DIMENSION, MIN_SESSION_LEASE_TIMEOUT_MILLIS, SESSION_CANCEL_EXIT_CODE,
 };

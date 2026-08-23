@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -9,6 +10,9 @@ pub const AGENT_PROTOCOL_VERSION: u16 = 1;
 pub const CAPABILITY_CONPTY_V1: &str = "conpty-v1";
 pub const CAPABILITY_SESSION_CONTROL_V1: &str = "session-control-v1";
 pub const CAPABILITY_SESSION_LEASE_V1: &str = "session-lease-v1";
+pub const CAPABILITY_PROCESS_ENVIRONMENT_V1: &str = "process-environment-v1";
+pub const CAPABILITY_DETACHED_RUN_V1: &str = "detached-run-v1";
+pub const CAPABILITY_SESSION_SIGNAL_V1: &str = "session-signal-v1";
 pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
@@ -43,6 +47,10 @@ pub enum FrameKind {
     FileDone = 23,
     SessionLease = 24,
     SessionHeartbeat = 25,
+    ProcessEnvironment = 26,
+    SessionDetach = 27,
+    Started = 28,
+    SessionSignal = 29,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -71,6 +79,10 @@ impl TryFrom<u8> for FrameKind {
             23 => Ok(Self::FileDone),
             24 => Ok(Self::SessionLease),
             25 => Ok(Self::SessionHeartbeat),
+            26 => Ok(Self::ProcessEnvironment),
+            27 => Ok(Self::SessionDetach),
+            28 => Ok(Self::Started),
+            29 => Ok(Self::SessionSignal),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -202,6 +214,125 @@ pub struct StartRequest {
     pub kind: SessionKind,
     pub argv: Vec<String>,
     pub working_directory: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProcessEnvironment {
+    pub variables: Vec<(String, String)>,
+}
+
+impl ProcessEnvironment {
+    pub fn new(variables: Vec<(String, String)>) -> Result<Self> {
+        validate_environment(&variables)?;
+        Ok(Self { variables })
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        validate_environment(&self.variables)?;
+        let mut flattened = Vec::with_capacity(self.variables.len() * 2);
+        for (name, value) in &self.variables {
+            flattened.push(name.clone());
+            flattened.push(value.clone());
+        }
+        let mut payload = Vec::new();
+        push_strings(&mut payload, &flattened)?;
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let flattened = decoder.strings()?;
+        decoder.finish()?;
+        if flattened.len() % 2 != 0 {
+            return Err(LswError::Protocol(
+                "process environment must contain name/value pairs".to_owned(),
+            ));
+        }
+        let variables = flattened
+            .chunks_exact(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect();
+        Self::new(variables)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.variables.is_empty()
+    }
+}
+
+fn validate_environment(variables: &[(String, String)]) -> Result<()> {
+    if variables.len() > MAX_ARGUMENTS / 2 {
+        return Err(LswError::Protocol(format!(
+            "more than {} environment variables",
+            MAX_ARGUMENTS / 2
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for (name, value) in variables {
+        if name.is_empty() || name.contains(['=', '\0']) {
+            return Err(LswError::Protocol(
+                "environment variable names must be non-empty and contain neither '=' nor NUL"
+                    .to_owned(),
+            ));
+        }
+        if value.contains('\0') {
+            return Err(LswError::Protocol(
+                "environment variable values must not contain NUL".to_owned(),
+            ));
+        }
+        if !names.insert(name.to_uppercase()) {
+            return Err(LswError::Protocol(format!(
+                "environment variable {name:?} was supplied more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionSignal {
+    Interrupt,
+    Terminate,
+}
+
+impl SessionSignal {
+    pub const fn exit_code(self) -> i32 {
+        match self {
+            Self::Interrupt => 130,
+            Self::Terminate => 143,
+        }
+    }
+
+    pub const fn encode(self) -> [u8; 1] {
+        [match self {
+            Self::Interrupt => 1,
+            Self::Terminate => 2,
+        }]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        match payload {
+            [1] => Ok(Self::Interrupt),
+            [2] => Ok(Self::Terminate),
+            [value] => Err(LswError::Protocol(format!(
+                "unknown session signal {value}"
+            ))),
+            _ => Err(LswError::Protocol(
+                "session signal payload must contain one byte".to_owned(),
+            )),
+        }
+    }
+}
+
+pub fn encode_process_id(process_id: u32) -> [u8; 4] {
+    process_id.to_be_bytes()
+}
+
+pub fn decode_process_id(payload: &[u8]) -> Result<u32> {
+    let bytes: [u8; 4] = payload
+        .try_into()
+        .map_err(|_| LswError::Protocol("process ID must contain four bytes".to_owned()))?;
+    Ok(u32::from_be_bytes(bytes))
 }
 
 /// Opts a single authenticated process session into capability-gated control
@@ -687,6 +818,44 @@ mod tests {
             StartRequest::decode(&request.encode().expect("request should encode"))
                 .expect("request should decode"),
             request
+        );
+    }
+
+    #[test]
+    fn process_environment_is_bounded_unambiguous_and_case_insensitive() {
+        let environment = ProcessEnvironment::new(vec![
+            ("LSW_MODE".to_owned(), "development".to_owned()),
+            ("UNICODE".to_owned(), "données".to_owned()),
+        ])
+        .expect("environment should validate");
+        assert_eq!(
+            ProcessEnvironment::decode(&environment.encode().expect("environment should encode"))
+                .expect("environment should decode"),
+            environment
+        );
+        assert!(ProcessEnvironment::new(vec![("".to_owned(), "x".to_owned())]).is_err());
+        assert!(ProcessEnvironment::new(vec![
+            ("Path".to_owned(), "one".to_owned()),
+            ("PATH".to_owned(), "two".to_owned()),
+        ])
+        .is_err());
+        assert!(ProcessEnvironment::decode(&[0, 1, 0, 0, 0, 1, b'X']).is_err());
+    }
+
+    #[test]
+    fn signal_and_process_id_payloads_are_exact() {
+        for signal in [SessionSignal::Interrupt, SessionSignal::Terminate] {
+            assert_eq!(
+                SessionSignal::decode(&signal.encode()).expect("signal should decode"),
+                signal
+            );
+        }
+        assert_eq!(SessionSignal::Interrupt.exit_code(), 130);
+        assert_eq!(SessionSignal::Terminate.exit_code(), 143);
+        assert!(SessionSignal::decode(&[3]).is_err());
+        assert_eq!(
+            decode_process_id(&encode_process_id(u32::MAX)).expect("PID should decode"),
+            u32::MAX
         );
     }
 
