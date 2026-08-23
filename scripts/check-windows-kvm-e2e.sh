@@ -340,6 +340,14 @@ collect_e2e_artifacts() {
                 --output "$artifact_dir/diagnose.tar.gz" >/dev/null 2>&1 || :
         fi
     fi
+    if [ -f "$e2e_root/lswd.log" ]; then
+        tail -c 131072 "$e2e_root/lswd.log" >"$artifact_dir/lswd.log"
+        chmod 600 "$artifact_dir/lswd.log"
+    fi
+    if [ -f "$LSW_STATE_DIR/lswd.log" ]; then
+        tail -c 131072 "$LSW_STATE_DIR/lswd.log" >"$artifact_dir/lswd-autospawn.log"
+        chmod 600 "$artifact_dir/lswd-autospawn.log"
+    fi
     artifacts_collected=1
 }
 
@@ -652,7 +660,11 @@ if [ "$e2e_no_viewer" != 1 ]; then
 fi
 mkdir -p -- "$LSW_STATE_DIR"
 chmod 700 "$LSW_STATE_DIR"
-setsid "$lswd" >"$e2e_root/lswd.log" 2>&1 &
+# WinPE preparation and apply run directly from the installer and therefore do
+# not count as daemon-owned work. Keep this explicitly tracked gate daemon
+# alive across those bounded phases; the cold-start path below still uses the
+# product's default 30-second idle configuration.
+LSW_DAEMON_IDLE_SECONDS=3600 setsid "$lswd" >"$e2e_root/lswd.log" 2>&1 &
 daemon_pid=$!
 daemon_ready=0
 daemon_attempt=0
