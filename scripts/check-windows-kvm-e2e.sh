@@ -699,12 +699,14 @@ if [ -z "$viewer_option" ]; then
         --iso "$iso" \
         --edition "$edition" \
         --profile "$profile" \
+        --accept-windows-license \
         --agent "$agent"
 else
     "$lsw" install "$instance" \
         --iso "$iso" \
         --edition "$edition" \
         --profile "$profile" \
+        --accept-windows-license \
         --agent "$agent" \
         "$viewer_option"
 

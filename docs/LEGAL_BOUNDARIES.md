@@ -16,9 +16,14 @@ systems, firmware, hypervisors, installation media, trademarks, or user data.
   attribution and corresponding-source boundary.
 - Users remain responsible for license entitlement, activation, edition and
   VM/device limits. `--iso` accepts user-supplied authorized offline media.
-- The installation command records the user's request to install Windows. The
-  generated answer file may set the documented Windows Setup `AcceptEula`
-  value; LSW does not grant a Windows license or activation entitlement.
+- A new interactive installation requires `[y/N]` confirmation of the
+  applicable Microsoft Windows license terms. Noninteractive use fails unless
+  `--accept-windows-license` is present. Only after that explicit action may the
+  generated answer file set the documented Windows Setup `AcceptEula` value.
+  Users can review the [Microsoft licensing
+  documents](https://aka.ms/licensingdocs); the terms supplied with the media or
+  applicable retail/volume agreement control. LSW does not grant a Windows
+  license or activation entitlement.
 - The beta does not add a `ProductKey`, bypass activation, use the deprecated
   `SkipMachineOOBE` setting, or disable UAC. The user accepts the media's license
   terms before install. LSW then uses Microsoft's supported unattended OOBE
@@ -52,3 +57,7 @@ systems, firmware, hypervisors, installation media, trademarks, or user data.
 
 Windows, macOS, Apple, Microsoft and other names belong to their respective
 owners. LSW should describe compatibility without implying vendor endorsement.
+
+LSW's GPL-3.0-or-later license is not a separate product EULA and does not need
+a synthetic click-through acceptance prompt. The installer identifies that
+license and the bundled third-party notices independently from Windows terms.

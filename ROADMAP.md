@@ -48,6 +48,14 @@ and gives desktop work a safe file-sharing foundation.
 - Establish the Windows interactive-user companion and authenticated bulk
   transport needed by later GUI, clipboard, and drag-and-drop work without
   weakening the Session 0 service boundary.
+- Add `lsw user setup` and an optional post-install prompt for a permanent
+  standard Windows desktop user. Terminal-only installs may defer it. Username
+  validation and masked password confirmation must be local; the password must
+  never enter argv, environment, the manifest, installation seed, logs, or
+  diagnostics. Administrator membership requires a separate explicit choice.
+- Do not enable Windows AutoLogon. A desktop session may request the password at
+  launch or use an explicitly enabled Linux Secret Service/keyring entry; the
+  normal SCM agent must remain usable before any interactive user signs in.
 - Keep signed VirtIO networking, filesystem, balloon, and vsock acceleration
   optional. Inbox-device installation and recovery must continue to work.
 

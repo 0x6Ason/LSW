@@ -60,6 +60,20 @@ lsw install win-dev
 lsw
 ```
 
+A new interactive installation displays the Windows licensing boundary and
+requires `[y/N]` confirmation before any download or instance creation.
+Noninteractive automation must be explicit:
+
+```bash
+lsw install win-dev --accept-windows-license
+```
+
+`--accept-license` remains a compatibility alias. The confirmation applies only
+to the Microsoft Software License Terms for the selected Windows media. LSW is
+licensed under GPL-3.0-or-later and does not add a second click-through EULA.
+Review the [Microsoft licensing documents](https://aka.ms/licensingdocs) and the
+terms supplied with the media or applicable retail/volume agreement.
+
 The one-shot installer performs the following steps:
 
 1. Checks the host and repairs missing packages through the distribution's
@@ -98,11 +112,11 @@ Edition inspection temporarily extracts the ISO's install WIM/ESD into LSW's
 private state directory and removes it immediately after reading its metadata.
 Ensure the state filesystem has enough free space for that temporary file.
 
-The command records that the user is responsible for the license terms of the
-media they selected. It does not add a product key, bypass activation, use the
-deprecated `SkipMachineOOBE` setting, or disable UAC. It automates the supported
-OOBE settings with a random one-shot local account, then removes that account
-before installation is reported complete.
+The command records explicit Windows-license acceptance before setting Windows
+Setup `AcceptEula=true`. It does not add a product key, grant an entitlement,
+bypass activation, use the deprecated `SkipMachineOOBE` setting, or disable UAC.
+It automates the supported OOBE settings with a random one-shot local account,
+then removes that account before installation is reported complete.
 
 The pre-applied unattend registers the guest agent during `specialize` as the
 automatic Windows service `LSWAgent`, running as the virtual account
@@ -262,7 +276,7 @@ The following commands remain available for debugging, automation, and manual
 recovery, but are not part of the beginner path:
 
 ```bash
-lsw create NAME --iso PATH --accept-license [OPTIONS]
+lsw create NAME --iso PATH --accept-windows-license [OPTIONS]
 lsw prepare NAME [--execute]
 lsw seed NAME [OPTIONS] [--execute]
 lsw plan NAME [--run]

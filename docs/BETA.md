@@ -13,6 +13,10 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   allowlisted Microsoft HTTPS CDNs, downloads with aria2c or a native four-range
   resumable engine, refreshes expired signed URLs, and verifies Microsoft's
   exact SHA-256. Offline `--iso` mode remains available.
+- New interactive installs require `[y/N]` Windows-license confirmation before
+  download or instance creation. Redirected/noninteractive use fails closed
+  unless `--accept-windows-license` is present; `--accept-license` remains a
+  compatibility alias.
 - The network-disabled `WinPeDismBackend` uses real DISM from the official ISO
   to prepare a profile WIM, then applies it to the instance qcow2 in a separate
   phase. The phases use distinct disk topologies, OVMF variables, and exact
@@ -178,9 +182,9 @@ The broader hardware and soak matrix still includes:
 1. On a dedicated Linux x86_64 KVM host, run `lsw doctor` and provision a
    read-only Windows 11 ISO that exactly matches Microsoft's current English
    x64 published SHA.
-2. Run `lsw install NAME --iso PATH --edition pro --profile slim`; verify both
-   WinPE completion markers and removal of the workspace and seed before normal
-   boot.
+2. Run `lsw install NAME --iso PATH --edition pro --profile slim
+   --accept-windows-license`; verify both WinPE completion markers and removal
+   of the workspace and seed before normal boot.
 3. Let the headless install complete without console input. Confirm the
    one-shot `LSWSetup` account, cached unattend, SetupComplete script, and setup
    payload are gone, with no console user or automatic login. Verify `LSWAgent`

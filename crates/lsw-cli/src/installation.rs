@@ -9,6 +9,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -221,6 +222,7 @@ fn install_new_instance(
         .requested
         .as_deref()
         .ok_or("usage: lsw install NAME [--iso PATH] [--edition EDITION] [OPTIONS]")?;
+    let license_accepted = confirm_windows_license(parsed.accept_windows_license)?;
     let capabilities = ensure_install_dependencies(parsed.profile, true, !parsed.no_viewer)?;
     let iso = match supplied_iso {
         Some(iso) => absolute_path(&iso)?,
@@ -270,7 +272,7 @@ fn install_new_instance(
             .unwrap_or_else(|| parsed.profile.default_disk_gib()),
         network: parsed.network,
         port_forwards: resolve_port_forwards(&parsed.port_forwards, name)?,
-        license_accepted: true,
+        license_accepted,
         allow_unsupported_requirements: parsed.allow_unsupported_requirements,
     };
     let manifest = InstanceManifest::new(spec)?;
@@ -360,6 +362,61 @@ fn install_new_instance(
         store.set_default(name)?;
     }
     Ok(())
+}
+
+fn confirm_windows_license(accepted_by_option: bool) -> Result<bool, Box<dyn std::error::Error>> {
+    if accepted_by_option {
+        println!("Microsoft Windows license acceptance confirmed by --accept-windows-license.");
+        println!("LSW is GPL-3.0-or-later; see LICENSE and THIRD_PARTY_NOTICES.md.");
+        return Ok(true);
+    }
+
+    let stdin = io::stdin();
+    let mut stderr = io::stderr();
+    if !stdin.is_terminal() || !stderr.is_terminal() {
+        return Err(
+            "a new Windows installation requires explicit license acceptance; rerun with --accept-windows-license"
+                .into(),
+        );
+    }
+
+    writeln!(
+        stderr,
+        "Windows is proprietary software. Review and accept the Microsoft Software License Terms that apply to this media and your use."
+    )?;
+    writeln!(
+        stderr,
+        "Microsoft licensing documents: https://aka.ms/licensingdocs"
+    )?;
+    writeln!(
+        stderr,
+        "The terms supplied with your media or applicable retail/volume agreement control."
+    )?;
+    writeln!(
+        stderr,
+        "LSW does not grant a Windows license or activation entitlement."
+    )?;
+    writeln!(
+        stderr,
+        "LSW itself is GPL-3.0-or-later; see LICENSE and THIRD_PARTY_NOTICES.md."
+    )?;
+    write!(
+        stderr,
+        "Continue and set Windows Setup AcceptEula=true? [y/N] "
+    )?;
+    stderr.flush()?;
+
+    let mut response = String::new();
+    stdin.read_line(&mut response)?;
+    if affirmative_license_response(&response) {
+        Ok(true)
+    } else {
+        Err("Windows license terms were not accepted; no instance was created".into())
+    }
+}
+
+pub(super) fn affirmative_license_response(response: &str) -> bool {
+    response.trim().eq_ignore_ascii_case("y") || response.trim().eq_ignore_ascii_case("yes")
 }
 
 fn download_official_windows_iso(

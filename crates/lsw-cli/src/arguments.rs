@@ -28,6 +28,7 @@ pub(super) struct InstallArguments {
     pub(super) disk_gib: Option<u32>,
     pub(super) network: NetworkMode,
     pub(super) port_forwards: Vec<PortForwardRequest>,
+    pub(super) accept_windows_license: bool,
     pub(super) allow_unsupported_requirements: bool,
     pub(super) seed: InstallSeedOptions,
     pub(super) without_agent: bool,
@@ -51,6 +52,7 @@ impl InstallArguments {
             disk_gib: None,
             network: NetworkMode::Nat,
             port_forwards: Vec::new(),
+            accept_windows_license: false,
             allow_unsupported_requirements: false,
             seed: InstallSeedOptions::default(),
             without_agent: false,
@@ -148,7 +150,12 @@ impl InstallArguments {
                     parsed.allow_unsupported_requirements = true;
                     parsed.create_option_seen = true;
                 }
-                "--accept-license" => {}
+                "--accept-windows-license" | "--accept-license" => {
+                    if parsed.accept_windows_license {
+                        return Err("Windows license acceptance was supplied more than once".into());
+                    }
+                    parsed.accept_windows_license = true;
+                }
                 value if value.starts_with('-') => {
                     return Err(format!("unknown install option {value:?}").into())
                 }
@@ -174,7 +181,7 @@ pub(super) struct CreateArguments {
     pub(super) disk_gib: Option<u32>,
     pub(super) network: NetworkMode,
     pub(super) port_forwards: Vec<PortForwardRequest>,
-    pub(super) accept_license: bool,
+    pub(super) accept_windows_license: bool,
     pub(super) allow_unsupported_requirements: bool,
 }
 
@@ -183,7 +190,7 @@ impl CreateArguments {
         let name = arguments
             .first()
             .and_then(|value| value.to_str())
-            .ok_or("usage: lsw create NAME --iso PATH --accept-license")?
+            .ok_or("usage: lsw create NAME --iso PATH --accept-windows-license")?
             .to_owned();
         let mut iso = None;
         let mut profile = WindowsProfile::Slim;
@@ -192,7 +199,7 @@ impl CreateArguments {
         let mut disk_gib = None;
         let mut network = NetworkMode::Nat;
         let mut port_forwards = Vec::new();
-        let mut accept_license = false;
+        let mut accept_windows_license = false;
         let mut allow_unsupported_requirements = false;
         let mut index = 1;
 
@@ -215,7 +222,12 @@ impl CreateArguments {
                     let value = next_value(arguments, &mut index, option)?;
                     port_forwards.push(parse_publish(value)?);
                 }
-                "--accept-license" => accept_license = true,
+                "--accept-windows-license" | "--accept-license" => {
+                    if accept_windows_license {
+                        return Err("Windows license acceptance was supplied more than once".into());
+                    }
+                    accept_windows_license = true;
+                }
                 "--allow-unsupported-requirements" => allow_unsupported_requirements = true,
                 unknown => return Err(format!("unknown create option {unknown:?}").into()),
             }
@@ -231,7 +243,7 @@ impl CreateArguments {
             disk_gib,
             network,
             port_forwards,
-            accept_license,
+            accept_windows_license,
             allow_unsupported_requirements,
         })
     }

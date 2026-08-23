@@ -129,12 +129,13 @@ if [ -n "$unexpected_node" ]; then
 fi
 
 for required_file in \
-    BUILDINFO.txt CHANGELOG.md LICENSE README.md THIRD_PARTY_NOTICES.md \
+    BUILDINFO.txt CHANGELOG.md LICENSE README.md ROADMAP.md THIRD_PARTY_NOTICES.md \
     SOURCE-MANIFEST.sha256 \
     install.sh lsw lsw-agent.exe lswd \
     systemd/lswd.service systemd/lswd.socket \
     docs/DEVELOPMENT.md docs/WINDOWS_KVM_E2E.md \
     source/Cargo.lock source/Cargo.toml source/LICENSE source/README.md \
+    source/ROADMAP.md \
     source/THIRD_PARTY_NOTICES.md \
     source/contrib/systemd/lswd.service source/contrib/systemd/lswd.socket \
     source/.cargo/config.toml \

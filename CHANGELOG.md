@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Added explicit Windows-license acceptance to new one-shot installations.
+  Interactive terminals require `[y/N]` confirmation before media download or
+  instance creation; noninteractive use requires `--accept-windows-license`.
+  The older `--accept-license` spelling remains a compatibility alias. LSW's
+  GPL-3.0-or-later notice stays separate and is not presented as another EULA.
+- Added a dedicated experience-first roadmap covering optional low-memory
+  systemd operation, desktop-user setup, host-folder sharing, Linux-native
+  Windows GUI applications, clipboard and file drag-and-drop, full-screen and
+  multi-monitor behavior, reversible shell-light optimization, and ARM64 only
+  after those paths stabilize.
+
 ## 1.0.0-beta.6
 
 - Added complete remote process semantics. `exec` and `run` accept one guest

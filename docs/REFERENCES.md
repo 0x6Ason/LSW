@@ -7,6 +7,7 @@ the license supplied with a user's specific media.
 - [Microsoft: Windows 11 requirements](https://learn.microsoft.com/en-us/windows/whats-new/windows-11-requirements)
 - [Microsoft: Download Windows 11](https://www.microsoft.com/software-download/windows11)
 - [Microsoft: AcceptEula unattended setting](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-setup-userdata-accepteula)
+- [Microsoft licensing documents](https://aka.ms/licensingdocs)
 - [Microsoft: Automate OOBE](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/automate-oobe)
 - [Microsoft: OOBE unattended settings](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-oobe)
 - [Microsoft: UserAccounts](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-useraccounts)

@@ -32,13 +32,16 @@ validation claims in the beta.6 release.
 ## Lifecycle
 
 1. `lsw install NAME` provides the beta.6 beginner path; `lsw create` remains an
-   advanced primitive. The installer validates the requested shape and stores
-   manifest v4 plus a random 256-bit per-instance agent token. Without `--iso`,
-   it resolves the current official Windows 11 x64 media from Microsoft,
-   downloads from an allowlisted HTTPS CDN with at most four connections, and
-   verifies Microsoft's published SHA-256. `--iso` retains a local offline
-   path. Version 1 and 2 manifests migrate with no published ports; version 3
-   manifests receive the default idle-timeout setting.
+   advanced primitive. Before a new instance is created or media is downloaded,
+   an interactive terminal requires `[y/N]` Windows-license confirmation and
+   noninteractive use requires `--accept-windows-license`. The installer then
+   validates the requested shape and stores manifest v4 plus a random 256-bit
+   per-instance agent token. Without `--iso`, it resolves the current official
+   Windows 11 x64 media from Microsoft, downloads from an allowlisted HTTPS CDN
+   with at most four connections, and verifies Microsoft's published SHA-256.
+   `--iso` retains a local offline path. Version 1 and 2 manifests migrate with
+   no published ports; version 3 manifests receive the default idle-timeout
+   setting.
 2. The installer selects Windows 11 Pro by WIM metadata unless the user chooses
    another edition. A network-disabled WinPE microVM uses the official media's
    DISM to export and service a profile-specific WIM in a private workspace,

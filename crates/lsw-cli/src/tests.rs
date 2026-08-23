@@ -11,7 +11,7 @@ fn create_accepts_repeated_tcp_publish_options() {
         "win-dev",
         "--iso",
         "windows.iso",
-        "--accept-license",
+        "--accept-windows-license",
         "--publish",
         "8080:80",
         "--publish",
@@ -140,6 +140,7 @@ fn one_shot_install_parses_the_beta_six_beginner_flow() {
         "--profile",
         "slim",
         "--no-viewer",
+        "--accept-windows-license",
     ]
     .into_iter()
     .map(OsString::from)
@@ -150,6 +151,32 @@ fn one_shot_install_parses_the_beta_six_beginner_flow() {
     assert_eq!(parsed.edition.as_deref(), Some("pro"));
     assert_eq!(parsed.profile, WindowsProfile::Slim);
     assert!(parsed.no_viewer);
+    assert!(parsed.accept_windows_license);
+}
+
+#[test]
+fn windows_license_acceptance_has_a_clear_option_and_compatibility_alias() {
+    for option in ["--accept-windows-license", "--accept-license"] {
+        let arguments = ["win-dev", option]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let parsed = InstallArguments::parse(&arguments).expect("license option should parse");
+        assert!(parsed.accept_windows_license);
+    }
+
+    let duplicate = ["win-dev", "--accept-windows-license", "--accept-license"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(InstallArguments::parse(&duplicate).is_err());
+
+    for accepted in ["y", "Y", "yes", "YES", " yes "] {
+        assert!(installation::affirmative_license_response(accepted));
+    }
+    for rejected in ["", "n", "no", "true", "1"] {
+        assert!(!installation::affirmative_license_response(rejected));
+    }
 }
 
 #[test]
@@ -165,6 +192,7 @@ fn automatic_install_defaults_to_slim_english_and_microsoft_media() {
     assert!(parsed.iso.is_none());
     assert!(!parsed.language_option_seen);
     assert!(parsed.no_viewer);
+    assert!(!parsed.accept_windows_license);
 }
 
 #[test]

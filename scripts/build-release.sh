@@ -98,13 +98,14 @@ install -m 0644 -- "$windows_agent" "$staged_bundle/lsw-agent.exe"
 install -m 0755 -- scripts/install.sh "$staged_bundle/install.sh"
 install -m 0644 -- contrib/systemd/lswd.service contrib/systemd/lswd.socket \
     "$staged_bundle/systemd/"
-install -m 0644 -- README.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md "$staged_bundle/"
+install -m 0644 -- README.md ROADMAP.md CHANGELOG.md LICENSE THIRD_PARTY_NOTICES.md \
+    "$staged_bundle/"
 install -m 0644 -- docs/ARCHITECTURE.md docs/BETA.md docs/LEGAL_BOUNDARIES.md \
     docs/DEVELOPMENT.md docs/REFERENCES.md docs/SECURITY.md \
     docs/WINDOWS_KVM_E2E.md "$staged_bundle/docs/"
 tar --exclude='*/__pycache__' --exclude='*.pyc' --exclude='*.pyo' \
     -cf - .github .gitattributes .gitignore Cargo.lock Cargo.toml CHANGELOG.md LICENSE README.md \
-    THIRD_PARTY_NOTICES.md contrib crates docs rustfmt.toml scripts | \
+    ROADMAP.md THIRD_PARTY_NOTICES.md contrib crates docs rustfmt.toml scripts | \
     tar -xf - -C "$staged_bundle/source"
 (
     cd "$staged_bundle/source"
