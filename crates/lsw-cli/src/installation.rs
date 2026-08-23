@@ -16,12 +16,14 @@ use std::time::{Duration, Instant};
 
 use lsw_core::{
     HostCapabilities, InstallSeedBuilder, InstanceManifest, InstanceSpec, InstanceState,
-    IsoDownloadEngine, IsoDownloader, LaunchPhase, LswError, MicrosoftIsoRequest,
-    MicrosoftIsoResolver, Provisioner, SessionKind, StartRequest, StateStore, WinPeDismBackend,
-    WinPeDismVmPhase, WindowsEdition, WindowsMediaInspector, WindowsProfile, WINPE_VM_TIMEOUT,
+    IsoDownloadEngine, IsoDownloadProgressStage, IsoDownloader, LaunchPhase, LswError,
+    MicrosoftIsoRequest, MicrosoftIsoResolver, Provisioner, SessionKind, StartRequest, StateStore,
+    WinPeDismBackend, WinPeDismProgress, WinPeDismVmPhase, WindowsEdition, WindowsMediaInspector,
+    WindowsProfile, WINPE_VM_TIMEOUT,
 };
 
 use crate::agent_client::AgentClient;
+use crate::progress::{ProgressEvent, ProgressRenderer};
 
 use super::{
     absolute_path, fix_host_dependencies, launch_installation_viewer, resolve_name,
@@ -45,8 +47,9 @@ pub(super) fn install_instance(
             "--language is used only with Microsoft ISO download; omit it with --iso".into(),
         );
     }
+    let mut progress = ProgressRenderer::new();
     if let Some(iso) = parsed.iso.clone() {
-        return install_new_instance(store, parsed, Some(iso));
+        return install_new_instance(store, parsed, Some(iso), &mut progress);
     }
 
     let create_from_microsoft = if let Some(name) = parsed.requested.as_deref() {
@@ -59,7 +62,7 @@ pub(super) fn install_instance(
         false
     };
     if create_from_microsoft {
-        return install_new_instance(store, parsed, None);
+        return install_new_instance(store, parsed, None, &mut progress);
     }
     if parsed.create_option_seen {
         return Err(
@@ -88,7 +91,27 @@ pub(super) fn install_instance(
 
     let instance_dir = store.instance_dir(&name)?;
     let seed = instance_dir.join("seed");
-    match fs::symlink_metadata(&seed) {
+    let seed_metadata = fs::symlink_metadata(&seed);
+    if manifest.state == InstanceState::Stopped
+        && seed_metadata
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        if parsed.seed_option_seen || parsed.edition.is_some() {
+            return Err(
+                "installation options cannot be changed while resuming completed WinPE deployment"
+                    .into(),
+            );
+        }
+        return resume_winpe_installation(
+            store,
+            &name,
+            parsed.without_agent,
+            parsed.no_viewer,
+            &mut progress,
+        );
+    }
+    match seed_metadata {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
             if parsed.seed_option_seen {
                 return Err(format!(
@@ -123,16 +146,67 @@ pub(super) fn install_instance(
         Err(error) => return Err(error.into()),
     }
     let verify_agent = !parsed.without_agent && seed.join("lsw/lsw-agent.exe").is_file();
+    progress.update(ProgressEvent::stage(1, 2, "Starting Windows", "first boot"));
     start_named_instance(store, &name, LaunchPhase::Install)?;
     if !parsed.no_viewer {
         launch_installation_viewer(store, &name)?;
     }
     if verify_agent {
-        wait_for_unattended_setup(store, &name, Duration::from_secs(60 * 60))?;
+        wait_for_unattended_setup(
+            store,
+            &name,
+            Duration::from_secs(60 * 60),
+            &mut progress,
+            2,
+            2,
+        )?;
+        progress.finish();
         show_activation_notice_once(store, &name);
         println!("Environment verified. Run `lsw` to enter PowerShell.");
     } else {
+        progress.finish();
         println!("Windows setup is running without a verifiable LSW agent.");
+    }
+    Ok(())
+}
+
+fn resume_winpe_installation(
+    store: &StateStore,
+    name: &str,
+    without_agent: bool,
+    no_viewer: bool,
+    progress: &mut ProgressRenderer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Resuming Windows first boot and installation verification for {name:?}.");
+    progress.update(ProgressEvent::stage(
+        1,
+        2,
+        "Completing Windows setup",
+        "first boot / specialize",
+    ));
+    start_named_instance(store, name, LaunchPhase::Run)?;
+    if !no_viewer {
+        launch_installation_viewer(store, name)?;
+    }
+    if without_agent {
+        progress.finish();
+        println!("Windows is running without the LSW agent; shell verification was skipped.");
+    } else {
+        wait_for_unattended_setup(store, name, Duration::from_secs(15 * 60), progress, 1, 2)?;
+        progress.update(ProgressEvent::measured(
+            2,
+            2,
+            "Verifying environment",
+            "agent and setup cleanup",
+            1,
+            1,
+        ));
+        progress.finish();
+        show_activation_notice_once(store, name);
+        println!("Environment verified. Run `lsw` to enter PowerShell.");
+    }
+    if store.default_name()?.is_none() {
+        store.set_default(name)?;
     }
     Ok(())
 }
@@ -141,6 +215,7 @@ fn install_new_instance(
     store: &StateStore,
     parsed: InstallArguments,
     supplied_iso: Option<PathBuf>,
+    progress: &mut ProgressRenderer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let name = parsed
         .requested
@@ -149,8 +224,15 @@ fn install_new_instance(
     let capabilities = ensure_install_dependencies(parsed.profile, true, !parsed.no_viewer)?;
     let iso = match supplied_iso {
         Some(iso) => absolute_path(&iso)?,
-        None => download_official_windows_iso(store, &capabilities, &parsed.language)?,
+        None => download_official_windows_iso(store, &capabilities, &parsed.language, progress)?,
     };
+
+    progress.update(ProgressEvent::stage(
+        3,
+        8,
+        "Inspecting Windows media",
+        "selecting edition",
+    ));
 
     let edition = if let Some(index) = parsed.seed.unattended_image_index {
         select_windows_edition_index(store, &iso, index)?
@@ -163,6 +245,7 @@ fn install_new_instance(
         )?
         .expect("a new one-shot install must select an edition")
     };
+    progress.finish();
     let mut options = parsed.seed;
     options.unattended_image_index = None;
     options.unattended_image_name = Some(edition.name.clone());
@@ -197,9 +280,16 @@ fn install_new_instance(
         "You are responsible for the license, product key, and activation of the Windows media you supplied."
     );
 
+    progress.update(ProgressEvent::stage(
+        4,
+        8,
+        "Preparing instance storage",
+        "disk, firmware, and vTPM",
+    ));
     let provisioner = Provisioner::new(capabilities.clone());
     let preparation = provisioner.plan(&manifest, &instance_dir)?;
     provisioner.apply(&preparation)?;
+    progress.finish();
     println!("Prepared disk, firmware variables, runtime directories, and vTPM state.");
 
     let token = store.read_agent_token(name)?;
@@ -214,13 +304,16 @@ fn install_new_instance(
     );
 
     if let Err(error) = run_winpe_preinstallation(
-        &capabilities,
-        &manifest,
-        &instance_dir,
-        &edition,
-        &seed_plan.destination,
-        &options.locale,
-        seed_plan.setup_account_password_value(),
+        WinPePreinstallation {
+            capabilities: &capabilities,
+            manifest: &manifest,
+            instance_dir: &instance_dir,
+            edition: &edition,
+            install_seed: &seed_plan.destination,
+            locale: &options.locale,
+            setup_account_password_value: seed_plan.setup_account_password_value(),
+        },
+        progress,
     ) {
         let mut failed = manifest.clone();
         failed.state = InstanceState::Failed;
@@ -236,15 +329,31 @@ fn install_new_instance(
     // rejects Run for a still-Configured instance.
     mark_winpe_install_complete(store, &manifest)?;
 
+    progress.update(ProgressEvent::stage(
+        7,
+        8,
+        "Completing Windows setup",
+        "first boot / specialize",
+    ));
     start_named_instance(store, name, LaunchPhase::Run)?;
     if !parsed.no_viewer {
         launch_installation_viewer(store, name)?;
     }
     if !parsed.without_agent {
-        wait_for_unattended_setup(store, name, Duration::from_secs(15 * 60))?;
+        wait_for_unattended_setup(store, name, Duration::from_secs(15 * 60), progress, 7, 8)?;
+        progress.update(ProgressEvent::measured(
+            8,
+            8,
+            "Verifying environment",
+            "agent and setup cleanup",
+            1,
+            1,
+        ));
+        progress.finish();
         show_activation_notice_once(store, name);
         println!("Environment verified. Run `lsw` to enter PowerShell.");
     } else {
+        progress.finish();
         println!("Windows is running without the LSW agent; shell verification was skipped.");
     }
     if store.default_name()?.is_none() {
@@ -257,17 +366,19 @@ fn download_official_windows_iso(
     store: &StateStore,
     capabilities: &HostCapabilities,
     language: &str,
+    progress: &mut ProgressRenderer,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    println!("Resolving the current official Windows 11 x64 ISO from Microsoft...");
+    progress.update(ProgressEvent::stage(
+        1,
+        8,
+        "Resolving Windows ISO",
+        "Microsoft download service",
+    ));
     let request = MicrosoftIsoRequest {
         language: language.to_owned(),
     };
     let resolver = MicrosoftIsoResolver::new();
     let resolved = resolver.resolve(&request)?;
-    println!(
-        "Resolved {} {} with Microsoft SHA-256 {}.",
-        resolved.language, resolved.architecture, resolved.expected_sha256
-    );
 
     store.initialize()?;
     let cache = store.root().join("cache");
@@ -279,20 +390,43 @@ fn download_official_windows_iso(
         resolved.expected_sha256.to_ascii_lowercase()
     ));
     let downloader = IsoDownloader::new(capabilities);
-    println!(
-        "Downloading with {} (maximum four Microsoft CDN connections)...",
-        match downloader.engine() {
+    let engine = downloader.engine();
+    progress.update(ProgressEvent::stage(
+        2,
+        8,
+        "Downloading Windows ISO",
+        match engine {
             IsoDownloadEngine::Aria2 => "aria2c",
-            IsoDownloadEngine::Native => "the native resumable downloader",
-        }
-    );
-    let report = downloader.download_resolved(&resolver, &request, resolved, &destination)?;
-    println!(
-        "Verified {} bytes at {} (SHA-256 {}).",
-        report.bytes,
-        report.destination.display(),
-        report.sha256
-    );
+            IsoDownloadEngine::Native => "native resumable downloader",
+        },
+    ));
+    let report = downloader.download_resolved_with_progress(
+        &resolver,
+        &request,
+        resolved,
+        &destination,
+        |event| {
+            let label = match event.stage {
+                IsoDownloadProgressStage::Transferring => "Downloading Windows ISO",
+                IsoDownloadProgressStage::Assembling => "Assembling Windows ISO",
+                IsoDownloadProgressStage::Verifying => "Verifying Windows ISO",
+            };
+            let detail = match (event.stage, engine) {
+                (IsoDownloadProgressStage::Transferring, IsoDownloadEngine::Aria2) => "aria2c",
+                (IsoDownloadProgressStage::Transferring, IsoDownloadEngine::Native) => {
+                    "native resumable downloader"
+                }
+                (IsoDownloadProgressStage::Assembling, _) => "resumable range files",
+                (IsoDownloadProgressStage::Verifying, _) => "Microsoft SHA-256",
+            };
+            match (event.completed_bytes, event.total_bytes) {
+                (Some(completed), Some(total)) => {
+                    progress.update(ProgressEvent::measured(2, 8, label, "", completed, total))
+                }
+                _ => progress.update(ProgressEvent::stage(2, 8, label, detail)),
+            }
+        },
+    )?;
     Ok(report.destination)
 }
 
@@ -307,55 +441,86 @@ fn ensure_private_directory(path: &Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+struct WinPePreinstallation<'a> {
+    capabilities: &'a HostCapabilities,
+    manifest: &'a InstanceManifest,
+    instance_dir: &'a Path,
+    edition: &'a WindowsEdition,
+    install_seed: &'a Path,
+    locale: &'a str,
+    setup_account_password_value: &'a str,
+}
+
 fn run_winpe_preinstallation(
-    capabilities: &HostCapabilities,
-    manifest: &InstanceManifest,
-    instance_dir: &Path,
-    edition: &WindowsEdition,
-    install_seed: &Path,
-    locale: &str,
-    setup_account_password_value: &str,
+    request: WinPePreinstallation<'_>,
+    progress: &mut ProgressRenderer,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
-        "Preparing {} with official WinPE DISM (network disabled)...",
-        edition.name
-    );
     let prepare = WinPeDismBackend::plan_with_guest_setup(
-        manifest,
-        edition.index,
-        instance_dir,
-        install_seed,
-        locale,
-        setup_account_password_value,
+        request.manifest,
+        request.edition.index,
+        request.instance_dir,
+        request.install_seed,
+        request.locale,
+        request.setup_account_password_value,
     )?;
     WinPeDismBackend::write_seed(&prepare)?;
     let prepare_vm = WinPeDismBackend::plan_vm(
-        capabilities.clone(),
-        manifest,
-        instance_dir,
+        request.capabilities.clone(),
+        request.manifest,
+        request.instance_dir,
         WinPeDismVmPhase::Prepare,
     )?;
-    let prepare_result = WinPeDismBackend::run_vm(&prepare_vm, WINPE_VM_TIMEOUT)?;
-    println!(
-        "WinPE prepare phase completed in {} seconds.",
-        prepare_result.elapsed.as_secs()
-    );
+    WinPeDismBackend::run_vm_with_progress(&prepare_vm, WINPE_VM_TIMEOUT, |event| {
+        progress.update(winpe_progress_event(event, 5, 8));
+    })?;
 
-    println!("Applying the prepared image to the LSW-owned qcow2 disk...");
-    let apply = WinPeDismBackend::plan_apply(manifest, instance_dir)?;
+    let apply = WinPeDismBackend::plan_apply(request.manifest, request.instance_dir)?;
     WinPeDismBackend::write_apply_seed(&apply)?;
     let apply_vm = WinPeDismBackend::plan_vm(
-        capabilities.clone(),
-        manifest,
-        instance_dir,
+        request.capabilities.clone(),
+        request.manifest,
+        request.instance_dir,
         WinPeDismVmPhase::Apply,
     )?;
-    let apply_result = WinPeDismBackend::run_vm(&apply_vm, WINPE_VM_TIMEOUT)?;
-    println!(
-        "WinPE apply phase completed in {} seconds.",
-        apply_result.elapsed.as_secs()
-    );
+    WinPeDismBackend::run_vm_with_progress(&apply_vm, WINPE_VM_TIMEOUT, |event| {
+        progress.update(winpe_progress_event(event, 6, 8));
+    })?;
+    progress.finish();
     Ok(())
+}
+
+fn winpe_progress_event(event: &WinPeDismProgress, step: u8, total_steps: u8) -> ProgressEvent {
+    let label = match event.phase {
+        WinPeDismVmPhase::Prepare => "Preparing Windows image",
+        WinPeDismVmPhase::Apply => "Applying Windows image",
+    };
+    let detail = match event.stage.as_str() {
+        "starting-winpe" => "starting isolated WinPE".to_owned(),
+        "initialize-workspace" => "initializing workspace".to_owned(),
+        "export-image" => "exporting selected edition".to_owned(),
+        "mount-image" => "mounting offline image".to_owned(),
+        "inventory-appx" => "inventorying provisioned applications".to_owned(),
+        "no-appx-removals" => "preserving provisioned applications".to_owned(),
+        "stage-guest-setup" => "staging unattended setup and agent".to_owned(),
+        "commit-image" => "committing prepared image".to_owned(),
+        "complete" => "prepared image complete".to_owned(),
+        "initialize-target" => "partitioning target disk".to_owned(),
+        "apply-image" => "applying Windows to target disk".to_owned(),
+        "configure-boot" => "configuring UEFI boot".to_owned(),
+        "apply-complete" => "Windows image applied".to_owned(),
+        "discard-image" => "discarding failed image mount".to_owned(),
+        "failed" | "apply-failed" => "WinPE reported failure".to_owned(),
+        stage if stage.starts_with("remove-appx ") => {
+            format!("removing {}", stage.trim_start_matches("remove-appx "))
+        }
+        stage => stage.replace('-', " "),
+    };
+    match event.percent {
+        Some(percent) => {
+            ProgressEvent::measured(step, total_steps, label, detail, u64::from(percent), 100)
+        }
+        None => ProgressEvent::stage(step, total_steps, label, detail),
+    }
 }
 
 fn cleanup_winpe_preinstallation(instance_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -428,8 +593,10 @@ fn wait_for_unattended_setup(
     store: &StateStore,
     name: &str,
     timeout: Duration,
+    progress: &mut ProgressRenderer,
+    step: u8,
+    total_steps: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Waiting for unattended Windows setup and the boot-time LSW agent...");
     let token = store.read_agent_token(name)?;
     let deadline = Instant::now() + timeout;
     let marker_probe = StartRequest {
@@ -439,17 +606,33 @@ fn wait_for_unattended_setup(
             "-NoLogo".to_owned(),
             "-NoProfile".to_owned(),
             "-Command".to_owned(),
-            r#"$Marker='C:\ProgramData\LSW\setup-complete.marker'; if (-not (Test-Path -LiteralPath $Marker -PathType Leaf)) { exit 23 }; if ([System.IO.File]::ReadAllText($Marker).Trim() -cne 'LSW-SETUP-COMPLETE') { exit 24 }; foreach ($Path in @('C:\Windows\Panther\unattend.xml', 'C:\Windows\Panther\Unattend\unattend.xml', 'C:\Windows\Setup\Scripts\SetupComplete.cmd', 'C:\ProgramData\LSW\setup')) { if (Test-Path -LiteralPath $Path) { exit 25 } }; if ($null -ne (Get-LocalUser -Name 'LSWSetup' -ErrorAction SilentlyContinue)) { exit 26 }; $Winlogon=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; if ([string]$Winlogon.AutoAdminLogon -eq '1') { exit 27 }; $StoredPassword=$Winlogon.PSObject.Properties['DefaultPassword']; if ($null -ne $StoredPassword -and -not [string]::IsNullOrEmpty([string]$StoredPassword.Value)) { exit 28 }"#.to_owned(),
+            r#"$Progress='C:\ProgramData\LSW\setup-progress.marker'; if (Test-Path -LiteralPath $Progress -PathType Leaf) { [Console]::Out.Write([System.IO.File]::ReadAllText($Progress).Trim()) }; $Marker='C:\ProgramData\LSW\setup-complete.marker'; if (-not (Test-Path -LiteralPath $Marker -PathType Leaf)) { exit 23 }; if ([System.IO.File]::ReadAllText($Marker).Trim() -cne 'LSW-SETUP-COMPLETE') { exit 24 }; foreach ($Path in @('C:\Windows\Panther\unattend.xml', 'C:\Windows\Panther\Unattend\unattend.xml', 'C:\Windows\Setup\Scripts\SetupComplete.cmd', 'C:\ProgramData\LSW\setup')) { if (Test-Path -LiteralPath $Path) { exit 25 } }; if ($null -ne (Get-LocalUser -Name 'LSWSetup' -ErrorAction SilentlyContinue)) { exit 26 }; $Winlogon=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; if ([string]$Winlogon.AutoAdminLogon -eq '1') { exit 27 }; $StoredPassword=$Winlogon.PSObject.Properties['DefaultPassword']; if ($null -ne $StoredPassword -and -not [string]::IsNullOrEmpty([string]$StoredPassword.Value)) { exit 28 }"#.to_owned(),
         ],
         working_directory: None,
     };
     loop {
         let manifest = store.load(name)?;
-        let setup_complete = AgentClient::connect(&manifest, &token)
+        match AgentClient::connect(&manifest, &token)
             .and_then(|client| client.run_capture(&marker_probe, &[], 1024))
-            .is_ok_and(|process| process.exit_code == 0);
-        if setup_complete {
-            return Ok(());
+        {
+            Ok(process) => {
+                let stage = String::from_utf8_lossy(&process.stdout);
+                progress.update(ProgressEvent::stage(
+                    step,
+                    total_steps,
+                    "Completing Windows setup",
+                    windows_setup_stage(stage.trim()),
+                ));
+                if process.exit_code == 0 {
+                    return Ok(());
+                }
+            }
+            Err(_) => progress.update(ProgressEvent::stage(
+                step,
+                total_steps,
+                "Completing Windows setup",
+                "first boot / specialize",
+            )),
         }
         if manifest.state == InstanceState::Failed {
             return Err(format!("instance {name:?} failed while waiting for its agent").into());
@@ -462,6 +645,27 @@ fn wait_for_unattended_setup(
             .into());
         }
         thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn windows_setup_stage(stage: &str) -> String {
+    match stage {
+        "installing-agent" => "installing LSW agent".to_owned(),
+        "configuring-services" => "configuring Windows services".to_owned(),
+        "applying-profile" => "applying LSW profile".to_owned(),
+        "starting-agent" => "starting LSW agent".to_owned(),
+        "waiting-for-oobe" => "oobeSystem".to_owned(),
+        "cleanup" => "removing temporary setup state".to_owned(),
+        "complete" => "Windows setup complete".to_owned(),
+        "" => "specialize".to_owned(),
+        unknown => format!(
+            "Windows setup: {}",
+            unknown
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(64)
+                .collect::<String>()
+        ),
     }
 }
 
@@ -636,6 +840,40 @@ mod tests {
     use lsw_core::NetworkMode;
 
     use super::*;
+
+    #[test]
+    fn setup_and_winpe_stages_are_presented_without_invented_progress() {
+        assert_eq!(windows_setup_stage("waiting-for-oobe"), "oobeSystem");
+        assert_eq!(
+            windows_setup_stage("cleanup"),
+            "removing temporary setup state"
+        );
+
+        let stage = winpe_progress_event(
+            &WinPeDismProgress {
+                phase: WinPeDismVmPhase::Apply,
+                stage: "apply-image".to_owned(),
+                percent: None,
+                elapsed: Duration::from_secs(1),
+            },
+            6,
+            8,
+        );
+        assert_eq!(stage.detail, "applying Windows to target disk");
+        assert_eq!(stage.completed, None);
+
+        let measured = winpe_progress_event(
+            &WinPeDismProgress {
+                phase: WinPeDismVmPhase::Apply,
+                stage: "apply-image".to_owned(),
+                percent: Some(73),
+                elapsed: Duration::from_secs(2),
+            },
+            6,
+            8,
+        );
+        assert_eq!((measured.completed, measured.total), (Some(73), Some(100)));
+    }
 
     #[test]
     fn completed_winpe_install_transitions_to_stopped_before_normal_run() {

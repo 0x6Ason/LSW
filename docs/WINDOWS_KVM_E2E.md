@@ -11,7 +11,7 @@ completion marker. It checks the exact automatic `LSWAgent` Windows service
 configuration and virtual-account process SID, PowerShell command execution,
 guest exit-code propagation, graceful shutdown, an interactive ConPTY shell,
 QEMU/daemon cleanup, socket cleanup, and host-port release. The release job
-exercises the beta.5 beginner `slim` profile, cold-starts the installed guest
+exercises the beta.6 beginner `slim` profile, cold-starts the installed guest
 through a bare `lsw`, proves ConPTY and service-backed agent execution return at
 the Windows sign-in screen, requires the same service SID, and verifies that
 neither the ISO nor the seed is attached to the restarted QEMU process.
@@ -88,7 +88,7 @@ distribution does not use one of LSW's standard OVMF paths, set both
 environment. The preflight fails before installation if no complete firmware
 pair is available.
 
-The beta.5 gate is headless. The runner may run as a background service and does
+The beta.6 gate is headless. The runner may run as a background service and does
 not need `DISPLAY`, `WAYLAND_DISPLAY`, a session bus, or `remote-viewer`.
 
 Provision a short, dedicated, encrypted, disk-backed state directory. Long
@@ -178,13 +178,13 @@ configuration and identity checks and requires the same SID. It also requires
 neither automatic logon nor a stored default password. This prevents a hidden
 desktop login from making the cold-start test pass.
 
-Session 0 is sufficient for the beta.5 command and ConPTY contract, but it does
+Session 0 is sufficient for the beta.6 command and ConPTY contract, but it does
 not provide visible desktop GUI applications. A future user-session companion
 will own GUI, clipboard, audio, and per-window integration without changing the
 boot-time service boundary.
 
 This workflow and harness define the required release evidence; they do not
-claim the service path has passed on real hardware. Tag beta.5 only after the
+claim the service path has passed on real hardware. Tag beta.6 only after the
 exact candidate completes this job successfully on the dedicated KVM runner.
 
 Tag only the exact commit named in a successful run. If `master` changes, run

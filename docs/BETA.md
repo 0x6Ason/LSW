@@ -1,6 +1,6 @@
 # LSW 1.0 beta status
 
-`1.0.0-beta.5` is a Linux x86_64 engineering beta, not a claim that every
+`1.0.0-beta.6` is a Linux x86_64 engineering beta, not a claim that every
 target platform has passed general-availability hardware validation. It joins
 Microsoft ISO resolution and download, WinPE DISM pre-application, the instance
 lifecycle, the Windows agent, and a lawful activation boundary into one path.
@@ -74,7 +74,7 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
 
 The WinPE, SCM, WMI, and ConPTY items above describe implemented planners,
 generated content, protocols, and source/CI tests. They do not claim execution
-inside a real Windows WinPE or Session 0 service context. A beta.5 tag must
+inside a real Windows WinPE or Session 0 service context. A beta.6 tag must
 still pass the dedicated Windows/KVM gate.
 
 ## Gates requiring a real host and Windows guest

@@ -1,7 +1,7 @@
 # WinPE DISM backend
 
 `lsw-core::WinPeDismBackend` implements the isolated pre-install
-image-preparation and target-apply primitives. The beta.5 one-shot
+image-preparation and target-apply primitives. The beta.6 one-shot
 `lsw install NAME` path invokes both phases before the normal guest boot.
 
 ## Implemented contract
@@ -17,15 +17,21 @@ Given a profile, a validated WIM index and an instance directory, the backend:
    private NTFS workspace.
 5. Locates `sources/install.wim` or `sources/install.esd` on the official ISO.
 6. Uses the ISO's Windows `dism.exe` to export and mount the selected edition.
-   Export, ordinary mount, and commit use integrity checks. Mount intentionally
+   Export uses maximum compression plus the private NTFS scratch directory;
+   export, ordinary mount, and commit retain integrity checks. A real KVM
+   comparison rejected fast compression because its larger intermediate made
+   total preparation slower. Mount intentionally
    omits `/Optimize`: real Windows 11 25H2/KVM first-boot testing reproduced
    `PROCESS1_INITIALIZATION_FAILED (0x6B)` with that optional optimized path.
 7. Inventories provisioned AppX packages with `/English`, resolves the profile's
    display-name allowlist to full package names, and removes only matches.
 8. Commits the result as `lsw-prepared.wim`, with integrity checks on export,
    mount and commit. In the one-shot installer, it stages the private agent and
-   answer file into the mounted WIM immediately before that commit.
-9. Emits phase markers to a private writable status volume and discards a
+   answer file into the mounted WIM immediately before that commit. A bounded
+   marker tells first boot not to repeat the already completed profile and
+   CompactOS work.
+9. Emits phase markers and bounded live DISM output to a private writable
+   status volume, allowing the host to report real percentages, and discards a
    mounted image after an error.
 
 The apply plan then boots a separate WinPE phase with the prepared workspace as
@@ -50,8 +56,9 @@ the apply script does the same only for virtual Disk 1. The QEMU planner keeps
 these topologies distinct: prepare attaches only a newly created private sparse
 workspace, while apply attaches that workspace first and the LSW target second.
 Both phases disable networking, use per-phase OVMF variables and require a
-bounded run plus an exact completion marker. The host reads the writable status
-volume only after QEMU exits. No host block device is accepted by the plan.
+bounded run plus an exact completion marker. The host may read the dedicated
+status and DISM logs while QEMU owns the volume, but no host process writes to
+them until QEMU exits. No host block device is accepted by the plan.
 
 The workspace is expected to be a sparse 32 GiB qcow2. Its final artifact is
 `W:\lsw-prepared.wim`. The backend owns both QEMU children until exit, enforces a
@@ -64,11 +71,11 @@ Unit tests cover stage construction, image-index validation, atomic/private seed
 writing, absence of product keys, the conservative stock path, exact DISM
 operations, separated disk topology, apply/CompactOS behavior, payload ACL
 staging, control-media topology, and mandatory completion markers. The backend
-is enabled in the beta.5 installer. A real Windows 11 25H2/KVM run completed
+is enabled in the beta.6 installer. A real Windows 11 25H2/KVM run completed
 both WinPE phases, specialize, and SCM agent startup, then exposed a race where
 the first agent connection preceded the specialize-to-OOBE reboot. The headless
 installer now waits for a post-OOBE cleanup marker instead. The protected
-exact-commit release-gate job remains mandatory before tagging beta.5; partial
+exact-commit release-gate job remains mandatory before tagging beta.6; partial
 or local runs do not replace that publication control.
 
 The command sequence follows Microsoft's documentation for

@@ -10,7 +10,7 @@ pub enum WindowsProfile {
     Vanilla,
     Slim,
     // Retained so existing beta manifests keep their runtime semantics. New
-    // beta.5 instances expose only vanilla and slim.
+    // beta.6 instances expose only vanilla and slim.
     #[doc(hidden)]
     Ephemeral,
     #[doc(hidden)]
@@ -76,7 +76,7 @@ impl FromStr for WindowsProfile {
             "slim" => Ok(Self::Slim),
             _ => Err(LswError::InvalidValue {
                 field: "profile",
-                reason: format!("unknown profile {value:?}; beta.5 supports vanilla or slim"),
+                reason: format!("unknown profile {value:?}; beta.6 supports vanilla or slim"),
             }),
         }
     }

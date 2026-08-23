@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::install_seed::OFFLINE_PROFILE_MARKER_NAME;
 use crate::{
     CommandInvocation, CustomizationPlan, HostCapabilities, InstanceManifest, LswError,
     PreparationPlan, PreparationStep, QemuBackend, Result, WindowsProfile,
@@ -45,6 +46,7 @@ const WINPE_STARTNET: &[u8] = include_bytes!("../assets/winpe-startnet.cmd");
 const WINPE_SHELL: &[u8] = include_bytes!("../assets/winpeshl.ini");
 const MAX_SEED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STATUS_LOG_BYTES: u64 = 1024 * 1024;
+const MAX_DISM_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const MIN_APPLIED_DISK_BYTES: u64 = 512 * 1024 * 1024;
 const SETUP_ACCOUNT_NAME: &str = "LSWSetup";
 
@@ -93,6 +95,8 @@ pub struct WinPeDismVmPlan {
     pub host_preparation: PreparationPlan,
     /// Host-backed phase status log containing bounded completion markers.
     pub status_log: PathBuf,
+    /// Host-backed DISM output used for live percentage reporting and diagnostics.
+    pub dism_log: PathBuf,
     /// Serial firmware and WinPE diagnostic log for this phase.
     pub serial_log: PathBuf,
     /// QEMU diagnostic log for this phase.
@@ -134,6 +138,19 @@ pub struct WinPeDismRunResult {
     pub elapsed: Duration,
     /// Bounded private-volume status lines retained for diagnostics.
     pub status_events: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Live progress observed from a network-isolated WinPE phase.
+pub struct WinPeDismProgress {
+    /// Phase producing this progress event.
+    pub phase: WinPeDismVmPhase,
+    /// Stable machine-readable stage emitted by the WinPE script.
+    pub stage: String,
+    /// DISM percentage for the current stage when DISM reports one.
+    pub percent: Option<u8>,
+    /// Wall-clock time elapsed since the WinPE child was launched.
+    pub elapsed: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -548,6 +565,7 @@ impl WinPeDismBackend {
         let target_disk = instance_dir.join("disk.qcow2");
         let status_directory = instance_dir.join(format!("run/winpe-{phase_name}-status"));
         let status_log = status_directory.join("status.log");
+        let dism_log = status_directory.join("dism.log");
         let serial_log = instance_dir.join(format!("run/winpe-{phase_name}-serial.log"));
         let qemu_log = instance_dir.join(format!("winpe-{phase_name}-qemu.log"));
         let qmp_socket = instance_dir.join(format!("run/winpe-{phase_name}-qmp.sock"));
@@ -760,6 +778,7 @@ impl WinPeDismBackend {
                 missing_capabilities: missing_capabilities.clone(),
             },
             status_log,
+            dism_log,
             serial_log,
             qemu_log,
             qmp_socket,
@@ -792,6 +811,18 @@ impl WinPeDismBackend {
 
     /// Runs a WinPE phase and requires its exact private-volume completion marker.
     pub fn run_vm(plan: &WinPeDismVmPlan, timeout: Duration) -> Result<WinPeDismRunResult> {
+        Self::run_vm_with_progress(plan, timeout, |_| {})
+    }
+
+    /// Runs a WinPE phase while reporting trusted guest stages and DISM percentages.
+    pub fn run_vm_with_progress<F>(
+        plan: &WinPeDismVmPlan,
+        timeout: Duration,
+        mut on_progress: F,
+    ) -> Result<WinPeDismRunResult>
+    where
+        F: FnMut(&WinPeDismProgress),
+    {
         if timeout.is_zero() {
             return Err(LswError::InvalidValue {
                 field: "WinPE timeout",
@@ -805,7 +836,7 @@ impl WinPeDismBackend {
         }
         crate::Provisioner::new(HostCapabilities::unavailable(plan.backend.platform()))
             .apply(&plan.host_preparation)?;
-        prepare_status_volume(&plan.status_log)?;
+        prepare_status_volume(&plan.status_log, &plan.dism_log)?;
         let uses_qmp = plan
             .invocation
             .arguments
@@ -825,7 +856,25 @@ impl WinPeDismBackend {
             .stderr(Stdio::from(stderr))
             .spawn()?;
 
+        let mut observed_status_events = 0_usize;
+        let mut current_stage = Some("starting-winpe".to_owned());
+        let mut last_percent = None;
+        on_progress(&WinPeDismProgress {
+            phase: plan.phase,
+            stage: "starting-winpe".to_owned(),
+            percent: None,
+            elapsed: started.elapsed(),
+        });
+
         let status = loop {
+            report_winpe_progress(
+                plan,
+                started,
+                &mut observed_status_events,
+                &mut current_stage,
+                &mut last_percent,
+                &mut on_progress,
+            )?;
             if let Some(status) = child.try_wait()? {
                 break status;
             }
@@ -844,8 +893,18 @@ impl WinPeDismBackend {
                     ),
                 });
             }
-            thread::sleep(Duration::from_millis(250));
+            // The terminal renderer updates once per second. Matching that
+            // cadence avoids repeatedly rereading a growing guest DISM log.
+            thread::sleep(Duration::from_secs(1));
         };
+        report_winpe_progress(
+            plan,
+            started,
+            &mut observed_status_events,
+            &mut current_stage,
+            &mut last_percent,
+            &mut on_progress,
+        )?;
         if !status.success() {
             return Err(LswError::ExternalCommandFailed {
                 program: PathBuf::from(&plan.invocation.program),
@@ -1048,6 +1107,122 @@ fn read_status_events(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+fn report_winpe_progress<F>(
+    plan: &WinPeDismVmPlan,
+    started: Instant,
+    observed_status_events: &mut usize,
+    current_stage: &mut Option<String>,
+    last_percent: &mut Option<u8>,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&WinPeDismProgress),
+{
+    let mut emitted = false;
+    let events = read_status_events(&plan.status_log)?;
+    if events.len() < *observed_status_events {
+        *observed_status_events = 0;
+    }
+    for event in events.iter().skip(*observed_status_events) {
+        let Some(stage) = event.strip_prefix("LSW-WINPE-DISM ") else {
+            continue;
+        };
+        let stage = stage.trim().to_owned();
+        *current_stage = Some(stage.clone());
+        *last_percent = None;
+        on_progress(&WinPeDismProgress {
+            phase: plan.phase,
+            stage,
+            percent: None,
+            elapsed: started.elapsed(),
+        });
+        emitted = true;
+    }
+    *observed_status_events = events.len();
+
+    if let Some((dism_stage, percent)) = read_dism_progress(&plan.dism_log)? {
+        if current_stage.as_deref() == Some(dism_stage.as_str())
+            && last_percent.as_ref() != Some(&percent)
+        {
+            *last_percent = Some(percent);
+            on_progress(&WinPeDismProgress {
+                phase: plan.phase,
+                stage: dism_stage,
+                percent: Some(percent),
+                elapsed: started.elapsed(),
+            });
+            emitted = true;
+        }
+    }
+    if !emitted {
+        if let Some(stage) = current_stage.as_ref() {
+            on_progress(&WinPeDismProgress {
+                phase: plan.phase,
+                stage: stage.clone(),
+                percent: *last_percent,
+                elapsed: started.elapsed(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_dism_progress(path: &Path) -> Result<Option<(String, u8)>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(LswError::InvalidValue {
+            field: "WinPE DISM log",
+            reason: format!("{} is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() > MAX_DISM_LOG_BYTES {
+        return Err(LswError::InvalidValue {
+            field: "WinPE DISM log",
+            reason: format!("{} exceeds 8 MiB", path.display()),
+        });
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    fs::File::open(path)?
+        .take(MAX_DISM_LOG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    let log = String::from_utf8_lossy(&bytes);
+    let Some(stage_offset) = log.rfind("LSW-DISM-STAGE ") else {
+        return Ok(None);
+    };
+    let stage_and_output = &log[stage_offset + "LSW-DISM-STAGE ".len()..];
+    let Some(stage_end) = stage_and_output.find(['\r', '\n']) else {
+        return Ok(None);
+    };
+    let stage = stage_and_output[..stage_end].trim();
+    if stage.is_empty() {
+        return Ok(None);
+    }
+    let output = &stage_and_output[stage_end..];
+    let Some(command_offset) = output.find("LSW-DISM-COMMAND ") else {
+        return Ok(None);
+    };
+    let command_output = &output[command_offset + "LSW-DISM-COMMAND ".len()..];
+    let percent = command_output
+        .match_indices('%')
+        .filter_map(|(offset, _)| parse_percentage_before(&command_output[..offset]))
+        .last();
+    Ok(percent.map(|percent| (stage.to_owned(), percent)))
+}
+
+fn parse_percentage_before(value: &str) -> Option<u8> {
+    let candidate = value
+        .chars()
+        .rev()
+        .skip_while(|character| character.is_ascii_whitespace())
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    let percent = candidate.parse::<f32>().ok()?;
+    (percent.is_finite() && (0.0..=100.0).contains(&percent)).then_some(percent.floor() as u8)
+}
+
 fn validate_applied_target(qemu_img: &Path, target_disk: &Path) -> Result<()> {
     require_regular_file(target_disk, "applied target disk")?;
     let length = fs::metadata(target_disk)?.len();
@@ -1067,7 +1242,7 @@ fn validate_applied_target(qemu_img: &Path, target_disk: &Path) -> Result<()> {
     )
 }
 
-fn prepare_status_volume(status_log: &Path) -> Result<()> {
+fn prepare_status_volume(status_log: &Path, dism_log: &Path) -> Result<()> {
     let directory = status_log.parent().ok_or_else(|| LswError::InvalidValue {
         field: "WinPE status volume",
         reason: "status log has no parent directory".to_owned(),
@@ -1097,6 +1272,7 @@ fn prepare_status_volume(status_log: &Path) -> Result<()> {
         require_regular_file(&tag, "WinPE status tag")?;
     }
     prepare_output_file(status_log)?;
+    prepare_output_file(dism_log)?;
     Ok(())
 }
 
@@ -1295,11 +1471,11 @@ if not defined LSW_STATUS (
     wpeutil.exe shutdown
     exit /b 1
 )
+set "LSW_LOG=%LSW_STATUS%\dism.log"
 
 for %%D in (C D E F G H I J K L M N O P Q R S U V W X Y Z) do (
     if not defined LSW_IMAGE if exist "%%D:\{WINPE_PREPARED_IMAGE_NAME}" (
         set "LSW_IMAGE=%%D:\{WINPE_PREPARED_IMAGE_NAME}"
-        set "LSW_LOG=%%D:\logs\winpe-apply.log"
     )
 )
 if not defined LSW_IMAGE goto :fail
@@ -1323,11 +1499,12 @@ if errorlevel 1 goto :fail
 
 call :retain_log
 call :status apply-complete
+call :flush_status
 wpeutil.exe shutdown
 exit /b 0
 
 :run
->>"%LSW_LOG%" echo ^> %*
+>>"%LSW_LOG%" echo LSW-DISM-COMMAND %*
 %* >>"%LSW_LOG%" 2>&1
 set "LSW_EXIT=!errorlevel!"
 if not "!LSW_EXIT!"=="0" >>"%LSW_LOG%" echo command failed with exit code !LSW_EXIT!
@@ -1336,16 +1513,25 @@ exit /b !LSW_EXIT!
 :fail
 call :retain_log
 call :status apply-failed
+call :flush_status
 if defined LSW_LOG >>"%LSW_LOG%" echo WinPE apply failed
 wpeutil.exe shutdown
 exit /b 1
 
 :retain_log
-if defined LSW_LOG if exist "%LSW_LOG%" copy /Y "%LSW_LOG%" "%LSW_STATUS%\dism.log" >nul 2>&1
+exit /b 0
+
+:flush_status
+if exist "%SystemRoot%\System32\timeout.exe" (
+    timeout.exe /t 2 /nobreak >nul 2>&1
+) else (
+    ping.exe -n 3 127.0.0.1 >nul 2>&1
+)
 exit /b 0
 
 :status
 >>"%LSW_STATUS%\status.log" echo LSW-WINPE-DISM %*
+if defined LSW_LOG >>"%LSW_LOG%" echo LSW-DISM-STAGE %*
 exit /b 0
 "#
     )
@@ -1443,18 +1629,22 @@ fn winpe_script(
         removal_patterns
     };
     let guest_setup = if stage_guest_setup {
-        r#"call :status stage-guest-setup
+        format!(
+            r#"call :status stage-guest-setup
 mkdir "%LSW_MOUNT%\ProgramData\LSW\setup" "%LSW_MOUNT%\Windows\Panther" >>"%LSW_LOG%" 2>&1
 if errorlevel 1 goto :fail_mounted
 xcopy.exe "%LSW_SEED%\payload\lsw\*" "%LSW_MOUNT%\ProgramData\LSW\setup\" /E /H /K /Y /I >>"%LSW_LOG%" 2>&1
+if errorlevel 1 goto :fail_mounted
+>"%LSW_MOUNT%\ProgramData\LSW\setup\{OFFLINE_PROFILE_MARKER_NAME}" echo LSW-OFFLINE-PROFILE-APPLIED
 if errorlevel 1 goto :fail_mounted
 copy /Y "%LSW_SEED%\lsw\offline-unattend.xml" "%LSW_MOUNT%\Windows\Panther\unattend.xml" >>"%LSW_LOG%" 2>&1
 if errorlevel 1 goto :fail_mounted
 icacls.exe "%LSW_MOUNT%\ProgramData\LSW\setup" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >>"%LSW_LOG%" 2>&1
 if errorlevel 1 goto :fail_mounted
 "#
+        )
     } else {
-        ""
+        String::new()
     };
 
     format!(
@@ -1464,7 +1654,7 @@ set "LSW_SEED=%~d0"
 set "LSW_WORK={WINPE_WORKSPACE_DRIVE}"
 set "LSW_MOUNT={WINPE_WORKSPACE_DRIVE}\mount"
 set "LSW_SCRATCH={WINPE_WORKSPACE_DRIVE}\scratch"
-set "LSW_LOG={WINPE_WORKSPACE_DRIVE}\logs\winpe-dism.log"
+set "LSW_LOG="
 set "LSW_PACKAGES={WINPE_WORKSPACE_DRIVE}\logs\provisioned-appx.txt"
 set "LSW_IMAGE={WINPE_WORKSPACE_DRIVE}\{WINPE_PREPARED_IMAGE_NAME}"
 set "LSW_DISM=%SystemRoot%\System32\dism.exe"
@@ -1474,6 +1664,7 @@ if not defined LSW_STATUS (
     wpeutil.exe shutdown
     exit /b 1
 )
+set "LSW_LOG=%LSW_STATUS%\dism.log"
 
 call :status initialize-workspace
 diskpart.exe /s "%LSW_SEED%\lsw\workspace.diskpart" > X:\lsw-workspace.log 2>&1
@@ -1492,7 +1683,7 @@ if not defined LSW_SOURCE (
 )
 
 call :status export-image
-call :run "%LSW_DISM%" /English /Export-Image /SourceImageFile:"%LSW_SOURCE%" /SourceIndex:{edition_index} /DestinationImageFile:"%LSW_IMAGE%" /Compress:max /CheckIntegrity
+call :run "%LSW_DISM%" /English /Export-Image /SourceImageFile:"%LSW_SOURCE%" /SourceIndex:{edition_index} /DestinationImageFile:"%LSW_IMAGE%" /Compress:max /ScratchDir:"%LSW_SCRATCH%" /CheckIntegrity
 if errorlevel 1 goto :fail
 
 call :status mount-image
@@ -1510,6 +1701,7 @@ call :run "%LSW_DISM%" /English /Unmount-Image /MountDir:"%LSW_MOUNT%" /Commit /
 if errorlevel 1 goto :fail_mounted
 call :retain_log
 call :status complete
+call :flush_status
 wpeutil.exe shutdown
 exit /b 0
 
@@ -1528,7 +1720,7 @@ for /f "tokens=2 delims=:" %%P in ('findstr.exe /b /c:"PackageName :" "%LSW_PACK
 exit /b 0
 
 :run
->>"%LSW_LOG%" echo ^> %*
+>>"%LSW_LOG%" echo LSW-DISM-COMMAND %*
 %* >>"%LSW_LOG%" 2>&1
 set "LSW_EXIT=!errorlevel!"
 if not "!LSW_EXIT!"=="0" >>"%LSW_LOG%" echo command failed with exit code !LSW_EXIT!
@@ -1541,15 +1733,24 @@ call :status discard-image
 :fail
 call :retain_log
 call :status failed
+call :flush_status
 wpeutil.exe shutdown
 exit /b 1
 
 :retain_log
-if defined LSW_LOG if exist "%LSW_LOG%" copy /Y "%LSW_LOG%" "%LSW_STATUS%\dism.log" >nul 2>&1
+exit /b 0
+
+:flush_status
+if exist "%SystemRoot%\System32\timeout.exe" (
+    timeout.exe /t 2 /nobreak >nul 2>&1
+) else (
+    ping.exe -n 3 127.0.0.1 >nul 2>&1
+)
 exit /b 0
 
 :status
 >>"%LSW_STATUS%\status.log" echo LSW-WINPE-DISM %*
+if defined LSW_LOG >>"%LSW_LOG%" echo LSW-DISM-STAGE %*
 exit /b 0
 "#
     )
@@ -1807,6 +2008,7 @@ mod tests {
 
         assert!(script.contains("dism.exe"));
         assert!(script.contains("/English /Export-Image"));
+        assert!(script.contains("/Compress:max /ScratchDir:\"%LSW_SCRATCH%\" /CheckIntegrity"));
         assert!(script.contains("/SourceIndex:6"));
         assert!(script.contains("/Mount-Image"));
         assert!(script.contains("/ScratchDir:\"%LSW_SCRATCH%\" /CheckIntegrity"));
@@ -1814,6 +2016,8 @@ mod tests {
         assert!(script.contains("/Remove-ProvisionedAppxPackage"));
         assert!(script.contains("/Unmount-Image"));
         assert!(script.contains("/Commit /CheckIntegrity"));
+        assert!(script.contains("call :status complete\ncall :flush_status"));
+        assert!(script.contains("timeout.exe /t 2 /nobreak"));
         assert!(!script.contains("wimlib"));
         assert!(!script.contains("powershell"));
         assert!(!script.contains("/Remove-Package"));
@@ -1892,6 +2096,8 @@ mod tests {
             .expect("prepared image should be committed");
         assert!(stage < commit);
         assert!(script.contains("%LSW_MOUNT%\\Windows\\Panther\\unattend.xml"));
+        assert!(script.contains(OFFLINE_PROFILE_MARKER_NAME));
+        assert!(script.contains("LSW-OFFLINE-PROFILE-APPLIED"));
 
         let unattend = String::from_utf8(
             plan.generated
@@ -1953,6 +2159,7 @@ mod tests {
         assert!(script.contains("/ApplyDir:T:\\"));
         assert!(script.contains("bcdboot.exe"));
         assert!(script.contains("/s S: /f UEFI"));
+        assert!(script.contains("call :status apply-complete\ncall :flush_status"));
         assert!(!script.contains("stage-guest-setup"));
         assert!(!script.contains("select disk"));
 
@@ -2010,6 +2217,10 @@ mod tests {
         assert!(prepare_command.contains("winpe-seed"));
         assert!(prepare_command.contains("winpe-control.iso"));
         assert!(prepare_command.contains("fat:rw:"));
+        assert_eq!(
+            prepare.dism_log,
+            root.join("run/winpe-prepare-status/dism.log")
+        );
         assert!(!prepare_command.contains("tpm-tis"));
         assert!(prepare
             .host_preparation
@@ -2069,13 +2280,42 @@ mod tests {
                 .into(),
             ],
         };
-        let result = WinPeDismBackend::run_vm(&plan, Duration::from_secs(5))
+        let mut progress = Vec::new();
+        let result =
+            WinPeDismBackend::run_vm_with_progress(&plan, Duration::from_secs(5), |event| {
+                progress.push(event.clone())
+            })
             .expect("completion marker should succeed");
         assert_eq!(result.phase, WinPeDismVmPhase::Prepare);
         assert_eq!(result.status_events, vec!["LSW-WINPE-DISM complete"]);
+        assert!(progress.iter().any(|event| event.stage == "starting-winpe"));
+        assert!(progress.iter().any(|event| event.stage == "complete"));
 
         plan.invocation.arguments = vec!["-c".into(), ":".into()];
         assert!(WinPeDismBackend::run_vm(&plan, Duration::from_secs(5)).is_err());
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn dism_progress_parser_uses_only_the_latest_stage() {
+        let root = fixture();
+        let log = root.join("dism.log");
+        fs::write(
+            &log,
+            b"LSW-DISM-STAGE export-image\r\nLSW-DISM-COMMAND dism /Export-Image\r\n[===== 100.0% =====]\r\nLSW-DISM-STAGE mount-image\r\nLSW-DISM-COMMAND dism /Mount-Image\r\n[===== 42.5% =====]\r\n",
+        )
+        .expect("fixture log should be written");
+        assert_eq!(
+            read_dism_progress(&log).expect("progress should parse"),
+            Some(("mount-image".to_owned(), 42))
+        );
+
+        fs::write(&log, b"LSW-DISM-STAGE inventory-appx\r\n")
+            .expect("fixture log should be replaced");
+        assert_eq!(
+            read_dism_progress(&log).expect("stage without DISM should parse"),
+            None
+        );
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 

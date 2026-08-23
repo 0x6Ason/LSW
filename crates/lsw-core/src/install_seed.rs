@@ -16,6 +16,7 @@ use crate::{
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const LICENSE_HELPER_SCRIPT: &[u8] = include_bytes!("../assets/license-helper.ps1");
 const SETUP_ACCOUNT_NAME: &str = "LSWSetup";
+pub(crate) const OFFLINE_PROFILE_MARKER_NAME: &str = "offline-profile-applied.marker";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallSeedOptions {
@@ -372,12 +373,24 @@ $SetupScriptsRoot = Join-Path $env:SystemRoot 'Setup\Scripts'
 $SetupCompletePath = Join-Path $SetupScriptsRoot 'SetupComplete.cmd'
 $SetupCompleteMarker = Join-Path $DataRoot 'setup-complete.marker'
 $SetupCompleteMarkerTemporary = Join-Path $DataRoot 'setup-complete.marker.tmp'
+$SetupProgressPath = Join-Path $DataRoot 'setup-progress.marker'
+$SetupProgressTemporary = Join-Path $DataRoot 'setup-progress.marker.tmp'
+
+function Set-LswSetupStage {
+    param([Parameter(Mandatory = $true)][string] $Stage)
+
+    [System.IO.File]::WriteAllText($SetupProgressTemporary, $Stage, [System.Text.Encoding]::ASCII)
+    Move-Item -LiteralPath $SetupProgressTemporary -Destination $SetupProgressPath -Force
+}
 
 New-Item -ItemType Directory -Force -Path $DataRoot, $SetupScriptsRoot | Out-Null
-Remove-Item -LiteralPath $SetupCompleteMarker, $SetupCompleteMarkerTemporary -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $SetupCompleteMarker, $SetupCompleteMarkerTemporary, $SetupProgressTemporary -Force -ErrorAction SilentlyContinue
+Set-LswSetupStage 'installing-agent'
 $SetupCompleteContents = @'
 @echo off
 setlocal EnableExtensions
+>"%ProgramData%\LSW\setup-progress.marker.tmp" echo cleanup
+move /y "%ProgramData%\LSW\setup-progress.marker.tmp" "%ProgramData%\LSW\setup-progress.marker" >nul
 reg.exe add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul
 if errorlevel 1 exit /b 70
 for %%V in (DefaultUserName DefaultDomainName DefaultPassword) do reg.exe delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v %%V /f >nul 2>&1
@@ -389,6 +402,9 @@ rd /s /q "%ProgramData%\LSW\setup" >nul 2>&1
 >"%ProgramData%\LSW\setup-complete.marker.tmp" echo LSW-SETUP-COMPLETE
 move /y "%ProgramData%\LSW\setup-complete.marker.tmp" "%ProgramData%\LSW\setup-complete.marker" >nul
 if errorlevel 1 exit /b 72
+>"%ProgramData%\LSW\setup-progress.marker.tmp" echo complete
+move /y "%ProgramData%\LSW\setup-progress.marker.tmp" "%ProgramData%\LSW\setup-progress.marker" >nul
+if errorlevel 1 exit /b 73
 del /f /q "%~f0" >nul 2>&1
 exit /b 0
 '@
@@ -437,6 +453,7 @@ function Invoke-Sc {
     }
 }
 
+Set-LswSetupStage 'configuring-services'
 New-Item -ItemType Directory -Force -Path $InstallRoot, $DataRoot | Out-Null
 $AgentTarget = Join-Path $InstallRoot 'lsw-agent.exe'
 $LicenseScriptTarget = Join-Path $InstallRoot 'license-helper.ps1'
@@ -634,7 +651,9 @@ if (-not (Get-NetFirewallRule -DisplayName 'LSW Guest Agent' -ErrorAction Silent
     New-NetFirewallRule -DisplayName 'LSW Guest Agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort __LSW_AGENT_GUEST_PORT__ -RemoteAddress 10.0.2.2 | Out-Null
 }
 
+Set-LswSetupStage 'applying-profile'
 & (Join-Path $PSScriptRoot 'apply-profile.ps1')
+Set-LswSetupStage 'starting-agent'
 Invoke-Sc @('start', $ServiceName)
 $StartedService = Get-Service -Name $ServiceName
 $StartedService.WaitForStatus(
@@ -648,6 +667,7 @@ $StartedService.Refresh()
 if ($StartedService.Status -ne 'Running') {
     throw 'LSWAgent did not remain running after SCM started it.'
 }
+Set-LswSetupStage 'waiting-for-oobe'
 "#
     .replace("__LSW_AGENT_GUEST_PORT__", &AGENT_GUEST_PORT.to_string())
     .replace(
@@ -684,7 +704,7 @@ Get-AppxProvisionedPackage -Online | Where-Object {{ $RemoveNames -contains $_.D
         "Write-Host 'CompactOS not requested for this profile.'"
     };
     Ok(format!(
-        "$ErrorActionPreference = 'Stop'\r\nWrite-Host 'Applying LSW {} profile.'\r\n{}\r\n{}\r\n",
+        "$ErrorActionPreference = 'Stop'\r\n$OfflineProfileMarker = Join-Path $PSScriptRoot '{OFFLINE_PROFILE_MARKER_NAME}'\r\nif (Test-Path -LiteralPath $OfflineProfileMarker -PathType Leaf) {{\r\n    Write-Host 'LSW profile was already applied offline by WinPE.'\r\n    return\r\n}}\r\nWrite-Host 'Applying LSW {} profile.'\r\n{}\r\n{}\r\n",
         manifest.spec.profile, removal, compact
     ))
 }
@@ -956,6 +976,19 @@ mod tests {
         assert!(installer.contains("DefaultUserName DefaultDomainName DefaultPassword"));
         assert!(installer.contains("setup-complete.marker"));
         assert!(installer.contains("LSW-SETUP-COMPLETE"));
+        for stage in [
+            "installing-agent",
+            "configuring-services",
+            "applying-profile",
+            "starting-agent",
+            "waiting-for-oobe",
+            "cleanup",
+            "complete",
+        ] {
+            assert!(installer.contains(stage));
+        }
+        assert!(installer.contains("setup-progress.marker.tmp"));
+        assert!(installer.contains("Move-Item -LiteralPath $SetupProgressTemporary"));
         assert!(installer.contains("%WINDIR%\\Panther\\unattend.xml"));
         assert!(installer.contains("del /f /q \"%~f0\""));
         assert!(!installer.contains("New-ItemProperty"));
@@ -1010,6 +1043,9 @@ mod tests {
         let profile = fs::read_to_string(root.join("seed/lsw/apply-profile.ps1"))
             .expect("profile should be readable");
         assert!(profile.contains("Remove-AppxProvisionedPackage"));
+        assert!(profile.contains(OFFLINE_PROFILE_MARKER_NAME));
+        assert!(profile.contains("already applied offline by WinPE"));
+        assert!(profile.contains("    return\r\n"));
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 

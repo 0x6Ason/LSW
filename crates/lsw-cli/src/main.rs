@@ -10,6 +10,7 @@ mod arguments;
 mod daemon_client;
 mod installation;
 mod license;
+mod progress;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -181,14 +182,14 @@ fn doctor(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
         let missing = capabilities.missing_for_install_workflow();
         let install_aria2 = capabilities.aria2c.is_none();
         if missing.is_empty() && !install_aria2 {
-            println!("All beta.5 host dependencies are already installed.\n");
+            println!("All beta.6 host dependencies are already installed.\n");
         } else {
             let mut requested = missing;
             if install_aria2 {
                 requested.push("aria2c (optional download accelerator)");
             }
             println!(
-                "Installing beta.5 host dependencies: {}",
+                "Installing beta.6 host dependencies: {}",
                 requested.join(", ")
             );
             fix_host_dependencies(false)?;
@@ -1739,7 +1740,7 @@ fn bench(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::
         );
         println!("{output}");
     } else {
-        println!("LSW beta.5 performance baseline");
+        println!("LSW beta.6 performance baseline");
         println!(
             "  accelerator: {}",
             QemuBackend::select(&capabilities).accelerator()

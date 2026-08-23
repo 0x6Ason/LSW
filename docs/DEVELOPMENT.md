@@ -9,7 +9,7 @@ runners used KVM or installed Windows.
 ## Local checks
 
 Use the Rust version declared by `rust-version` in the workspace manifest. The
-beta.5 workflows pin Rust 1.76.0 instead of treating the moving `stable`
+beta.6 workflows pin Rust 1.76.0 instead of treating the moving `stable`
 toolchain as the MSRV gate:
 
 ```sh
@@ -100,7 +100,7 @@ executable with `--help`. Linux-side validation cannot execute the Windows
 binary. Neither gate exercises a managed guest session or a service-backed
 Windows ConPTY session.
 
-The beta.5 pre-applied unattend installs the agent during `specialize` as the
+The beta.6 pre-applied unattend installs the agent during `specialize` as the
 automatic Windows service `LSWAgent` under the virtual account
 `NT SERVICE\LSWAgent`; it must not restore the old per-user `HKCU` startup
 entry. It also registers the narrow, demand-start `LSWLicenseHelper` as
@@ -131,7 +131,7 @@ Useful controls are:
 - `CARGO_TARGET_DIR`: isolate Cargo artifacts; relative paths are resolved from
   the workspace root and are respected by both host and guest-agent builders.
 - `LSW_EXPECT_VERSION`: require the binary version to match a tag such as
-  `v1.0.0-beta.5`.
+  `v1.0.0-beta.6`.
 - `SOURCE_DATE_EPOCH`: set the reproducible build environment and all archive
   member timestamps. The default is a fixed epoch. Archive ownership and modes
   are normalized, and gzip timestamps are disabled.

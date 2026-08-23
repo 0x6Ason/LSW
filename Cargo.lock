@@ -128,21 +128,21 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lsw-agent"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "lsw-core",
 ]
 
 [[package]]
 name = "lsw-cli"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "lsw-core",
 ]
 
 [[package]]
 name = "lsw-core"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "getrandom",
  "serde",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "lsw-daemon"
-version = "1.0.0-beta.5"
+version = "1.0.0-beta.6"
 dependencies = [
  "lsw-core",
 ]

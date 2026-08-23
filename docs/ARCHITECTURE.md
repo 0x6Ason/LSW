@@ -12,7 +12,7 @@ guest. Host platform and accelerator selection are separated from guest
 protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
 and QEMU argument generation exist as planner-level work only. There are no
 macOS or Windows host-side binaries, daemon IPC integrations, or runtime
-validation claims in the beta.5 candidate.
+validation claims in the beta.6 candidate.
 
 ## Components
 
@@ -31,7 +31,7 @@ validation claims in the beta.5 candidate.
 
 ## Lifecycle
 
-1. `lsw install NAME` provides the beta.5 beginner path; `lsw create` remains an
+1. `lsw install NAME` provides the beta.6 beginner path; `lsw create` remains an
    advanced primitive. The installer validates the requested shape and stores
    manifest v4 plus a random 256-bit per-instance agent token. Without `--iso`,
    it resolves the current official Windows 11 x64 media from Microsoft,
@@ -53,7 +53,7 @@ validation claims in the beta.5 candidate.
    after daemon restart.
 4. A normal guest shutdown leaves the base disk intact. Old preview manifests
    using the retired `ephemeral` selector retain their disposable-overlay
-   behavior, but new beta.5 installs expose only `vanilla` and `slim`.
+   behavior, but new beta.6 installs expose only `vanilla` and `slim`.
 5. During the first boot's `specialize` pass, the pre-applied unattend installs
    the agent as the automatic `LSWAgent` Windows service under the virtual account
    `NT SERVICE\LSWAgent`. It removes the legacy per-user startup entry and

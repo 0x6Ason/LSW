@@ -26,8 +26,9 @@ pub use error::{LswError, Result};
 pub use install_seed::{InstallSeedBuilder, InstallSeedOptions, InstallSeedPlan};
 #[cfg(not(windows))]
 pub use iso_download::{
-    sha256_file, IsoDownloadEngine, IsoDownloadReport, IsoDownloader, MicrosoftIsoRequest,
-    MicrosoftIsoResolver, ResolvedWindowsIso, SecretDownloadUrl,
+    sha256_file, IsoDownloadEngine, IsoDownloadProgress, IsoDownloadProgressStage,
+    IsoDownloadReport, IsoDownloader, MicrosoftIsoRequest, MicrosoftIsoResolver,
+    ResolvedWindowsIso, SecretDownloadUrl,
 };
 pub use manifest::{InstanceManifest, InstanceSpec, InstanceState, NetworkMode, PortForward};
 pub use pe::{
@@ -40,9 +41,10 @@ pub use qemu::{CommandInvocation, CommandPlan, LaunchPhase, QemuPlanner};
 pub use store::StateStore;
 pub use windows_media::{WindowsEdition, WindowsMediaInspector};
 pub use winpe_dism::{
-    WinPeDismApplyPlan, WinPeDismApplyStage, WinPeDismBackend, WinPeDismPlan, WinPeDismRunResult,
-    WinPeDismStage, WinPeDismVmPhase, WinPeDismVmPlan, WINPE_PREPARED_IMAGE_NAME,
-    WINPE_TARGET_DISK_ID, WINPE_VM_TIMEOUT, WINPE_WORKSPACE_DISK_ID, WINPE_WORKSPACE_SIZE_GIB,
+    WinPeDismApplyPlan, WinPeDismApplyStage, WinPeDismBackend, WinPeDismPlan, WinPeDismProgress,
+    WinPeDismRunResult, WinPeDismStage, WinPeDismVmPhase, WinPeDismVmPlan,
+    WINPE_PREPARED_IMAGE_NAME, WINPE_TARGET_DISK_ID, WINPE_VM_TIMEOUT, WINPE_WORKSPACE_DISK_ID,
+    WINPE_WORKSPACE_SIZE_GIB,
 };
 
 // Windows reserves TCP 5040 for the Connected Devices Platform service on

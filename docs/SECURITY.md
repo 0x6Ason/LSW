@@ -131,11 +131,11 @@ instance.
 
 | Profile | Guest Secure Boot | Test-signed custom driver policy |
 | --- | --- | --- |
-| `vanilla`, `slim` | Off | No custom driver is enabled or installed by beta.5 |
+| `vanilla`, `slim` | Off | No custom driver is enabled or installed by beta.6 |
 
 Old preview manifests named `standard` migrate to `vanilla`. Existing
 `ephemeral` and `secure` manifests retain their old runtime and firmware
-semantics when loaded, but those names cannot be selected for new beta.5
+semantics when loaded, but those names cannot be selected for new beta.6
 instances. The old secure mode still requires a key-enrolled OVMF variable
 template and SMM-backed flash protection.
 

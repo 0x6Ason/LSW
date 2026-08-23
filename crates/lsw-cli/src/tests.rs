@@ -47,7 +47,7 @@ fn create_rejects_malformed_tcp_publish_option() {
 }
 
 #[test]
-fn one_shot_install_parses_the_beta_five_beginner_flow() {
+fn one_shot_install_parses_the_beta_six_beginner_flow() {
     let arguments = [
         "win-dev",
         "--iso",

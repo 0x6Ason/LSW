@@ -4,11 +4,10 @@ LSW is a local Windows development runtime for Linux. It provides a WSL-like
 command-line experience while running a real Windows kernel inside one managed
 QEMU/KVM virtual machine per instance.
 
-The current source candidate is `1.0.0-beta.5`. Its focus is daily usability on
-Linux x86_64: one-command installation, automatic host dependency repair, Windows
-edition selection by name, fully unattended headless setup, an optional viewer,
-configuration and log commands, redacted diagnostic bundles, safe instance
-removal, all-instance shutdown, and a machine-readable performance baseline.
+The current development candidate is `1.0.0-beta.6`. It builds on the released
+beta.5 one-command Windows environment with truthful installation progress,
+faster unattended first boot, complete remote process semantics, and improved
+host integration on Linux x86_64.
 
 LSW does not start a new VM for every application. Shells, commands, file
 transfers, and GUI processes for an instance all use the same running Windows
@@ -23,7 +22,7 @@ guest.
   planned for beta.7.
 - The default device model uses Windows inbox NVMe, e1000e, and VGA drivers.
   Signed VirtIO acceleration will remain optional.
-- The beta.5 `vanilla` and `slim` profiles retain the driverless installation
+- The beta.6 `vanilla` and `slim` profiles retain the driverless installation
   and recovery path.
 - LSW manages a complete Windows kernel, so it cannot match the absolute memory
   density of a Linux namespace container. The goal is WSL-like lifecycle and
@@ -75,6 +74,20 @@ The one-shot installer performs the following steps:
    qcow2, creates UEFI boot files, and deletes temporary seeds/workspace media.
 6. Boots Windows headlessly, completes OOBE, removes the one-shot setup account
    and cached answer file, then verifies the boot-time agent.
+
+The beta.6 terminal UI renders byte-accurate bars for native ISO transfer,
+range assembly, SHA-256 verification, and DISM percentages. WinPE boot,
+specialize, OOBE, agent installation, and cleanup instead display their real
+named stage and elapsed time; LSW does not invent percentages for work that
+Windows does not expose measurably. Redirected output emits bounded progress
+updates suitable for CI logs.
+
+Real Windows/KVM measurement found that fast WIM compression shortened export
+but made total preparation slower because the larger intermediate increased
+later mount and commit work. LSW therefore retains maximum compression and
+uses the private NTFS scratch directory explicitly. A pre-applied profile marker
+prevents first boot from repeating offline AppX and CompactOS work. Exact media
+SHA-256, `/CheckIntegrity`, and CompactOS-on-apply behavior remain unchanged.
 
 `--edition pro` remains available to override the default and is matched against
 ISO metadata; users never need to guess a WIM index. The WinPE jobs attach only
@@ -163,7 +176,7 @@ the key in argv, environment, seed media, the base image, logs, or diagnostics.
 
 `memory.max` is applied to the next QEMU start. `idle-timeout` is stored in
 manifest v4 so the beta.7 memory and hibernation governor can enforce one
-stable configuration contract; beta.5 does not yet hibernate automatically.
+stable configuration contract; beta.6 does not yet hibernate automatically.
 
 `lsw diagnose --bundle` creates a support archive containing a redacted
 manifest, host capability report, daemon status, a redacted QEMU plan, and
@@ -211,7 +224,7 @@ documented hardware.
 | `vanilla` | Stock Windows plus the LSW agent | Off |
 | `slim` | Removes only an explicit optional AppX allowlist and enables CompactOS | Off |
 
-`slim` is the beta.5 default. Both profiles are embedded versioned declarative
+`slim` is the beta.6 default. Both profiles are embedded versioned declarative
 manifests. They preserve WinSxS, Windows Update and the servicing stack,
 MSI/MSIX, Defender, Terminal, PowerShell, ConPTY, Store, winget, WebView2, WMI,
 hibernation, Recovery, and common development-tool dependencies. LSW does not
@@ -268,7 +281,7 @@ Interactive host terminals negotiate Windows ConPTY when both peers advertise
 support. LSW forwards input/output and terminal resize events; older agents
 fall back to pipe sessions.
 
-The beta.5 agent runs at boot as the automatic `LSWAgent` Windows service under
+The beta.6 agent runs at boot as the automatic `LSWAgent` Windows service under
 `NT SERVICE\LSWAgent`. Shell and `exec` processes therefore use that service
 identity in Windows Session 0; they do not impersonate a desktop user. This
 provides command access at the Windows sign-in screen without storing a daily
@@ -295,7 +308,7 @@ daemon with QEMU, OVMF, NVMe, e1000e, vTPM, QMP, loopback forwarding, suspend,
 resume, and forced stop. Placeholder media is used, so those tests do not claim
 that Windows booted.
 
-Before beta.5 is promoted, run the real hardware gate on a Linux x86_64 machine
+Before beta.6 is promoted, run the real hardware gate on a Linux x86_64 machine
 with KVM and a licensed Windows 11 ISO:
 
 ```bash
@@ -391,7 +404,7 @@ targets, Zig, or operating-system media.
   pre-provisioned current official ISO.
 - The guest agent now runs as the automatic `LSWAgent` Windows service under
   `NT SERVICE\LSWAgent`, but that boot-time path has not yet passed the real
-  Windows/KVM release gate. beta.5 must not be tagged until the exact candidate
+  Windows/KVM release gate. beta.6 must not be tagged until the exact candidate
   passes WinPE prepare/apply, unattended OOBE cleanup, service/helper identity, true ConPTY,
   shutdown, and no-login cold restart on the dedicated hardware runner.
 - The optional installation and recovery display uses private Unix-socket VNC
@@ -402,7 +415,7 @@ targets, Zig, or operating-system media.
 - Suspend/resume currently uses QMP stop/continue and retains guest RAM. It is
   not hibernation or disk-backed resume.
 - Automatic memory reclaim, balloon control, and idle hibernation are beta.7
-  work. The beta.5 idle timeout is configuration only.
+  work. The beta.6 idle timeout is configuration only.
 - Agent authentication is not encrypted and is limited to LSW's local
   loopback/QEMU user-network path.
 - QEMU does not yet run inside an LSW-specific seccomp/namespace/service-account

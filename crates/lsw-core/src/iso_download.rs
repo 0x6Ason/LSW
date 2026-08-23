@@ -15,8 +15,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -107,7 +108,7 @@ pub struct ResolvedWindowsIso {
     pub sku_id: String,
     /// Canonical Microsoft language label.
     pub language: String,
-    /// Selected media architecture; beta.5 requires `x64`.
+    /// Selected media architecture; beta.6 requires `x64`.
     pub architecture: String,
     /// Filename derived from the allowlisted CDN path.
     pub filename: String,
@@ -847,6 +848,28 @@ pub enum IsoDownloadEngine {
     Native,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A measurable or indeterminate stage in the ISO download pipeline.
+pub enum IsoDownloadProgressStage {
+    /// Bytes are being transferred from Microsoft's CDN.
+    Transferring,
+    /// Native range files are being assembled into one ISO.
+    Assembling,
+    /// Downloaded or cached bytes are being hashed locally.
+    Verifying,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Live progress from an official ISO download or cache verification.
+pub struct IsoDownloadProgress {
+    /// Operation currently being performed.
+    pub stage: IsoDownloadProgressStage,
+    /// Bytes completed when the selected engine can measure them faithfully.
+    pub completed_bytes: Option<u64>,
+    /// Total bytes expected when known.
+    pub total_bytes: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Verified result of an ISO download.
 pub struct IsoDownloadReport {
@@ -914,6 +937,21 @@ impl IsoDownloader {
         initial: ResolvedWindowsIso,
         destination: &Path,
     ) -> Result<IsoDownloadReport> {
+        self.download_resolved_with_progress(resolver, request, initial, destination, |_| {})
+    }
+
+    /// Downloads an already-resolved ISO while reporting transfer and hash progress.
+    pub fn download_resolved_with_progress<F>(
+        &self,
+        resolver: &MicrosoftIsoResolver,
+        request: &MicrosoftIsoRequest,
+        initial: ResolvedWindowsIso,
+        destination: &Path,
+        mut on_progress: F,
+    ) -> Result<IsoDownloadReport>
+    where
+        F: FnMut(&IsoDownloadProgress),
+    {
         let parent = destination.parent().ok_or_else(|| LswError::InvalidValue {
             field: "ISO destination",
             reason: "destination has no parent directory".to_owned(),
@@ -921,7 +959,9 @@ impl IsoDownloader {
         require_real_directory(parent, "ISO destination directory")?;
         validate_destination(destination)?;
 
-        if let Some(report) = existing_verified_iso(destination, &initial, self.engine())? {
+        if let Some(report) =
+            existing_verified_iso(destination, &initial, self.engine(), &mut on_progress)?
+        {
             return Ok(report);
         }
         let temporary = download_temporary_path(destination)?;
@@ -935,12 +975,14 @@ impl IsoDownloader {
                 ensure_same_iso(&initial, &resolved)?;
             }
             let result = match &self.aria2c {
-                Some(aria2c) => download_with_aria2(aria2c, &resolved, &temporary),
-                None => download_with_ranges(&self.agent, &resolved, &temporary),
+                Some(aria2c) => {
+                    download_with_aria2(aria2c, &resolved, &temporary, &mut on_progress)
+                }
+                None => download_with_ranges(&self.agent, &resolved, &temporary, &mut on_progress),
             };
             match result {
                 Ok(()) => {
-                    let actual = sha256_file(&temporary)?;
+                    let actual = sha256_file_with_progress(&temporary, &mut on_progress)?;
                     if !actual.eq_ignore_ascii_case(&resolved.expected_sha256) {
                         return Err(LswError::InvalidValue {
                             field: "Windows ISO SHA-256",
@@ -971,11 +1013,15 @@ impl IsoDownloader {
     }
 }
 
-fn download_with_aria2(
+fn download_with_aria2<F>(
     aria2c: &Path,
     resolved: &ResolvedWindowsIso,
     temporary: &Path,
-) -> Result<()> {
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&IsoDownloadProgress),
+{
     validate_microsoft_cdn_url(&resolved.download_url.0)?;
     let parent = temporary.parent().ok_or_else(|| LswError::InvalidValue {
         field: "ISO download",
@@ -1027,7 +1073,26 @@ fn download_with_aria2(
         stdin.write_all(resolved.download_url.expose().as_bytes())?;
         stdin.write_all(format!("\n  out={filename}\n").as_bytes())?;
     }
-    let status = child.wait()?;
+    on_progress(&IsoDownloadProgress {
+        stage: IsoDownloadProgressStage::Transferring,
+        completed_bytes: None,
+        total_bytes: None,
+    });
+    let mut last_heartbeat = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(1) {
+            on_progress(&IsoDownloadProgress {
+                stage: IsoDownloadProgressStage::Transferring,
+                completed_bytes: None,
+                total_bytes: None,
+            });
+            last_heartbeat = Instant::now();
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
     if !status.success() {
         return Err(LswError::ExternalCommandFailed {
             program: aria2c.to_owned(),
@@ -1070,11 +1135,15 @@ fn split_ranges(length: u64) -> Result<Vec<ByteRange>> {
         .collect())
 }
 
-fn download_with_ranges(
+fn download_with_ranges<F>(
     agent: &ureq::Agent,
     resolved: &ResolvedWindowsIso,
     temporary: &Path,
-) -> Result<()> {
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&IsoDownloadProgress),
+{
     validate_microsoft_cdn_url(&resolved.download_url.0)?;
     let length = cdn_content_length(agent, &resolved.download_url)?;
     let ranges = split_ranges(length)?;
@@ -1084,12 +1153,38 @@ fn download_with_ranges(
         .map(|(index, _)| sidecar_path(temporary, &format!("part{index}")))
         .collect::<Result<Vec<_>>>()?;
 
+    let mut downloaded = part_paths
+        .iter()
+        .zip(&ranges)
+        .map(|(path, range)| partial_file_length(path, range.len()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum::<u64>();
+    on_progress(&IsoDownloadProgress {
+        stage: IsoDownloadProgressStage::Transferring,
+        completed_bytes: Some(downloaded),
+        total_bytes: Some(length),
+    });
+
     thread::scope(|scope| -> Result<()> {
+        let (progress_sender, progress_receiver) = mpsc::channel();
         let mut handles = Vec::new();
         for (range, path) in ranges.iter().copied().zip(part_paths.iter().cloned()) {
             let agent = agent.clone();
             let url = resolved.download_url.clone();
-            handles.push(scope.spawn(move || download_range(&agent, &url, range, &path)));
+            let progress_sender = progress_sender.clone();
+            handles.push(
+                scope.spawn(move || download_range(&agent, &url, range, &path, &progress_sender)),
+            );
+        }
+        drop(progress_sender);
+        for bytes in progress_receiver {
+            downloaded = downloaded.saturating_add(bytes).min(length);
+            on_progress(&IsoDownloadProgress {
+                stage: IsoDownloadProgressStage::Transferring,
+                completed_bytes: Some(downloaded),
+                total_bytes: Some(length),
+            });
         }
         let mut first_error = None;
         for handle in handles {
@@ -1116,6 +1211,12 @@ fn download_with_ranges(
     let assembly = sidecar_path(temporary, "assembling")?;
     let mut output = create_private_truncated_file(&assembly)?;
     let mut assembled = 0_u64;
+    on_progress(&IsoDownloadProgress {
+        stage: IsoDownloadProgressStage::Assembling,
+        completed_bytes: Some(0),
+        total_bytes: Some(length),
+    });
+    let mut buffer = vec![0_u8; 1024 * 1024];
     for (path, range) in part_paths.iter().zip(&ranges) {
         require_regular_file(path, "ISO range part")?;
         let metadata = fs::metadata(path)?;
@@ -1125,7 +1226,20 @@ fn download_with_ranges(
                 reason: "a completed range has the wrong size".to_owned(),
             });
         }
-        assembled += io::copy(&mut fs::File::open(path)?, &mut output)?;
+        let mut part = fs::File::open(path)?;
+        loop {
+            let bytes = part.read(&mut buffer)?;
+            if bytes == 0 {
+                break;
+            }
+            output.write_all(&buffer[..bytes])?;
+            assembled += bytes as u64;
+            on_progress(&IsoDownloadProgress {
+                stage: IsoDownloadProgressStage::Assembling,
+                completed_bytes: Some(assembled.min(length)),
+                total_bytes: Some(length),
+            });
+        }
     }
     if assembled != length {
         return Err(LswError::InvalidValue {
@@ -1166,6 +1280,7 @@ fn download_range(
     url: &SecretDownloadUrl,
     range: ByteRange,
     path: &Path,
+    progress_sender: &mpsc::Sender<u64>,
 ) -> Result<()> {
     let existing = partial_file_length(path, range.len())?;
     if existing == range.len() {
@@ -1203,7 +1318,17 @@ fn download_range(
     let mut output = OpenOptions::new().create(true).append(true).open(path)?;
     set_private_file_permissions(path)?;
     let mut reader = response.into_reader().take(remaining + 1);
-    let written = io::copy(&mut reader, &mut output)?;
+    let mut written = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let bytes = reader.read(&mut buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        output.write_all(&buffer[..bytes])?;
+        written += bytes as u64;
+        let _ = progress_sender.send(bytes as u64);
+    }
     output.flush()?;
     output.sync_all()?;
     if written != remaining {
@@ -1238,11 +1363,15 @@ fn download_http_error(context: &'static str, error: ureq::Error) -> LswError {
     }
 }
 
-fn existing_verified_iso(
+fn existing_verified_iso<F>(
     destination: &Path,
     resolved: &ResolvedWindowsIso,
     engine: IsoDownloadEngine,
-) -> Result<Option<IsoDownloadReport>> {
+    on_progress: &mut F,
+) -> Result<Option<IsoDownloadReport>>
+where
+    F: FnMut(&IsoDownloadProgress),
+{
     let metadata = match fs::symlink_metadata(destination) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1254,7 +1383,7 @@ fn existing_verified_iso(
             reason: format!("{} is not a regular file", destination.display()),
         });
     }
-    let actual = sha256_file(destination)?;
+    let actual = sha256_file_with_progress(destination, on_progress)?;
     if !actual.eq_ignore_ascii_case(&resolved.expected_sha256) {
         return Err(LswError::InvalidValue {
             field: "ISO destination",
@@ -1293,16 +1422,36 @@ fn ensure_same_iso(initial: &ResolvedWindowsIso, refreshed: &ResolvedWindowsIso)
 
 /// Calculates a lowercase SHA-256 for a regular, non-symlink file.
 pub fn sha256_file(path: &Path) -> Result<String> {
+    sha256_file_with_progress(path, &mut |_| {})
+}
+
+fn sha256_file_with_progress<F>(path: &Path, on_progress: &mut F) -> Result<String>
+where
+    F: FnMut(&IsoDownloadProgress),
+{
     require_regular_file(path, "SHA-256 input")?;
+    let total = fs::metadata(path)?.len();
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut completed = 0_u64;
+    on_progress(&IsoDownloadProgress {
+        stage: IsoDownloadProgressStage::Verifying,
+        completed_bytes: Some(0),
+        total_bytes: Some(total),
+    });
     loop {
         let bytes = file.read(&mut buffer)?;
         if bytes == 0 {
             break;
         }
         digest.update(&buffer[..bytes]);
+        completed += bytes as u64;
+        on_progress(&IsoDownloadProgress {
+            stage: IsoDownloadProgressStage::Verifying,
+            completed_bytes: Some(completed),
+            total_bytes: Some(total),
+        });
     }
     Ok(hex_bytes(&digest.finalize()))
 }
@@ -1599,7 +1748,9 @@ mod tests {
             )
             .expect("URL should parse"),
         };
-        assert!(existing_verified_iso(&iso, &resolved, IsoDownloadEngine::Native).is_err());
+        assert!(
+            existing_verified_iso(&iso, &resolved, IsoDownloadEngine::Native, &mut |_| {}).is_err()
+        );
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 
@@ -1619,6 +1770,34 @@ mod tests {
             b"unrelated file"
         );
         assert!(temporary.exists());
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn sha256_reports_exact_bounded_progress() {
+        let root = fixture();
+        let input = root.join("input.iso");
+        fs::write(&input, vec![0x5a; 1024 * 1024 + 17]).expect("fixture should be written");
+        let mut events = Vec::new();
+        let digest = sha256_file_with_progress(&input, &mut |event| events.push(*event))
+            .expect("fixture should hash");
+
+        assert_eq!(digest.len(), 64);
+        assert_eq!(
+            events.first(),
+            Some(&IsoDownloadProgress {
+                stage: IsoDownloadProgressStage::Verifying,
+                completed_bytes: Some(0),
+                total_bytes: Some(1024 * 1024 + 17),
+            })
+        );
+        assert_eq!(
+            events.last().and_then(|event| event.completed_bytes),
+            Some(1024 * 1024 + 17)
+        );
+        assert!(events.iter().all(|event| {
+            event.completed_bytes.unwrap_or_default() <= event.total_bytes.unwrap_or_default()
+        }));
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 
@@ -1697,7 +1876,7 @@ mod tests {
             .expect("fixture URL should be accepted"),
         };
         let temporary = root.join(".windows.iso.lsw-download");
-        download_with_aria2(&fake_aria2, &resolved, &temporary)
+        download_with_aria2(&fake_aria2, &resolved, &temporary, &mut |_| {})
             .expect("fake aria2 should receive a valid input-file request");
         assert_eq!(
             fs::read(&temporary).expect("download should exist"),

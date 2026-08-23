@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.0-beta.6 (in development)
+
+- Added a single terminal progress model for official ISO transfer and SHA-256
+  verification, WinPE preparation and application, and unattended Windows
+  first boot. Interactive terminals receive an in-place progress bar for
+  measurable work; redirected logs receive bounded ten-percent updates, while
+  specialize and OOBE report named stages without invented percentages.
+- Extended the private, network-disabled WinPE status volume with live DISM
+  output and bounded percentage parsing. A real Windows/KVM benchmark rejected
+  fast compression because the larger intermediate made total preparation
+  slower, so maximum compression remains the default. Export now uses the
+  private NTFS scratch directory explicitly; CompactOS and integrity checks are
+  unchanged.
+- Added an atomic guest setup-stage marker covering service configuration,
+  profile application, agent startup, OOBE, cleanup, and completion. The host
+  reads it only through the authenticated loopback agent channel. Pre-applied
+  images also carry a bounded marker so first boot skips the duplicate online
+  profile and CompactOS pass.
+- Added safe `lsw install NAME` recovery when WinPE deployment completed but
+  first boot or verification was interrupted. A stopped instance with no seed
+  resumes normal Windows boot and authenticated setup verification without
+  reattaching installation media.
+
 ## 1.0.0-beta.5
 
 - Added the one-shot `lsw install NAME` path. It resolves the current official
