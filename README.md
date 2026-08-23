@@ -102,9 +102,12 @@ updates suitable for CI logs.
 Real Windows/KVM measurement found that fast WIM compression shortened export
 but made total preparation slower because the larger intermediate increased
 later mount and commit work. LSW therefore retains maximum compression and
-uses the private NTFS scratch directory explicitly. A pre-applied profile marker
-prevents first boot from repeating offline AppX and CompactOS work. Exact media
-SHA-256, `/CheckIntegrity`, and CompactOS-on-apply behavior remain unchanged.
+uses the private NTFS scratch directory explicitly. An offline AppX marker
+prevents first boot from repeating provisioned-package work. CompactOS runs in
+the named Windows `applying-profile` stage after a reliable non-compact image
+apply; this avoids making target-disk creation depend on DISM's non-deterministic
+CompactOS-on-apply path. Exact media SHA-256 and `/CheckIntegrity` remain
+mandatory.
 
 `--edition pro` remains available to override the default and is matched against
 ISO metadata; users never need to guess a WIM index. The WinPE jobs attach only

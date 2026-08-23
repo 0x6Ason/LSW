@@ -16,7 +16,7 @@ use crate::{
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const LICENSE_HELPER_SCRIPT: &[u8] = include_bytes!("../assets/license-helper.ps1");
 const SETUP_ACCOUNT_NAME: &str = "LSWSetup";
-pub(crate) const OFFLINE_PROFILE_MARKER_NAME: &str = "offline-profile-applied.marker";
+pub(crate) const OFFLINE_APPX_MARKER_NAME: &str = "offline-appx-applied.marker";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallSeedOptions {
@@ -677,8 +677,6 @@ if (-not (Get-NetFirewallRule -DisplayName 'LSW Guest Agent' -ErrorAction Silent
     New-NetFirewallRule -DisplayName 'LSW Guest Agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort __LSW_AGENT_GUEST_PORT__ -RemoteAddress 10.0.2.2 | Out-Null
 }
 
-Set-LswSetupStage 'applying-profile'
-& (Join-Path $PSScriptRoot 'apply-profile.ps1')
 Set-LswSetupStage 'starting-agent'
 Invoke-Sc @('start', $ServiceName)
 $StartedService = Get-Service -Name $ServiceName
@@ -693,6 +691,8 @@ $StartedService.Refresh()
 if ($StartedService.Status -ne 'Running') {
     throw 'LSWAgent did not remain running after SCM started it.'
 }
+Set-LswSetupStage 'applying-profile'
+& (Join-Path $PSScriptRoot 'apply-profile.ps1')
 Set-LswSetupStage 'waiting-for-oobe'
 "#
     .replace("__LSW_AGENT_GUEST_PORT__", &AGENT_GUEST_PORT.to_string())
@@ -729,12 +729,12 @@ Get-AppxProvisionedPackage -Online | Where-Object {{ $RemoveNames -contains $_.D
         )
     };
     let compact = if plan.compact_os {
-        "compact.exe /CompactOS:always"
+        "& compact.exe /CompactOS:always\r\nif ($LASTEXITCODE -ne 0) { throw \"CompactOS failed with exit code $LASTEXITCODE.\" }"
     } else {
         "Write-Host 'CompactOS not requested for this profile.'"
     };
     Ok(format!(
-        "$ErrorActionPreference = 'Stop'\r\n$OfflineProfileMarker = Join-Path $PSScriptRoot '{OFFLINE_PROFILE_MARKER_NAME}'\r\nif (Test-Path -LiteralPath $OfflineProfileMarker -PathType Leaf) {{\r\n    Write-Host 'LSW profile was already applied offline by WinPE.'\r\n    return\r\n}}\r\nWrite-Host 'Applying LSW {} profile.'\r\n{}\r\n{}\r\n",
+        "$ErrorActionPreference = 'Stop'\r\n$OfflineAppxMarker = Join-Path $PSScriptRoot '{OFFLINE_APPX_MARKER_NAME}'\r\nWrite-Host 'Applying LSW {} profile.'\r\nif (Test-Path -LiteralPath $OfflineAppxMarker -PathType Leaf) {{\r\n    Write-Host 'LSW provisioned application profile was already applied offline by WinPE.'\r\n}} else {{\r\n{}\r\n}}\r\n{}\r\n",
         manifest.spec.profile, removal, compact
     ))
 }
@@ -1020,6 +1020,10 @@ mod tests {
         ] {
             assert!(installer.contains(stage));
         }
+        assert!(
+            installer.find("Set-LswSetupStage 'starting-agent'")
+                < installer.find("Set-LswSetupStage 'applying-profile'")
+        );
         assert!(installer.contains("setup-progress.marker.tmp"));
         assert!(installer.contains("Move-Item -LiteralPath $SetupProgressTemporary"));
         assert!(installer.contains("%WINDIR%\\Panther\\unattend.xml"));
@@ -1076,9 +1080,11 @@ mod tests {
         let profile = fs::read_to_string(root.join("seed/lsw/apply-profile.ps1"))
             .expect("profile should be readable");
         assert!(profile.contains("Remove-AppxProvisionedPackage"));
-        assert!(profile.contains(OFFLINE_PROFILE_MARKER_NAME));
-        assert!(profile.contains("already applied offline by WinPE"));
-        assert!(profile.contains("    return\r\n"));
+        assert!(profile.contains(OFFLINE_APPX_MARKER_NAME));
+        assert!(profile.contains("application profile was already applied offline by WinPE"));
+        assert!(!profile.contains("    return\r\n"));
+        assert!(profile.contains("compact.exe /CompactOS:always"));
+        assert!(profile.contains("CompactOS failed with exit code $LASTEXITCODE"));
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 

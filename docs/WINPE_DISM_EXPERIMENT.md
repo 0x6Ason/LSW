@@ -28,26 +28,31 @@ Given a profile, a validated WIM index and an instance directory, the backend:
 8. Commits the result as `lsw-prepared.wim`, with integrity checks on export,
    mount and commit. In the one-shot installer, it stages the private agent and
    answer file into the mounted WIM immediately before that commit. A bounded
-   marker tells first boot not to repeat the already completed profile and
-   CompactOS work.
+   marker tells first boot not to repeat the already completed provisioned-AppX
+   work.
 9. Emits phase markers and bounded live DISM output to a private writable
    status volume, allowing the host to report real percentages, and discards a
    mounted image after an error.
 
 The apply plan then boots a separate WinPE phase with the prepared workspace as
 Disk 0 and the new instance qcow2 as Disk 1. It partitions only Disk 1, applies
-the WIM with optional CompactOS, creates UEFI boot files with BCDBoot, requires
-a distinct `apply-complete` status-volume marker, and rejects that marker if
-the resulting qcow2 is implausibly small or fails `qemu-img check`.
+the WIM without coupling target creation to CompactOS, creates UEFI boot files
+with BCDBoot, requires a distinct `apply-complete` status-volume marker, and
+rejects that marker if the resulting qcow2 is implausibly small or fails
+`qemu-img check`.
 
 The generated seed contains no Microsoft binary, Windows image, product key,
 activation data or agent token. Linux `wimlib` is not called for package, AppX
 or feature servicing.
 
-The `slim` plan requests CompactOS when the prepared image is eventually
-applied. It does not run `ResetBase`, remove WinSxS, disable Windows Update or
-Defender, remove Store/App Installer/WebView2, or disable WMI, hibernation or
-recovery.
+The `slim` plan enables CompactOS during the named Windows
+`applying-profile` setup stage after the target image has been applied safely.
+The offline marker skips duplicate AppX work without skipping CompactOS. This
+keeps a CompactOS failure recoverable and avoids the non-deterministic,
+CPU-bound stall reproduced by the exact Windows/KVM gate when DISM combined
+`/Apply-Image` with `/Compact:on`. The profile does not run `ResetBase`, remove
+WinSxS, disable Windows Update or Defender, remove Store/App
+Installer/WebView2, or disable WMI, hibernation or recovery.
 
 ## Safety boundary
 
@@ -69,7 +74,7 @@ process after termination so preparation RAM is released before normal boot.
 
 Unit tests cover stage construction, image-index validation, atomic/private seed
 writing, absence of product keys, the conservative stock path, exact DISM
-operations, separated disk topology, apply/CompactOS behavior, payload ACL
+operations, separated disk topology, deferred CompactOS behavior, payload ACL
 staging, control-media topology, and mandatory completion markers. The backend
 is enabled in the beta.6 installer. A real Windows 11 25H2/KVM run completed
 both WinPE phases, specialize, and SCM agent startup, then exposed a race where

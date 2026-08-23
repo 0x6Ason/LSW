@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::install_seed::OFFLINE_PROFILE_MARKER_NAME;
+use crate::install_seed::OFFLINE_APPX_MARKER_NAME;
 use crate::{
     CommandInvocation, CustomizationPlan, HostCapabilities, InstanceManifest, LswError,
     PreparationPlan, PreparationStep, QemuBackend, Result, WindowsProfile,
@@ -187,11 +187,8 @@ pub enum WinPeDismApplyStage {
     LocatePreparedImage,
     /// Partition and format only the LSW-owned target at Disk 1.
     InitializeTarget,
-    /// Apply the prepared WIM, optionally using CompactOS.
-    ApplyPreparedImage {
-        /// Whether DISM applies the image using CompactOS storage.
-        compact: bool,
-    },
+    /// Apply the prepared WIM without coupling installation to CompactOS.
+    ApplyPreparedImage,
     /// Create UEFI boot files with BCDBoot.
     ConfigureUefiBoot,
 }
@@ -206,10 +203,7 @@ impl WinPeDismApplyStage {
             Self::InitializeTarget => format!(
                 "initialize LSW-owned virtual Disk {WINPE_TARGET_DISK_ID} with EFI, MSR, and Windows partitions"
             ),
-            Self::ApplyPreparedImage { compact } => format!(
-                "apply the prepared image to the target{}",
-                if *compact { " with CompactOS" } else { "" }
-            ),
+            Self::ApplyPreparedImage => "apply the prepared image to the target".to_owned(),
             Self::ConfigureUefiBoot => {
                 "create the target UEFI boot files with BCDBoot".to_owned()
             }
@@ -265,8 +259,8 @@ pub struct WinPeDismPlan {
     pub workspace_size_gib: u32,
     /// Stable prepared-WIM filename inside the workspace.
     pub prepared_image_name: &'static str,
-    /// Whether the later apply phase should request CompactOS.
-    pub compact_on_apply: bool,
+    /// Whether Windows setup should enable CompactOS after the reliable apply phase.
+    pub compact_during_setup: bool,
     /// Whether the prepared WIM contains guest-agent setup files.
     pub includes_agent: bool,
     /// Ordered prepare-phase operations encoded in the script.
@@ -289,8 +283,6 @@ pub struct WinPeDismApplyPlan {
     pub target_disk: PathBuf,
     /// Fixed virtual disk number expected by the generated DiskPart script.
     pub target_disk_id: u32,
-    /// Whether to request CompactOS during DISM apply.
-    pub compact: bool,
     /// Ordered apply-phase operations encoded in the script.
     pub stages: Vec<WinPeDismApplyStage>,
     /// Relative files generated in the apply seed.
@@ -433,7 +425,7 @@ impl WinPeDismBackend {
             workspace_disk: instance_dir.join("run/winpe-workspace.qcow2"),
             workspace_size_gib: WINPE_WORKSPACE_SIZE_GIB,
             prepared_image_name: WINPE_PREPARED_IMAGE_NAME,
-            compact_on_apply: customization.compact_os,
+            compact_during_setup: customization.compact_os,
             includes_agent: false,
             stages,
             files,
@@ -497,7 +489,6 @@ impl WinPeDismBackend {
 
         let workspace_disk = instance_dir.join("run/winpe-workspace.qcow2");
         let target_disk = instance_dir.join("disk.qcow2");
-        let compact = CustomizationPlan::for_profile(manifest.spec.profile)?.compact_os;
         let mut generated = BTreeMap::new();
         generated.insert(
             PathBuf::from("lsw/target.diskpart"),
@@ -505,11 +496,11 @@ impl WinPeDismBackend {
         );
         generated.insert(
             PathBuf::from(WINPE_APPLY_SCRIPT_FILE),
-            apply_script(compact).into_bytes(),
+            apply_script().into_bytes(),
         );
         generated.insert(
             PathBuf::from("README.txt"),
-            apply_seed_readme(manifest.spec.profile, compact).into_bytes(),
+            apply_seed_readme(manifest.spec.profile).into_bytes(),
         );
 
         let files = generated.keys().cloned().collect();
@@ -519,11 +510,10 @@ impl WinPeDismBackend {
             workspace_disk,
             target_disk,
             target_disk_id: WINPE_TARGET_DISK_ID,
-            compact,
             stages: vec![
                 WinPeDismApplyStage::LocatePreparedImage,
                 WinPeDismApplyStage::InitializeTarget,
-                WinPeDismApplyStage::ApplyPreparedImage { compact },
+                WinPeDismApplyStage::ApplyPreparedImage,
                 WinPeDismApplyStage::ConfigureUefiBoot,
             ],
             files,
@@ -1456,8 +1446,7 @@ fn target_diskpart() -> String {
     )
 }
 
-fn apply_script(compact: bool) -> String {
-    let compact_argument = if compact { " /Compact:on" } else { "" };
+fn apply_script() -> String {
     format!(
         r#"@echo off
 setlocal EnableExtensions EnableDelayedExpansion
@@ -1489,7 +1478,7 @@ if not exist "T:\" goto :fail
 if not exist "S:\" goto :fail
 
 call :status apply-image
-call :run "%LSW_DISM%" /English /Apply-Image /ImageFile:"%LSW_IMAGE%" /Index:1 /ApplyDir:T:\ /CheckIntegrity{compact_argument}
+call :run "%LSW_DISM%" /English /Apply-Image /ImageFile:"%LSW_IMAGE%" /Index:1 /ApplyDir:T:\ /CheckIntegrity
 if errorlevel 1 goto :fail
 if not exist "T:\Windows\System32\bcdboot.exe" goto :fail
 
@@ -1635,7 +1624,7 @@ mkdir "%LSW_MOUNT%\ProgramData\LSW\setup" "%LSW_MOUNT%\Windows\Panther" >>"%LSW_
 if errorlevel 1 goto :fail_mounted
 xcopy.exe "%LSW_SEED%\payload\lsw\*" "%LSW_MOUNT%\ProgramData\LSW\setup\" /E /H /K /Y /I >>"%LSW_LOG%" 2>&1
 if errorlevel 1 goto :fail_mounted
->"%LSW_MOUNT%\ProgramData\LSW\setup\{OFFLINE_PROFILE_MARKER_NAME}" echo LSW-OFFLINE-PROFILE-APPLIED
+>"%LSW_MOUNT%\ProgramData\LSW\setup\{OFFLINE_APPX_MARKER_NAME}" echo LSW-OFFLINE-APPX-APPLIED
 if errorlevel 1 goto :fail_mounted
 copy /Y "%LSW_SEED%\lsw\offline-unattend.xml" "%LSW_MOUNT%\Windows\Panther\unattend.xml" >>"%LSW_LOG%" 2>&1
 if errorlevel 1 goto :fail_mounted
@@ -1762,15 +1751,14 @@ fn seed_readme(
     customization: &CustomizationPlan,
 ) -> String {
     format!(
-        "LSW WinPE DISM preparation seed\r\n\r\nProfile: {profile}\r\nEdition index: {edition_index}\r\nOutput: {WINPE_WORKSPACE_DRIVE}\\{WINPE_PREPARED_IMAGE_NAME}\r\n\r\nThis seed contains no Windows image, product key, activation data, or Microsoft binary. The one-shot plan may add the private per-instance agent token and setup payload.\r\nIt must be booted only in LSW's isolated preparation VM with a blank LSW-owned virtual Disk {WINPE_WORKSPACE_DISK_ID}.\r\nThe script uses dism.exe from the official Windows ISO's WinPE environment. Linux wimlib is not used for Windows package, AppX, or feature servicing.\r\nCompact-on-apply: {}\r\n",
+        "LSW WinPE DISM preparation seed\r\n\r\nProfile: {profile}\r\nEdition index: {edition_index}\r\nOutput: {WINPE_WORKSPACE_DRIVE}\\{WINPE_PREPARED_IMAGE_NAME}\r\n\r\nThis seed contains no Windows image, product key, activation data, or Microsoft binary. The one-shot plan may add the private per-instance agent token and setup payload.\r\nIt must be booted only in LSW's isolated preparation VM with a blank LSW-owned virtual Disk {WINPE_WORKSPACE_DISK_ID}.\r\nThe script uses dism.exe from the official Windows ISO's WinPE environment. Linux wimlib is not used for Windows package, AppX, or feature servicing.\r\nCompactOS during Windows setup: {}\r\n",
         if customization.compact_os { "yes" } else { "no" }
     )
 }
 
-fn apply_seed_readme(profile: WindowsProfile, compact: bool) -> String {
+fn apply_seed_readme(profile: WindowsProfile) -> String {
     format!(
-        "LSW WinPE DISM apply seed\r\n\r\nProfile: {profile}\r\nInput: {WINPE_PREPARED_IMAGE_NAME}\r\nTarget: virtual Disk {WINPE_TARGET_DISK_ID}\r\nCompact-on-apply: {}\r\n\r\nThis seed contains no Windows image, product key, activation data, or agent token.\r\nIt must be booted only with the LSW workspace as virtual Disk 0 and a new LSW-owned target qcow2 as virtual Disk {WINPE_TARGET_DISK_ID}. Never attach a host block device.\r\n",
-        if compact { "yes" } else { "no" }
+        "LSW WinPE DISM apply seed\r\n\r\nProfile: {profile}\r\nInput: {WINPE_PREPARED_IMAGE_NAME}\r\nTarget: virtual Disk {WINPE_TARGET_DISK_ID}\r\nCompact-on-apply: no\r\n\r\nCompactOS, when requested by the profile, runs during Windows setup after the target image is safely applied.\r\nThis seed contains no Windows image, product key, activation data, or agent token.\r\nIt must be booted only with the LSW workspace as virtual Disk 0 and a new LSW-owned target qcow2 as virtual Disk {WINPE_TARGET_DISK_ID}. Never attach a host block device.\r\n"
     )
 }
 
@@ -2022,7 +2010,7 @@ mod tests {
         assert!(!script.contains("powershell"));
         assert!(!script.contains("/Remove-Package"));
         assert!(!script.contains("/Disable-Feature"));
-        assert!(plan.compact_on_apply);
+        assert!(plan.compact_during_setup);
         assert!(plan.stages.iter().any(|stage| matches!(
             stage,
             WinPeDismStage::RemoveProvisionedAppx { display_name }
@@ -2037,7 +2025,7 @@ mod tests {
         let root = fixture();
         let plan = WinPeDismBackend::plan(WindowsProfile::Vanilla, 1, &root)
             .expect("vanilla plan should be generated");
-        assert!(!plan.compact_on_apply);
+        assert!(!plan.compact_during_setup);
         assert!(!plan
             .stages
             .iter()
@@ -2096,8 +2084,8 @@ mod tests {
             .expect("prepared image should be committed");
         assert!(stage < commit);
         assert!(script.contains("%LSW_MOUNT%\\Windows\\Panther\\unattend.xml"));
-        assert!(script.contains(OFFLINE_PROFILE_MARKER_NAME));
-        assert!(script.contains("LSW-OFFLINE-PROFILE-APPLIED"));
+        assert!(script.contains(OFFLINE_APPX_MARKER_NAME));
+        assert!(script.contains("LSW-OFFLINE-APPX-APPLIED"));
 
         let unattend = String::from_utf8(
             plan.generated
@@ -2153,9 +2141,8 @@ mod tests {
         let script = plan.script();
 
         assert_eq!(plan.target_disk_id, 1);
-        assert!(plan.compact);
         assert!(script.contains("/Apply-Image"));
-        assert!(script.contains("/Compact:on"));
+        assert!(!script.contains("/Compact:on"));
         assert!(script.contains("/ApplyDir:T:\\"));
         assert!(script.contains("bcdboot.exe"));
         assert!(script.contains("/s S: /f UEFI"));
@@ -2182,12 +2169,11 @@ mod tests {
     }
 
     #[test]
-    fn stock_apply_does_not_enable_compact_os() {
+    fn every_apply_defers_compact_os_until_windows_setup() {
         let root = fixture();
         let manifest = manifest(&root, WindowsProfile::Vanilla);
         let plan =
             WinPeDismBackend::plan_apply(&manifest, &root).expect("apply plan should be generated");
-        assert!(!plan.compact);
         assert!(!plan.script().contains("/Compact:on"));
         fs::remove_dir_all(root).expect("fixture should be removed");
     }

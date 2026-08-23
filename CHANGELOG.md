@@ -30,6 +30,12 @@
 - Expanded the exact Windows/KVM release gate with native account creation,
   linked-clone secret isolation, share boundary escapes, balloon/TRIM,
   hibernate/resume, offline compaction, and the existing no-login cold restart.
+- Decoupled reliable WinPE target apply from CompactOS after the exact gate
+  reproduced a CPU-bound DISM stall at 63 percent. WinPE still performs bounded
+  offline AppX servicing and an integrity-checked image apply; the `slim`
+  profile now enables CompactOS during the named Windows `applying-profile`
+  stage, where setup can report progress and recover without leaving a partial
+  target image.
 - Added explicit Windows-license acceptance to new one-shot installations.
   Interactive terminals require `[y/N]` confirmation before media download or
   instance creation; noninteractive use requires `--accept-windows-license`.
