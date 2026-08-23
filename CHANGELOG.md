@@ -9,7 +9,10 @@
   source disk. Sealed bases are read-only; clone overlays receive distinct
   tokens, ports, and a private boot-time identity volume. The SCM agent now
   reconciles identity media that Windows mounts after automatic services start,
-  avoiding a boot-time token race without delaying ordinary boots.
+  avoiding a boot-time token race without delaying ordinary boots. Host
+  commands tolerate the longer servicing window of a newly installed Windows
+  cold boot and show live agent-start progress instead of failing after 90
+  seconds.
 - Added manifest v5 and the opt-in resource governor: minimum memory, QMP
   balloon control, host-pressure reclaim, running-to-pause-to-Windows-hibernate
   policy, automatic resume, guest TRIM, qcow2 discard/detect-zeroes, and safe

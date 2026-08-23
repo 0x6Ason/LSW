@@ -6,6 +6,11 @@ use super::*;
 use lsw_core::PortForward;
 
 #[test]
+fn agent_wait_covers_slow_first_windows_cold_boots() {
+    assert!(AGENT_START_TIMEOUT >= Duration::from_secs(3 * 60));
+}
+
+#[test]
 fn create_accepts_repeated_tcp_publish_options() {
     let arguments = [
         "win-dev",

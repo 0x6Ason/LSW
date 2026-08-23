@@ -42,8 +42,11 @@ use lsw_core::{
     Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest, StateStore, VmAccelerator,
     WindowsProfile,
 };
+use progress::{ProgressEvent, ProgressRenderer};
 
-const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
+// A freshly installed Windows guest can spend more than two minutes servicing
+// its first cold boot before the automatic SCM agent accepts connections.
+const AGENT_START_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -1410,17 +1413,34 @@ fn connect_agent(
         InstanceState::Installing | InstanceState::Running => {}
     }
 
-    println!("Waiting for the LSW guest agent...");
+    let mut progress = ProgressRenderer::new();
+    progress.update(ProgressEvent::stage(
+        1,
+        1,
+        "Starting Windows",
+        "waiting for the guest agent",
+    ));
     let deadline = Instant::now() + AGENT_START_TIMEOUT;
     loop {
         manifest = store.load(name)?;
         if let Ok(client) = AgentClient::connect(&manifest, &token) {
+            progress.update(ProgressEvent::measured(
+                1,
+                1,
+                "Starting Windows",
+                "guest agent ready",
+                1,
+                1,
+            ));
+            progress.finish();
             return Ok(client);
         }
         if manifest.state == InstanceState::Failed {
+            progress.finish();
             return Err(format!("instance {name:?} failed while waiting for its agent").into());
         }
         if Instant::now() >= deadline {
+            progress.finish();
             return Err(format!(
                 "timed out waiting for the guest agent at {}; inspect the VM and {}",
                 agent_client::address(&manifest),
