@@ -39,6 +39,10 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_SESSIONS: usize = 32;
 #[cfg(windows)]
+const IDENTITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const IDENTITY_DISCOVERY_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(windows)]
 const LICENSE_HELPER_PORT: u16 = LICENSE_HELPER_GUEST_PORT;
 #[cfg(windows)]
 const LICENSE_HELPER_SERVICE: &str = "LSWLicenseHelper";
@@ -507,8 +511,12 @@ fn run_agent(
     ready: impl FnOnce(SocketAddr) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
-    apply_clone_identity(&configuration)?;
-    let token = Arc::new(read_token(&configuration.token_file)?);
+    let identity_applied = apply_clone_identity(&configuration.token_file)?;
+    let token = Arc::new(Mutex::new(read_token(&configuration.token_file)?));
+    #[cfg(windows)]
+    if !identity_applied {
+        watch_for_clone_identity(configuration.token_file.clone(), Arc::downgrade(&token))?;
+    }
     let listener = TcpListener::bind(configuration.listen)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
     let local_address = listener.local_addr()?;
@@ -543,7 +551,7 @@ fn run_agent(
 }
 
 #[cfg(windows)]
-fn apply_clone_identity(configuration: &Configuration) -> Result<(), Box<dyn std::error::Error>> {
+fn apply_clone_identity(token_file: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     let mut identity = None;
     for letter in b'D'..=b'Z' {
         let root = PathBuf::from(format!("{}:\\lsw", char::from(letter)));
@@ -557,7 +565,7 @@ fn apply_clone_identity(configuration: &Configuration) -> Result<(), Box<dyn std
         }
     }
     let Some(identity) = identity else {
-        return Ok(());
+        return Ok(false);
     };
 
     let name = fs::read_to_string(identity.join(CLONE_IDENTITY_NAME_FILE))?
@@ -578,28 +586,74 @@ fn apply_clone_identity(configuration: &Configuration) -> Result<(), Box<dyn std
         return Err("clone identity name is invalid".into());
     }
     let mut token = read_token(&identity.join(CLONE_IDENTITY_TOKEN_FILE))?.into_bytes();
-    let token_parent = configuration
-        .token_file
+    let token_parent = token_file
         .parent()
         .ok_or("configured token path has no parent directory")?;
     if !token_parent.is_dir() {
         return Err("configured token parent is not a directory".into());
     }
     token.push(b'\n');
-    let token_result = windows_path::replace_file(&configuration.token_file, &token);
+    let token_result = windows_path::replace_file(token_file, &token);
     token.fill(0);
     token_result?;
     windows_path::replace_file(
         &token_parent.join("instance.name"),
         format!("{name}\n").as_bytes(),
     )?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn watch_for_clone_identity(
+    token_file: PathBuf,
+    token: Weak<Mutex<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    thread::Builder::new()
+        .name("lsw-identity-watch".to_owned())
+        .spawn(move || {
+            let deadline = Instant::now() + IDENTITY_DISCOVERY_TIMEOUT;
+            while Instant::now() < deadline {
+                let Some(token) = token.upgrade() else {
+                    return;
+                };
+                match apply_clone_identity(&token_file) {
+                    Ok(true) => match read_token(&token_file) {
+                        Ok(replacement) => match token.lock() {
+                            Ok(mut current) => {
+                                *current = replacement;
+                                if !cfg!(test) {
+                                    write_stderr(format_args!(
+                                        "lsw-agent: applied late-mounted boot identity"
+                                    ));
+                                }
+                            }
+                            Err(_) => write_stderr(format_args!(
+                                "lsw-agent: boot identity token lock was poisoned"
+                            )),
+                        },
+                        Err(error) => write_stderr(format_args!(
+                            "lsw-agent: could not load the applied boot identity: {error}"
+                        )),
+                    },
+                    Ok(false) => {
+                        drop(token);
+                        thread::sleep(IDENTITY_DISCOVERY_INTERVAL);
+                        continue;
+                    }
+                    Err(error) => write_stderr(format_args!(
+                        "lsw-agent: could not apply the late-mounted boot identity: {error}"
+                    )),
+                }
+                return;
+            }
+        })?;
     Ok(())
 }
 
 fn run_stoppable_listener(
     listener: &TcpListener,
     configuration: &Configuration,
-    token: &Arc<String>,
+    token: &Arc<Mutex<String>>,
     active_sessions: &Arc<AtomicUsize>,
     shutdown: &Receiver<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -648,11 +702,18 @@ fn wait_for_shutdown(shutdown: &Receiver<()>, timeout: Duration) -> bool {
 fn dispatch_connection(
     stream: TcpStream,
     configuration: &Configuration,
-    token: &Arc<String>,
+    token: &Arc<Mutex<String>>,
     active_sessions: &Arc<AtomicUsize>,
 ) -> bool {
+    let session_token = match token.lock() {
+        Ok(token) => token.clone(),
+        Err(_) => {
+            write_stderr(format_args!("lsw-agent: agent token lock was poisoned"));
+            return configuration.once;
+        }
+    };
     if configuration.once {
-        if let Err(error) = handle_connection(stream, token) {
+        if let Err(error) = handle_connection(stream, &session_token) {
             write_stderr(format_args!("lsw-agent: session failed: {error}"));
         }
         return true;
@@ -668,7 +729,6 @@ fn dispatch_connection(
         return false;
     }
 
-    let session_token = Arc::clone(token);
     let session_counter = Arc::clone(active_sessions);
     let spawn_result = thread::Builder::new()
         .name("lsw-agent-session".to_owned())

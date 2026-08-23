@@ -65,6 +65,95 @@ fn windows_identity_file_replacement_is_atomic_and_repeatable() {
     fs::remove_dir_all(root).expect("fixture should be removed");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_late_identity_volume_updates_the_live_authenticator() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be valid")
+        .as_nanos();
+    let fixture = std::env::temp_dir().join(format!("lsw-agent-late-identity-{nonce}"));
+    let identity = fixture.join("identity");
+    let identity_root = identity.join("lsw");
+    let data = fixture.join("data");
+    fs::create_dir_all(&identity_root).expect("identity fixture should be created");
+    fs::create_dir_all(&data).expect("data fixture should be created");
+
+    let drive = (b'D'..=b'Z')
+        .rev()
+        .map(char::from)
+        .find(|letter| !Path::new(&format!("{letter}:\\")).exists())
+        .expect("an unused test drive letter should be available");
+    let drive_name = format!("{drive}:");
+    let old_token = "a".repeat(64);
+    let new_token = "b".repeat(64);
+    let token_file = data.join("agent.token");
+    fs::write(&token_file, format!("{old_token}\n")).expect("old token should be written");
+    fs::write(
+        identity_root.join(CLONE_IDENTITY_MARKER_FILE),
+        b"LSW-CLONE-IDENTITY\n",
+    )
+    .expect("identity marker should be written");
+    fs::write(
+        identity_root.join(CLONE_IDENTITY_NAME_FILE),
+        b"late-identity\n",
+    )
+    .expect("identity name should be written");
+    fs::write(
+        identity_root.join(CLONE_IDENTITY_TOKEN_FILE),
+        format!("{new_token}\n"),
+    )
+    .expect("new token should be written");
+
+    let live_token = Arc::new(Mutex::new(old_token));
+    watch_for_clone_identity(token_file.clone(), Arc::downgrade(&live_token))
+        .expect("identity watcher should start");
+    thread::sleep(IDENTITY_DISCOVERY_INTERVAL + Duration::from_millis(100));
+    let mounted = Command::new("subst.exe")
+        .arg(&drive_name)
+        .arg(&identity)
+        .status()
+        .expect("subst should start")
+        .success();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut applied = false;
+    while Instant::now() < deadline {
+        applied = live_token
+            .lock()
+            .map(|token| token.as_str() == new_token)
+            .unwrap_or(false);
+        if applied {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let token_contents = fs::read_to_string(&token_file);
+    let name_contents = fs::read_to_string(data.join("instance.name"));
+    let unmounted = Command::new("subst.exe")
+        .args([&drive_name, "/D"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    fs::remove_dir_all(fixture).expect("fixture should be removed");
+
+    assert!(mounted, "identity fixture drive should mount");
+    assert!(applied, "late identity should update the in-memory token");
+    assert_eq!(
+        token_contents
+            .expect("live token file should be readable")
+            .trim(),
+        new_token
+    );
+    assert_eq!(
+        name_contents
+            .expect("live identity name should be readable")
+            .trim(),
+        "late-identity"
+    );
+    assert!(unmounted, "identity fixture drive should unmount");
+}
+
 #[test]
 fn session_limit_is_bounded() {
     let arguments = vec![

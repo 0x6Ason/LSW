@@ -64,7 +64,8 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
 - Content-addressed sealed qcow2 bases and linked clones with exact ISO,
   profile/preparation, agent, firmware, and disk identity; read-only bases;
   fresh clone tokens/ports; and boot-time credential rotation from a private
-  identity volume.
+  identity volume. The running SCM agent reconciles removable identity media
+  that Windows mounts after automatic services start.
 - QMP balloon targets, host-pressure reclaim, opt-in pause/hibernate policy,
   Windows hibernate/resume, guest TRIM, qcow2 discard/detect-zeroes, and offline
   compaction. Stopped and hibernated instances retain no QEMU process.

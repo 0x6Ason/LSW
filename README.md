@@ -208,7 +208,8 @@ firmware, and source disk. Sealing records the converted base's SHA-256;
 `image verify` re-reads it explicitly while normal clone creation stays fast.
 The sealed qcow2 is read-only; each clone receives a
 linked overlay, fresh host token/control port, and a private boot identity
-volume that rotates the embedded agent credential before it listens.
+volume. The SCM agent rotates the embedded credential before listening or
+atomically switches its live authenticator if Windows mounts the volume late.
 
 Path conversion is explicit and syntactic; it does not make the independent
 guest disk a host mount:

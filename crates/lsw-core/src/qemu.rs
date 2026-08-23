@@ -294,13 +294,13 @@ impl QemuPlanner {
                     "usb-storage,drive=lsw-identity,removable=on",
                 );
                 notes.push(
-                    "the linked clone identity is attached read-only and consumed before the agent listens"
+                    "the boot identity is attached read-only and consumed by the guest agent"
                         .to_owned(),
                 );
             }
             (LaunchPhase::Run, Ok(_)) => {
                 return Err(crate::LswError::InvalidValue {
-                    field: "clone identity seed",
+                    field: "boot identity seed",
                     reason: format!("{} must be a real directory", identity_seed.display()),
                 })
             }

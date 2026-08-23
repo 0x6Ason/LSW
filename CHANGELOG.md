@@ -7,7 +7,9 @@
 - Added content-addressed sealed images and linked clones. Image identity covers
   the ISO, declarative profile/preparation contract, agent, firmware, and
   source disk. Sealed bases are read-only; clone overlays receive distinct
-  tokens, ports, and a private boot-time identity volume.
+  tokens, ports, and a private boot-time identity volume. The SCM agent now
+  reconciles identity media that Windows mounts after automatic services start,
+  avoiding a boot-time token race without delaying ordinary boots.
 - Added manifest v5 and the opt-in resource governor: minimum memory, QMP
   balloon control, host-pressure reclaim, running-to-pause-to-Windows-hibernate
   policy, automatic resume, guest TRIM, qcow2 discard/detect-zeroes, and safe

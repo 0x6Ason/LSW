@@ -93,8 +93,9 @@ validation claims in the beta.7 release.
    hiberfile. The opt-in idle policy balloons, pauses, and later hibernates.
 8. A pristine stopped/hibernated instance can be sealed. A clone uses a qcow2
    backing overlay and read-only FAT identity volume; the SCM agent rotates the
-   embedded token before binding its listener. Permanent users, shares, and
-   published ports are never copied into a clone manifest.
+   embedded token before binding its listener or atomically updates its live
+   authenticator if Windows mounts the volume after SCM startup. Permanent
+   users, shares, and published ports are never copied into a clone manifest.
 
 Instance state is stored under `$LSW_STATE_DIR` or, by default,
 `$HOME/.local/share/lsw`:
