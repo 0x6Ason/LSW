@@ -85,17 +85,17 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   MSVC native agent tests and executable-load checks, plus bounded QEMU
   firmware and product-lifecycle gates.
 
-The WinPE, SCM, WMI, and ConPTY items above describe implemented planners,
-generated content, protocols, and source/CI tests. They do not claim execution
-inside a real Windows WinPE or Session 0 service context. A beta.6 tag must
-still pass the dedicated Windows/KVM gate.
+In addition to the source and ordinary CI gates above, the tagged beta.6 commit
+`091089aca074b394e0c1934f3ec01f5fdfb7ef62` passed the dedicated
+[Windows/KVM release gate](https://github.com/0x6Ason/lsw/actions/runs/32651006829)
+before publication. That result is exact-commit evidence from one documented
+Linux x86_64/KVM host, not a claim about untested hardware or host platforms.
 
-## Gates requiring a real host and Windows guest
+## Real-host release gate and remaining matrix
 
 Ordinary source and GitHub-hosted runners do not provide a real Windows 11/KVM
-environment. The following workloads run only on a dedicated,
-isolated Linux x86_64 self-hosted release runner. Beta.6 must not be described
-as hardware-attested until they succeed:
+environment. Every new tagged release must pass the guarded workflow on a
+dedicated, isolated Linux x86_64 self-hosted runner. The beta.6 run covered:
 
 - Microsoft's current published English x64 SHA must exactly match the
   operator-provisioned read-only ISO.
@@ -110,6 +110,12 @@ as hardware-attested until they succeed:
 - WMI license status; the `LSWLicenseHelper` Manual/LocalSystem configuration,
   authenticated start permission, and return to Stopped after each request.
   The release gate never enters a product key.
+- True ConPTY; working-directory and environment injection; host signal and
+  exit-code propagation; detached execution; recursive round-trip transfer;
+  additive watch sync; graceful shutdown; and complete runtime cleanup.
+
+The broader hardware and soak matrix still includes:
+
 - OVMF path differences across Linux distributions.
 - The Windows firewall rule and QEMU slirp `10.0.2.2` source match.
 - Data transfer from `--publish` to a real guest TCP service and sustained use
@@ -118,7 +124,7 @@ as hardware-attested until they succeed:
 - Graceful/forced control of a real Windows workload and long-running vTPM
   behavior. QMP `stop`/`cont`/`quit` is covered against real QEMU, and the CI
   lifecycle gate checks `lswd` through a filesystem QMP socket.
-- ConPTY Unicode, Ctrl events, resize, disconnect, and long interactive use.
+- Extended ConPTY Unicode, resize, disconnect, and long interactive use.
 - Optional private Unix-socket VNC viewer compatibility.
 - Executables, paths, firmware, daemon IPC, and complete lifecycle behavior on
   macOS HVF and Windows WHPX hosts.
@@ -129,8 +135,8 @@ as hardware-attested until they succeed:
   select HVF/WHPX and generate accelerator arguments, but Windows and macOS host
   integration is not implemented or validated.
 - ConPTY is capability-negotiated, with pipe fallback for older or unsupported
-  agents. Real-guest console mode, Ctrl events, Unicode, and resize remain in
-  the E2E gate.
+  agents. The beta.6 exact-commit gate covered a real console and signal path;
+  extended Unicode, resize, disconnect, and long-session soaks remain.
 - `session-control-v1` distinguishes stdin EOF, authenticated cancellation, and
   opted-in disconnect cleanup. `session-lease-v1` bounds recovery of half-open
   peers and cleanup covers more than the leader. Unix ownership can reclaim

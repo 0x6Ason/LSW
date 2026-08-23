@@ -4,10 +4,10 @@ LSW is a local Windows development runtime for Linux. It provides a WSL-like
 command-line experience while running a real Windows kernel inside one managed
 QEMU/KVM virtual machine per instance.
 
-The current development candidate is `1.0.0-beta.6`. It builds on the released
-beta.5 one-command Windows environment with truthful installation progress,
-faster unattended first boot, complete remote process semantics, and improved
-host integration on Linux x86_64.
+The current release is `1.0.0-beta.6`. It provides a one-command Windows
+environment with truthful installation progress, unattended first boot,
+complete remote process semantics, and improved host integration on Linux
+x86_64.
 
 LSW does not start a new VM for every application. Shells, commands, file
 transfers, and GUI processes for an instance all use the same running Windows
@@ -359,57 +359,30 @@ kill-on-close Job Object before they are resumed.
 
 ## Windows/KVM end-to-end gate
 
-The firmware and product-lifecycle CI tests exercise the real planner and
-daemon with QEMU, OVMF, NVMe, e1000e, vTPM, QMP, loopback forwarding, suspend,
-resume, and forced stop. Placeholder media is used, so those tests do not claim
-that Windows booted.
+Tagged releases fail closed unless their exact commit has passed the dedicated
+Windows 11/KVM hardware gate with Microsoft's published ISO SHA-256. The gate
+covers real WinPE DISM, unattended OOBE and cleanup, SCM and licensing-helper
+identity, ConPTY and beta.6 process/file behavior, full shutdown, no-login cold
+restart, and complete runtime cleanup. `v1.0.0-beta.6` passed that gate before
+publication.
 
-Before beta.6 is promoted, run the real hardware gate on a Linux x86_64 machine
-with KVM and a licensed Windows 11 ISO:
-
-```bash
-LSW_WINDOWS_ISO=/absolute/path/Windows11.iso \
-LSW_WINDOWS_ISO_SHA256=64-character-reviewed-sha256 \
-LSW_WINDOWS_EDITION=pro \
-LSW_WINDOWS_AGENT=/absolute/path/lsw-agent.exe \
-scripts/check-windows-kvm-e2e.sh
-```
-
-The harness first resolves Microsoft's current English x64 metadata, requires
-the provisioned media to match its published SHA-256, and verifies both WinPE
-completion markers plus transient-media cleanup. Without a desktop session or
-manual guest input, it then proves that OOBE completed, the one-shot setup
-account, cached answer file, setup script, and staging payload were removed,
-and no console user or automatic-logon credential exists. It verifies the
-Windows 11 build, requested edition, and the automatic `LSWAgent` service's
-name, state, startup mode, virtual-account identity, and `S-1-5-80-...` process
-SID. It exercises true ConPTY, command execution, exit-code propagation, and
-graceful shutdown, then uses a bare `lsw` to cold-start the installed guest
-without installation media or an interactive Windows login and checks complete
-runtime cleanup.
+See [the operator workflow and evidence contract](docs/WINDOWS_KVM_E2E.md) and
+[the detailed acceptance boundary](docs/BETA.md). Ordinary CI also runs bounded
+firmware and product-lifecycle tests with placeholder media, but those tests do
+not claim that Windows booted.
 
 ## Roadmap
 
-- beta.6: implemented truthful install/OOBE progress; working-directory and
-  environment injection;
-  signal propagation and exact exit status; detached `run`; recursive transfer
-  and additive workspace watch sync; explicit Linux ↔ Windows path conversion;
-  dynamic loopback ports; shell completion; and systemd user socket activation.
-- beta.7: prepared/sealed base images keyed by exact ISO/profile/agent identity,
-  per-instance secret injection, linked clones, optional signed VirtIO
-  networking, ballooning and vsock, memory-pressure governor, Windows
-  hibernation, automatic resume, guest TRIM, discard, and compaction. Windows
-  DISM remains canonical; alternative direct-apply backends stay experimental
-  until real Windows/KVM proves ACL, reparse-point, update, servicing, and
-  cold-restart fidelity.
-- beta.8: driverless per-HWND Windows Graphics Capture transported to independent
-  Wayland windows, with X11 fallback, input, resize, DPI, clipboard, audio, and
-  notifications. Shared-memory/GPU acceleration remains optional.
-- beta.9 and later: Linux ARM64 with Windows ARM64, then macOS Apple Silicon with
-  HVF and Windows ARM64, then a Windows host with WHPX.
+Experience work now comes before architecture expansion. beta.7 targets a
+low-resource optional background runtime, linked clones, hibernation, and safe
+host-folder sharing. beta.8 targets Linux desktop-native Windows application
+windows, clipboard, file drag-and-drop, audio, notifications, and full screen.
+beta.9 adds multi-monitor polish and an experimental reversible shell-light
+profile. Linux/Windows ARM64 and additional hosts follow only after those paths
+have stable release gates.
 
-Apple Silicon cannot efficiently accelerate the current Windows x64 guest. It
-requires a separate Windows ARM64 agent, firmware, installer path, and CI.
+See the [full roadmap](ROADMAP.md) for ordering, acceptance criteria, and the
+Explorer/shell-light safety boundary.
 
 ## Build from source
 
@@ -445,14 +418,9 @@ targets, Zig, or operating-system media.
 
 ## Current limitations
 
-- A real WinPE DISM → unattended OOBE → agent/helper → ConPTY → shutdown →
-  cold-restart run still requires the dedicated KVM-capable release host and a
-  pre-provisioned current official ISO.
-- The guest agent now runs as the automatic `LSWAgent` Windows service under
-  `NT SERVICE\LSWAgent`, but that boot-time path has not yet passed the real
-  Windows/KVM release gate. beta.6 must not be tagged until the exact candidate
-  passes WinPE prepare/apply, unattended OOBE cleanup, service/helper identity, true ConPTY,
-  shutdown, and no-login cold restart on the dedicated hardware runner.
+- Tagged releases still require the dedicated KVM-capable release host and a
+  pre-provisioned current official ISO. beta.6 passed that exact-commit gate;
+  ordinary GitHub-hosted CI cannot reproduce it without KVM and Windows media.
 - The optional installation and recovery display uses private Unix-socket VNC
   internally; LSW opens it only when requested and does not expose TCP VNC or RDP.
 - `lsw run` can start a Session 0 process, but a service-launched GUI is not a
@@ -493,6 +461,7 @@ conventions.
 
 ## Documentation
 
+- [Roadmap](ROADMAP.md)
 - [Beta acceptance scope and known limitations](docs/BETA.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security model](docs/SECURITY.md)

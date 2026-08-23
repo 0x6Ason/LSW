@@ -12,7 +12,7 @@ guest. Host platform and accelerator selection are separated from guest
 protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
 and QEMU argument generation exist as planner-level work only. There are no
 macOS or Windows host-side binaries, daemon IPC integrations, or runtime
-validation claims in the beta.6 candidate.
+validation claims in the beta.6 release.
 
 ## Components
 
@@ -23,9 +23,9 @@ validation claims in the beta.6 candidate.
 | QEMU backend | Linux runtime implemented; firmware smoke passed | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
 | Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
 | `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY sessions, capability-gated control/leases, process ownership and file transfer |
-| ConPTY transport | Implemented; E2E gated | Capability negotiation, console I/O and terminal resize; real installed-Windows validation remains |
+| ConPTY transport | Implemented; beta.6 exact KVM gate passed | Capability negotiation, console I/O, signals and terminal resize |
 | PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
-| WinPE DISM backend | Integrated; E2E gated | Runs two network-disabled WinPE microVM phases using the official media's `dism.exe`: prepare a profile WIM, then partition/apply it to the private target qcow2 |
+| WinPE DISM backend | Integrated; beta.6 exact KVM gate passed | Runs two network-disabled WinPE microVM phases using the official media's `dism.exe`: prepare a profile WIM, then partition/apply it to the private target qcow2 |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
 | Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
