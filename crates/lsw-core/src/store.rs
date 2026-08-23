@@ -413,16 +413,23 @@ mod tests {
 
     use super::*;
 
-    fn available_published_port() -> u16 {
+    fn available_published_listener() -> TcpListener {
         loop {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("port should bind");
             let port = listener.local_addr().expect("address should exist").port();
             if !(crate::AGENT_CONTROL_PORT_START..crate::AGENT_CONTROL_PORT_END_EXCLUSIVE)
                 .contains(&port)
             {
-                return port;
+                return listener;
             }
         }
+    }
+
+    fn available_published_port() -> u16 {
+        available_published_listener()
+            .local_addr()
+            .expect("address should exist")
+            .port()
     }
 
     #[test]
@@ -636,7 +643,7 @@ mod tests {
         let iso = root.join("windows.iso");
         fs::create_dir_all(&root).expect("test root should be created");
         fs::write(&iso, b"test media").expect("test ISO should be created");
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("port should bind");
+        let listener = available_published_listener();
         let port = listener.local_addr().expect("address should exist").port();
         let manifest = InstanceManifest::new(InstanceSpec {
             name: "external-port-owner".to_owned(),
