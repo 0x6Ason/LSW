@@ -1072,8 +1072,17 @@ fi
 watch_sync_verified=true
 echo "beta.6 additive sync --watch passed."
 terminate_sync
-"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-    "foreach (\$Path in '$guest_detached_marker','$guest_transfer','$guest_sync') { if (Test-Path -LiteralPath \$Path) { Remove-Item -LiteralPath \$Path -Recurse -Force } }"
+# PowerShell, not the host shell, expands the cleanup variables.
+# shellcheck disable=SC2016
+if ! "$lsw" exec "$instance" \
+    --env "LSW_CLEANUP_DETACHED=$guest_detached_marker" \
+    --env "LSW_CLEANUP_TRANSFER=$guest_transfer" \
+    --env "LSW_CLEANUP_SYNC=$guest_sync" \
+    -- powershell.exe -NoLogo -NoProfile -Command \
+    '$ErrorActionPreference="Stop"; foreach ($Path in @($env:LSW_CLEANUP_DETACHED,$env:LSW_CLEANUP_TRANSFER,$env:LSW_CLEANUP_SYNC)) { for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }; break } catch { if ($Attempt -eq 39) { throw }; Start-Sleep -Milliseconds 250 } } }'
+then
+    echo "warning: guest test artifacts remained locked; instance removal will discard them" >&2
+fi
 
 if [ -n "$artifact_dir" ]; then
     "$lsw" bench "$instance" --json >"$artifact_dir/bench.json"
