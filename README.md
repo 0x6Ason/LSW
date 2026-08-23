@@ -321,10 +321,25 @@ runtime cleanup.
 
 ## Roadmap
 
-- beta.6: working directory and environment injection, signal and Ctrl-C
-  propagation, recursive/resumable transfer, workspace watch sync, Linux ↔
-  Windows path translation, dynamic ports, completion, systemd user socket
-  activation, detached `run`, and fully specified `exec` semantics.
+- beta.6: fully specified `exec` semantics, including working-directory and
+  environment injection, signal and Ctrl-C propagation, and exact exit codes;
+  detached `run`; recursive/resumable transfer and workspace watch sync; Linux
+  ↔ Windows path translation; dynamic ports; shell completion; and systemd
+  user socket activation.
+  - Add one progress-event contract for download, WinPE preparation, DISM
+    application, first boot, Windows setup, agent installation, and final
+    verification. The terminal UI reports percentages only for measurable work;
+    specialize, OOBE, and cleanup use truthful named stages with elapsed time.
+  - Reduce installation latency by benchmarking a fast-compressed intermediate
+    WIM, exposing an explicit speed-versus-size CompactOS policy, and caching a
+    reusable prepared image keyed by the exact ISO SHA-256, edition,
+    architecture, profile manifest, and LSW/agent version. Per-instance answer
+    files, authentication tokens, and other secrets are injected only after the
+    cached image is applied and are never stored in that cache.
+  - Keep Windows DISM as the canonical servicing and application backend.
+    Alternative direct-apply backends remain experimental until real
+    Windows/KVM E2E proves ACL, extended-attribute, reparse-point, update,
+    servicing, and cold-restart fidelity.
 - beta.7: sealed base images, linked clones, optional signed VirtIO networking,
   ballooning and vsock, memory-pressure governor, Windows hibernation, automatic
   resume, guest TRIM, discard, and compaction.
@@ -409,6 +424,12 @@ Thanks to its authors for publishing that work. See
 [third-party notices](THIRD_PARTY_NOTICES.md) for the retained attribution and
 license text. LSW neither bundles MSDL nor uses its backend, telemetry, or
 crowdsourced cache.
+
+LSW's name and its WSL-like lifecycle and terminal UX are inspired by
+[Microsoft's WSL project](https://github.com/microsoft/WSL). Thanks to Microsoft
+and the WSL contributors for that naming and UX reference. LSW is an independent
+project, is not affiliated with or endorsed by Microsoft, and does not
+incorporate WSL source code merely by following those interaction conventions.
 
 ## Documentation
 
