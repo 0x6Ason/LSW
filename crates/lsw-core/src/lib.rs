@@ -7,6 +7,8 @@ mod backend;
 mod capabilities;
 mod customization;
 mod error;
+#[cfg(not(windows))]
+mod image;
 mod install_seed;
 #[cfg(not(windows))]
 mod iso_download;
@@ -23,6 +25,8 @@ pub use backend::{AcceleratorCapabilities, HostPlatform, QemuBackend, VmAccelera
 pub use capabilities::HostCapabilities;
 pub use customization::{CustomizationPlan, PROFILE_MANIFEST_VERSION};
 pub use error::{LswError, Result};
+#[cfg(not(windows))]
+pub use image::{ImageManager, SealedImage};
 pub use install_seed::{InstallSeedBuilder, InstallSeedOptions, InstallSeedPlan};
 #[cfg(not(windows))]
 pub use iso_download::{
@@ -31,8 +35,9 @@ pub use iso_download::{
     ResolvedWindowsIso, SecretDownloadUrl,
 };
 pub use manifest::{
-    control_port_for_instance, InstanceManifest, InstanceSpec, InstanceState, NetworkMode,
-    PortForward, AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START,
+    control_port_for_instance, validate_windows_user_name, FolderShare, FolderShareMode,
+    IdlePolicy, InstanceManifest, InstanceSpec, InstanceState, NetworkMode, PortForward,
+    AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START, DEFAULT_HIBERNATE_TIMEOUT_SECONDS,
 };
 pub use pe::{
     PeAssessment, PeImage, PeImport, PeImportSymbol, PeKind, PeMachine, PeSection, PeSubsystem,
@@ -55,7 +60,11 @@ pub use winpe_dism::{
 // and Windows' default dynamic client-port range (49152-65535).
 pub const AGENT_GUEST_PORT: u16 = 35040;
 pub const LICENSE_HELPER_GUEST_PORT: u16 = 35041;
+pub const USER_HELPER_GUEST_PORT: u16 = 35042;
 pub const AGENT_TOKEN_FILE: &str = "agent.token";
+pub const CLONE_IDENTITY_MARKER_FILE: &str = "clone-identity.marker";
+pub const CLONE_IDENTITY_NAME_FILE: &str = "instance.name";
+pub const CLONE_IDENTITY_TOKEN_FILE: &str = "agent.token";
 pub const DAEMON_PROTOCOL_VERSION: u16 = 2;
 pub const MANIFEST_FILE: &str = "instance.lsw";
 pub use agent_protocol::{
@@ -63,9 +72,10 @@ pub use agent_protocol::{
     encode_exit, encode_file_length, encode_process_id, encode_resize, read_frame, write_frame,
     ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, ProcessEnvironment, ServerHello,
     SessionKind, SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
-    TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
-    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1,
-    CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    TerminalSize, TerminalStartRequest, UserCreateRequest, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_POWER_HIBERNATE_V1,
+    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
+    CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1,
     DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS, MAX_FRAME_BYTES, MAX_SESSION_LEASE_TIMEOUT_MILLIS,
     MAX_TERMINAL_DIMENSION, MIN_SESSION_LEASE_TIMEOUT_MILLIS, SESSION_CANCEL_EXIT_CODE,
 };

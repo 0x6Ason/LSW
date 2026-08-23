@@ -14,6 +14,8 @@ pub const CAPABILITY_PROCESS_ENVIRONMENT_V1: &str = "process-environment-v1";
 pub const CAPABILITY_DETACHED_RUN_V1: &str = "detached-run-v1";
 pub const CAPABILITY_SESSION_SIGNAL_V1: &str = "session-signal-v1";
 pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
+pub const CAPABILITY_POWER_HIBERNATE_V1: &str = "power-hibernate-v1";
+pub const CAPABILITY_USER_ACCOUNT_V1: &str = "user-account-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -51,6 +53,8 @@ pub enum FrameKind {
     SessionDetach = 27,
     Started = 28,
     SessionSignal = 29,
+    PowerHibernate = 30,
+    UserCreate = 31,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -83,9 +87,110 @@ impl TryFrom<u8> for FrameKind {
             27 => Ok(Self::SessionDetach),
             28 => Ok(Self::Started),
             29 => Ok(Self::SessionSignal),
+            30 => Ok(Self::PowerHibernate),
+            31 => Ok(Self::UserCreate),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
+}
+
+pub struct UserCreateRequest {
+    pub user_name: String,
+    pub password: Vec<u8>,
+    pub administrator: bool,
+}
+
+impl std::fmt::Debug for UserCreateRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UserCreateRequest")
+            .field("user_name", &self.user_name)
+            .field("password", &"[REDACTED]")
+            .field("administrator", &self.administrator)
+            .finish()
+    }
+}
+
+impl Drop for UserCreateRequest {
+    fn drop(&mut self) {
+        self.password.fill(0);
+    }
+}
+
+impl UserCreateRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        crate::validate_windows_user_name(&self.user_name)?;
+        validate_password(&self.password)?;
+        let mut payload = Vec::new();
+        push_string(&mut payload, &self.user_name)?;
+        let length = u32::try_from(self.password.len())
+            .map_err(|_| LswError::Protocol("password is too long".to_owned()))?;
+        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(&self.password);
+        payload.push(u8::from(self.administrator));
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let user_name = decoder.string()?;
+        let length = usize::try_from(decoder.u32()?)
+            .map_err(|_| LswError::Protocol("invalid password length".to_owned()))?;
+        if length > 1024 {
+            return Err(LswError::Protocol(
+                "password exceeds the 1024 byte protocol limit".to_owned(),
+            ));
+        }
+        let mut password = decoder.take(length)?.to_vec();
+        let flag = match decoder.u8() {
+            Ok(flag) => flag,
+            Err(error) => {
+                password.fill(0);
+                return Err(error);
+            }
+        };
+        let administrator = match flag {
+            0 => false,
+            1 => true,
+            _ => {
+                password.fill(0);
+                return Err(LswError::Protocol(
+                    "administrator flag must be zero or one".to_owned(),
+                ));
+            }
+        };
+        if let Err(error) = decoder.finish() {
+            password.fill(0);
+            return Err(error);
+        }
+        let request = Self {
+            user_name,
+            password,
+            administrator,
+        };
+        crate::validate_windows_user_name(&request.user_name)?;
+        validate_password(&request.password)?;
+        Ok(request)
+    }
+}
+
+fn validate_password(password: &[u8]) -> Result<()> {
+    if password.is_empty() {
+        return Err(LswError::Protocol("password must not be empty".to_owned()));
+    }
+    if password.len() > 1024 {
+        return Err(LswError::Protocol(
+            "password exceeds the 1024 byte protocol limit".to_owned(),
+        ));
+    }
+    let password = std::str::from_utf8(password)
+        .map_err(|_| LswError::Protocol("password must be valid UTF-8".to_owned()))?;
+    if password.contains('\0') || password.encode_utf16().count() > 256 {
+        return Err(LswError::Protocol(
+            "password must contain at most 256 UTF-16 code units and no NUL".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -885,6 +990,36 @@ mod tests {
                 .expect("get should decode"),
             get
         );
+    }
+
+    #[test]
+    fn user_creation_is_bounded_and_redacts_debug_output() {
+        let request = UserCreateRequest {
+            user_name: "desktop-user".to_owned(),
+            password: "S3cure password!".as_bytes().to_vec(),
+            administrator: false,
+        };
+        let encoded = request.encode().expect("user request should encode");
+        let decoded = UserCreateRequest::decode(&encoded).expect("user request should decode");
+        assert_eq!(decoded.user_name, "desktop-user");
+        assert_eq!(decoded.password, b"S3cure password!");
+        assert!(!decoded.administrator);
+        assert!(!format!("{request:?}").contains("S3cure"));
+        assert_eq!(
+            FrameKind::try_from(31).expect("user-create kind should decode"),
+            FrameKind::UserCreate
+        );
+
+        let mut invalid_flag = encoded;
+        *invalid_flag.last_mut().expect("encoded flag exists") = 2;
+        assert!(UserCreateRequest::decode(&invalid_flag).is_err());
+        assert!(UserCreateRequest {
+            user_name: "desktop-user".to_owned(),
+            password: Vec::new(),
+            administrator: false,
+        }
+        .encode()
+        .is_err());
     }
 
     #[test]

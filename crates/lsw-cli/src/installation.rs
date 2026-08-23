@@ -39,6 +39,12 @@ pub(super) fn install_instance(
     if parsed.without_agent && parsed.seed.agent_binary.is_some() {
         return Err("--agent and --without-agent cannot be used together".into());
     }
+    if parsed.without_agent && !parsed.defer_user_setup {
+        return Err("--without-agent requires --defer-user-setup because no agent can create the permanent Windows user".into());
+    }
+    if !parsed.defer_user_setup && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
+        return Err("noninteractive installation requires --defer-user-setup; run `lsw user setup --password-stdin` after installation".into());
+    }
     if parsed.seed.unattended_image_index.is_some() && parsed.edition.is_some() {
         return Err("--edition and --unattended-index cannot be used together".into());
     }
@@ -109,6 +115,7 @@ pub(super) fn install_instance(
             &name,
             parsed.without_agent,
             parsed.no_viewer,
+            parsed.defer_user_setup,
             &mut progress,
         );
     }
@@ -163,6 +170,7 @@ pub(super) fn install_instance(
         )?;
         progress.finish();
         show_activation_notice_once(store, &name);
+        crate::user_setup::after_install(store, &name, parsed.defer_user_setup)?;
         println!("Environment verified. Run `lsw` to enter PowerShell.");
     } else {
         progress.finish();
@@ -176,6 +184,7 @@ fn resume_winpe_installation(
     name: &str,
     without_agent: bool,
     no_viewer: bool,
+    defer_user_setup: bool,
     progress: &mut ProgressRenderer,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Resuming Windows first boot and installation verification for {name:?}.");
@@ -204,6 +213,7 @@ fn resume_winpe_installation(
         ));
         progress.finish();
         show_activation_notice_once(store, name);
+        crate::user_setup::after_install(store, name, defer_user_setup)?;
         println!("Environment verified. Run `lsw` to enter PowerShell.");
     }
     if store.default_name()?.is_none() {
@@ -353,6 +363,7 @@ fn install_new_instance(
         ));
         progress.finish();
         show_activation_notice_once(store, name);
+        crate::user_setup::after_install(store, name, parsed.defer_user_setup)?;
         println!("Environment verified. Run `lsw` to enter PowerShell.");
     } else {
         progress.finish();
@@ -871,7 +882,7 @@ fn select_windows_edition_index(
     Ok(selected)
 }
 
-fn find_windows_agent() -> Option<PathBuf> {
+pub(super) fn find_windows_agent() -> Option<PathBuf> {
     if let Some(configured) = env::var_os("LSW_WINDOWS_AGENT") {
         return Some(PathBuf::from(configured));
     }

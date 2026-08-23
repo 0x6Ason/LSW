@@ -4,10 +4,10 @@ LSW is a local Windows development runtime for Linux. It provides a WSL-like
 command-line experience while running a real Windows kernel inside one managed
 QEMU/KVM virtual machine per instance.
 
-The current release is `1.0.0-beta.6`. It provides a one-command Windows
-environment with truthful installation progress, unattended first boot,
-complete remote process semantics, and improved host integration on Linux
-x86_64.
+The current beta line is `1.0.0-beta.7`. It adds sealed linked-clone
+images, opt-in low-memory lifecycle policies, disk-backed Windows hibernation,
+declarative folder synchronization, and WSL-style permanent-user registration
+to the beta.6 terminal-first runtime on Linux x86_64.
 
 LSW does not start a new VM for every application. Shells, commands, file
 transfers, and GUI processes for an instance all use the same running Windows
@@ -18,11 +18,11 @@ guest.
 - Running `lsw` starts the default Windows instance when necessary and enters
   PowerShell, with Windows PowerShell and CMD as fallbacks.
 - Users do not need to operate QEMU, OVMF, swtpm, QMP, or VNC sockets directly.
-- Windows is installed once per instance. Linked-clone image workflows are
-  planned for beta.7.
+- Windows may be installed once, sealed by exact content identity, and reused
+  through small per-instance linked-clone overlays with private agent secrets.
 - The default device model uses Windows inbox NVMe, e1000e, and VGA drivers.
   Signed VirtIO acceleration will remain optional.
-- The beta.6 `vanilla` and `slim` profiles retain the driverless installation
+- The beta.7 `vanilla` and `slim` profiles retain the driverless installation
   and recovery path.
 - LSW manages a complete Windows kernel, so it cannot match the absolute memory
   density of a Linux namespace container. The goal is WSL-like lifecycle and
@@ -65,7 +65,7 @@ requires `[y/N]` confirmation before any download or instance creation.
 Noninteractive automation must be explicit:
 
 ```bash
-lsw install win-dev --accept-windows-license
+lsw install win-dev --accept-windows-license --defer-user-setup
 ```
 
 `--accept-license` remains a compatibility alias. The confirmation applies only
@@ -88,8 +88,11 @@ The one-shot installer performs the following steps:
    qcow2, creates UEFI boot files, and deletes temporary seeds/workspace media.
 6. Boots Windows headlessly, completes OOBE, removes the one-shot setup account
    and cached answer file, then verifies the boot-time agent.
+7. In an interactive terminal, asks for a permanent Windows desktop user and a
+   masked password. Automation must explicitly defer this step and may later
+   use `lsw user setup --username USER --password-stdin`.
 
-The beta.6 terminal UI renders byte-accurate bars for native ISO transfer,
+The terminal UI renders byte-accurate bars for native ISO transfer,
 range assembly, SHA-256 verification, and DISM percentages. WinPE boot,
 specialize, OOBE, agent installation, and cleanup instead display their real
 named stage and elapsed time; LSW does not invent percentages for work that
@@ -151,6 +154,14 @@ lsw sync --watch ./project 'C:\src\project'
 lsw pull 'C:\src\build\app.exe' ./app.exe
 ```
 
+The registered desktop identity is a standard local Windows account unless
+`lsw user setup --administrator` is explicitly requested. Its password never
+enters argv, environment, the manifest, installation media, logs, or diagnostic
+bundles. The unprivileged agent forwards one authenticated loopback frame to
+the demand-start LocalSystem `LSWUserHelper`; that helper calls Windows NetAPI
+once and exits. AutoLogon remains disabled. Session 0 CLI commands continue to use the boot-time service
+identity; beta.8 will use the registered identity for visible desktop apps.
+
 `lsw exec` and ordinary `lsw run` wait and return guest exit codes 0–255
 unchanged. Windows has a 32-bit exit-code space; when a value cannot be
 represented by a Unix shell, LSW prints the exact unsigned decimal and
@@ -165,6 +176,36 @@ implicit overwrite. `sync` is intentionally host-to-guest and additive:
 changed/new files are atomically replaced, while deletion on the host does not
 delete the guest copy. `--watch` polls a bounded local snapshot every 750 ms and
 retries failed changes.
+
+Declare a per-instance synchronization boundary instead of repeating paths:
+
+```bash
+lsw share add win-dev source ./project 'C:\Users\dev\source' --read-write
+lsw share sync win-dev source
+lsw share watch win-dev source              # additive host -> guest updates
+lsw share sync win-dev source --from-guest  # explicit RW guest -> host merge
+```
+
+Read-only shares install a deny-write ACL for the built-in Users SID while the
+service retains update access. Both sides reject symlinks/reparse points and
+parent traversal. Neither direction propagates deletions.
+
+Create a pristine reusable base before registering a permanent desktop user:
+
+```bash
+lsw shutdown win-base
+lsw image seal win-base
+lsw image list
+lsw image verify IMAGE_SHA256
+lsw clone win-base win-dev
+```
+
+The image key covers the exact ISO, profile/preparation identity, agent,
+firmware, and source disk. Sealing records the converted base's SHA-256;
+`image verify` re-reads it explicitly while normal clone creation stays fast.
+The sealed qcow2 is read-only; each clone receives a
+linked overlay, fresh host token/control port, and a private boot identity
+volume that rotates the embedded agent credential before it listens.
 
 Path conversion is explicit and syntactic; it does not make the independent
 guest disk a host mount:
@@ -188,6 +229,10 @@ lsw logs win-dev --follow
 lsw status win-dev
 lsw suspend win-dev
 lsw resume win-dev
+lsw hibernate win-dev
+lsw memory reclaim win-dev
+lsw trim win-dev
+lsw compact win-dev                 # stopped or hibernated instance
 lsw shutdown --all
 lsw diagnose win-dev --bundle
 lsw remove win-dev
@@ -213,9 +258,17 @@ one authenticated operation. The regular agent remains `NT SERVICE\LSWAgent`.
 The helper calls Windows WMI `InstallProductKey` and `Activate`; it does not put
 the key in argv, environment, seed media, the base image, logs, or diagnostics.
 
-`memory.max` is applied to the next QEMU start. `idle-timeout` is stored in
-manifest v4 so the beta.7 memory and hibernation governor can enforce one
-stable configuration contract; beta.6 does not yet hibernate automatically.
+`memory.max` is applied to the next QEMU start. Manifest v5 also stores
+`memory.min`, `idle-policy`, `idle-timeout`, and `hibernate-timeout`. Automatic
+balloon, pause, and hibernate behavior is disabled by default; opt in with:
+
+```bash
+lsw config set win-dev memory.min=2GiB idle-policy=pause-hibernate \
+  idle-timeout=10m hibernate-timeout=5m
+```
+
+The current policy measures inactivity at LSW's host control boundary, so it
+should remain off for a VM operated primarily through the recovery viewer.
 
 `lsw diagnose --bundle` creates a support archive containing a redacted
 manifest, host capability report, daemon status, a redacted QEMU plan, and
@@ -263,12 +316,13 @@ documented hardware.
 | `vanilla` | Stock Windows plus the LSW agent | Off |
 | `slim` | Removes only an explicit optional AppX allowlist and enables CompactOS | Off |
 
-`slim` is the beta.6 default. Both profiles are embedded versioned declarative
+`slim` is the beta.7 default. Both profiles are embedded versioned declarative
 manifests. They preserve WinSxS, Windows Update and the servicing stack,
 MSI/MSIX, Defender, Terminal, PowerShell, ConPTY, Store, winget, WebView2, WMI,
 hibernation, Recovery, and common development-tool dependencies. LSW does not
 enable test signing or install a self-signed certificate by default. The
-experimental `minimal` and user-versioned `custom` profiles remain beta.7 work.
+experimental `shell-light` profile remains beta.9 work; user-versioned custom
+profiles are not part of the current release.
 
 ## Advanced commands
 
@@ -280,7 +334,7 @@ lsw create NAME --iso PATH --accept-windows-license [OPTIONS]
 lsw prepare NAME [--execute]
 lsw seed NAME [OPTIONS] [--execute]
 lsw plan NAME [--run]
-lsw daemon [start|status]
+lsw daemon <enable|disable|start|status|diagnose>
 ```
 
 For legacy guided installation of an already-created instance:
@@ -326,13 +380,14 @@ Interactive host terminals negotiate Windows ConPTY when both peers advertise
 support. LSW forwards input/output and terminal resize events; older agents
 fall back to pipe sessions.
 
-The beta.6 agent runs at boot as the automatic `LSWAgent` Windows service under
+The beta.7 agent runs at boot as the automatic `LSWAgent` Windows service under
 `NT SERVICE\LSWAgent`. Shell and `exec` processes therefore use that service
 identity in Windows Session 0; they do not impersonate a desktop user. This
 provides command access at the Windows sign-in screen without storing a daily
 user credential.
-A later user-session companion will be required for visible desktop GUI
-processes, clipboard, audio, and per-window integration.
+The permanent-user identity and authenticated bulk file channel form the
+companion boundary for beta.8; visible desktop GUI processes, clipboard, audio,
+and per-window integration are not enabled yet.
 
 Controlled sessions distinguish stdin EOF, authenticated cancellation,
 interrupt/terminate signals, detached start acknowledgement, and disconnect
@@ -357,12 +412,13 @@ units. A default-prefix install places them in the user systemd data directory;
 enable on-demand startup with:
 
 ```bash
-systemctl --user enable --now lswd.socket
+lsw daemon enable
 ```
 
 The CLI first connects to the private socket, so a listening systemd socket
-activates `lswd` without a separate login-time daemon. Direct CLI autostart
-remains available when the socket unit is not enabled.
+activates `lswd` without a separate login-time daemon. With no active VM, the
+daemon exits after 30 idle seconds and only the socket remains. `lsw daemon
+disable` reverses the opt-in; direct CLI autostart remains available.
 
 On Unix, a child enters a separate process group before `exec`; ordinary
 descendants remaining in that group are reclaimed on exit, cancellation,
@@ -375,10 +431,11 @@ kill-on-close Job Object before they are resumed.
 
 Tagged releases fail closed unless their exact commit has passed the dedicated
 Windows 11/KVM hardware gate with Microsoft's published ISO SHA-256. The gate
-covers real WinPE DISM, unattended OOBE and cleanup, SCM and licensing-helper
-identity, ConPTY and beta.6 process/file behavior, full shutdown, no-login cold
-restart, and complete runtime cleanup. `v1.0.0-beta.6` passed that gate before
-publication.
+covers real WinPE DISM, unattended OOBE and cleanup, NetAPI user creation,
+SCM/licensing identity, ConPTY, clone-secret isolation, folder boundaries,
+balloon/TRIM/hibernate/compaction, full shutdown, no-login cold restart, and
+complete runtime cleanup. A beta.7 revision may be tagged only after that exact
+commit passes.
 
 See [the operator workflow and evidence contract](docs/WINDOWS_KVM_E2E.md) and
 [the detailed acceptance boundary](docs/BETA.md). Ordinary CI also runs bounded
@@ -387,9 +444,9 @@ not claim that Windows booted.
 
 ## Roadmap
 
-Experience work now comes before architecture expansion. beta.7 targets a
-low-resource optional background runtime, linked clones, hibernation, and safe
-host-folder sharing. beta.8 targets Linux desktop-native Windows application
+Experience work now comes before architecture expansion. beta.7 delivers the
+low-resource optional background runtime, linked clones, hibernation, user
+registration, and safe host-folder foundation. beta.8 targets Linux desktop-native Windows application
 windows, clipboard, file drag-and-drop, audio, notifications, and full screen.
 beta.9 adds multi-monitor polish and an experimental reversible shell-light
 profile. Linux/Windows ARM64 and additional hosts follow only after those paths
@@ -433,17 +490,19 @@ targets, Zig, or operating-system media.
 ## Current limitations
 
 - Tagged releases still require the dedicated KVM-capable release host and a
-  pre-provisioned current official ISO. beta.6 passed that exact-commit gate;
+  pre-provisioned current official ISO. beta.7 publication requires that exact-commit gate;
   ordinary GitHub-hosted CI cannot reproduce it without KVM and Windows media.
 - The optional installation and recovery display uses private Unix-socket VNC
   internally; LSW opens it only when requested and does not expose TCP VNC or RDP.
 - `lsw run` can start a Session 0 process, but a service-launched GUI is not a
   visible desktop application. A user-session companion and per-window
   Wayland/X11 integration are not implemented yet.
-- Suspend/resume currently uses QMP stop/continue and retains guest RAM. It is
-  not hibernation or disk-backed resume.
-- Automatic memory reclaim, balloon control, and idle hibernation are beta.7
-  work. The beta.6 idle timeout is configuration only.
+- Signed VirtIO drivers are not bundled or silently installed. The balloon
+  device and governor are available, but useful guest reclaim depends on a
+  compatible signed Windows driver; the inbox NVMe/e1000e path remains valid.
+- Folder shares are explicit synchronized mirrors, not kernel mounts. Host to
+  guest watch is additive; RW guest-to-host synchronization is explicit and
+  conflicts/deletions are never resolved destructively in the background.
 - Agent authentication is not encrypted and is limited to LSW's local
   loopback/QEMU user-network path.
 - QEMU does not yet run inside an LSW-specific seccomp/namespace/service-account

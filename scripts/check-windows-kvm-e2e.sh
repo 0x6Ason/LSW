@@ -148,6 +148,10 @@ initial_interactive_user=unknown
 cached_unattend_removed=unknown
 setup_payload_removed=unknown
 automatic_logon=unknown
+desktop_user_registered=unknown
+clone_identity_isolated=unknown
+folder_share_boundaries=unknown
+resource_governor_verified=unknown
 ovmf_code_sha256=unknown
 exec_context_verified=unknown
 signal_status=unknown
@@ -159,6 +163,8 @@ official_iso_sha256=unknown
 license_status=unknown
 license_helper_start_mode=unknown
 license_helper_start_name=unknown
+user_helper_start_mode=unknown
+user_helper_start_name=unknown
 
 python3 - "$LSW_STATE_DIR/instances/$instance/run/recovery-vnc.sock" <<'PY'
 import os
@@ -293,6 +299,10 @@ collect_e2e_artifacts() {
         printf 'cached_unattend_removed=%s\n' "$cached_unattend_removed"
         printf 'setup_payload_removed=%s\n' "$setup_payload_removed"
         printf 'automatic_logon=%s\n' "$automatic_logon"
+        printf 'desktop_user_registered=%s\n' "$desktop_user_registered"
+        printf 'clone_identity_isolated=%s\n' "$clone_identity_isolated"
+        printf 'folder_share_boundaries=%s\n' "$folder_share_boundaries"
+        printf 'resource_governor_verified=%s\n' "$resource_governor_verified"
         printf 'exec_context_verified=%s\n' "$exec_context_verified"
         printf 'signal_status=%s\n' "$signal_status"
         printf 'detached_run_verified=%s\n' "$detached_run_verified"
@@ -303,6 +313,8 @@ collect_e2e_artifacts() {
         printf 'license_status=%s\n' "$license_status"
         printf 'license_helper_start_mode=%s\n' "$license_helper_start_mode"
         printf 'license_helper_start_name=%s\n' "$license_helper_start_name"
+        printf 'user_helper_start_mode=%s\n' "$user_helper_start_mode"
+        printf 'user_helper_start_name=%s\n' "$user_helper_start_name"
         printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
         printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
         printf 'agent_sha256=%s\n' "$(sha256sum "$agent" | awk '{ print $1 }')"
@@ -452,11 +464,12 @@ terminate_daemon() {
 assert_stopped_runtime_released() {
     stopped_qemu_pid=$1
     stopped_agent_port=$2
+    stopped_instance=${3:-$instance}
 
     deadline=$(( $(date +%s) + 300 ))
     stopped=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if "$lsw" status "$instance" 2>/dev/null | grep -Fx 'STATE=stopped' >/dev/null; then
+        if "$lsw" status "$stopped_instance" 2>/dev/null | grep -Fx 'STATE=stopped' >/dev/null; then
             stopped=1
             break
         fi
@@ -477,7 +490,7 @@ assert_stopped_runtime_released() {
     esac
 
     for stale in qmp.sock swtpm.sock recovery-vnc.sock qemu.pid; do
-        if [ -e "$LSW_STATE_DIR/instances/$instance/run/$stale" ]; then
+        if [ -e "$LSW_STATE_DIR/instances/$stopped_instance/run/$stale" ]; then
             echo "error: stale runtime artifact remained after shutdown: $stale" >&2
             exit 1
         fi
@@ -700,6 +713,7 @@ if [ -z "$viewer_option" ]; then
         --edition "$edition" \
         --profile "$profile" \
         --accept-windows-license \
+        --defer-user-setup \
         --agent "$agent"
 else
     "$lsw" install "$instance" \
@@ -707,6 +721,7 @@ else
         --edition "$edition" \
         --profile "$profile" \
         --accept-windows-license \
+        --defer-user-setup \
         --agent "$agent" \
         "$viewer_option"
 
@@ -841,6 +856,118 @@ initial_interactive_user=none
 cached_unattend_removed=true
 setup_payload_removed=true
 automatic_logon=false
+
+clone_instance="${instance}-clone"
+clone_source_pid=$(awk 'NR == 1 { print $1 }' "$pid_file")
+clone_agent_port=$(
+    "$lsw" show "$instance" |
+        awk -v prefix='agent host port:      ' \
+            'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
+)
+"$lsw" shutdown "$instance"
+assert_stopped_runtime_released "$clone_source_pid" "$clone_agent_port"
+"$lsw" image seal "$instance"
+base_image_key=$(awk -F= '$1 == "base_image_key" { print $2; exit }' \
+    "$LSW_STATE_DIR/instances/$instance/instance.lsw")
+base_disk="$LSW_STATE_DIR/images/$base_image_key/base.qcow2"
+if [ -z "$base_image_key" ] || [ ! -f "$base_disk" ] || [ -w "$base_disk" ]; then
+    echo "error: sealed linked-clone base is absent or writable" >&2
+    exit 1
+fi
+"$lsw" image verify "$base_image_key"
+"$lsw" clone "$instance" "$clone_instance"
+source_token_sha=$(sha256sum "$LSW_STATE_DIR/instances/$instance/agent.token" | awk '{ print $1 }')
+clone_token_sha=$(sha256sum "$LSW_STATE_DIR/instances/$clone_instance/agent.token" | awk '{ print $1 }')
+if [ "$source_token_sha" = "$clone_token_sha" ]; then
+    echo "error: linked clone reused the source agent secret" >&2
+    exit 1
+fi
+clone_base_image_key=$(awk -F= '$1 == "base_image_key" { print $2; exit }' \
+    "$LSW_STATE_DIR/instances/$clone_instance/instance.lsw")
+if [ "$clone_base_image_key" != "$base_image_key" ]; then
+    echo "error: linked clone did not retain the verified base key" >&2
+    exit 1
+fi
+clone_backing=$(qemu-img info --output=json \
+    "$LSW_STATE_DIR/instances/$clone_instance/disk.qcow2" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get("backing-filename", ""))')
+if [ -z "$clone_backing" ] \
+    || [ "$(realpath -e -- "$clone_backing")" != "$(realpath -e -- "$base_disk")" ]; then
+    echo "error: linked clone does not reference its exact sealed base" >&2
+    exit 1
+fi
+clone_identity=$(
+    timeout 180s "$lsw" exec "$clone_instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '[Console]::Out.Write([IO.File]::ReadAllText("C:\ProgramData\LSW\instance.name").Trim())'
+)
+if [ "$clone_identity" != "$clone_instance" ]; then
+    echo "error: linked clone did not rotate to its private instance identity" >&2
+    exit 1
+fi
+clone_pid=$(awk 'NR == 1 { print $1 }' \
+    "$LSW_STATE_DIR/instances/$clone_instance/run/qemu.pid")
+clone_port=$(awk -F= '$1 == "control_port" { print $2; exit }' \
+    "$LSW_STATE_DIR/instances/$clone_instance/instance.lsw")
+"$lsw" shutdown "$clone_instance"
+assert_stopped_runtime_released "$clone_pid" "$clone_port" "$clone_instance"
+"$lsw" remove "$clone_instance"
+if [ -e "$LSW_STATE_DIR/instances/$clone_instance" ]; then
+    echo "error: linked clone remained after removal" >&2
+    exit 1
+fi
+resume_marker=LSW_CLONE_SOURCE_RESUME_OK
+resume_output=$(timeout 180s "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile \
+    -Command "[Console]::Out.Write('$resume_marker')")
+if [ "$resume_output" != "$resume_marker" ]; then
+    echo "error: sealed source did not resume after linked-clone validation" >&2
+    exit 1
+fi
+clone_identity_isolated=true
+
+desktop_user='lsw-e2e-user'
+desktop_password="Lsw!$(tr -d '-' </proc/sys/kernel/random/uuid)9a"
+if ! printf '%s\n' "$desktop_password" | timeout 120s "$lsw" user setup "$instance" \
+    --username "$desktop_user" --password-stdin; then
+    desktop_password=
+    unset desktop_password
+    echo "error: native Windows desktop-user registration failed" >&2
+    exit 1
+fi
+desktop_password=
+unset desktop_password
+desktop_user_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$ErrorActionPreference="Stop"; $User=Get-LocalUser -Name "lsw-e2e-user"; if (-not $User.Enabled) { exit 70 }; $Administrators=Get-LocalGroup -SID "S-1-5-32-544"; if (Get-LocalGroupMember -Group $Administrators | Where-Object { $_.SID -eq $User.SID }) { exit 71 }; $Winlogon=Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; if ([string]$Winlogon.AutoAdminLogon -eq "1") { exit 72 }; [Console]::Out.Write($User.Name)'
+)
+if [ "$desktop_user_output" != "$desktop_user" ]; then
+    echo "error: registered desktop user is absent, disabled, administrative, or configured for AutoLogon" >&2
+    exit 1
+fi
+if ! grep -F "default_user=$desktop_user" \
+    "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null; then
+    echo "error: registered desktop user was not persisted as the default identity" >&2
+    exit 1
+fi
+user_helper_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$Deadline=[DateTime]::UtcNow.AddSeconds(30); do { $Service=Get-CimInstance -ClassName Win32_Service -Filter "Name = '\''LSWUserHelper'\''"; if ($null -ne $Service -and $Service.State -eq "Stopped") { break }; Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $Deadline); if ($null -eq $Service) { exit 73 }; if ($Service.State -ne "Stopped") { exit 74 }; if ($Service.StartMode -ne "Manual") { exit 75 }; if ($Service.StartName -ine "LocalSystem") { exit 76 }; if ($Service.PathName -notlike "*--user-helper*") { exit 77 }; [Console]::Out.Write("$($Service.StartMode)|$($Service.StartName)")'
+)
+user_helper_start_mode=$(printf '%s\n' "$user_helper_output" | awk -F'|' '{ print $1 }')
+user_helper_start_name=$(printf '%s\n' "$user_helper_output" | awk -F'|' '{ print $2 }')
+if [ "$user_helper_start_mode" != Manual ] || [ "$user_helper_start_name" != LocalSystem ]; then
+    echo "error: account helper is not a stopped demand-start LocalSystem service" >&2
+    exit 1
+fi
+if grep -R -F --exclude='*.qcow2' --exclude='OVMF_VARS.fd' \
+    'Lsw!' "$LSW_STATE_DIR/instances/$instance" >/dev/null 2>&1; then
+    echo "error: desktop password material entered LSW metadata, seeds, or logs" >&2
+    exit 1
+fi
+desktop_user_registered=true
 edition_normalized=$(printf '%s' "$edition" | tr '[:upper:]' '[:lower:]')
 case "$edition_normalized" in
     pro|professional)
@@ -933,7 +1060,7 @@ then
     exit 1
 fi
 exec_context_verified=true
-echo "beta.6 cwd and environment injection passed."
+echo "beta.7 cwd and environment injection passed."
 
 set +e
 "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
@@ -949,7 +1076,7 @@ if [ "$signal_status" -ne 143 ]; then
     cat "$e2e_root/signal.stderr" >&2
     exit 1
 fi
-echo "beta.6 SIGTERM propagation returned exact status 143."
+echo "beta.7 SIGTERM propagation returned exact status 143."
 
 guest_detached_marker="C:\Windows\Temp\beta6-detached-$$.txt"
 "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
@@ -983,7 +1110,7 @@ if [ "$(printf '%s' "$detached_marker" | tr -d '\r')" != DETACHED_OK ]; then
     exit 1
 fi
 detached_run_verified=true
-echo "beta.6 detached run completed after client disconnect."
+echo "beta.7 detached run completed after client disconnect."
 
 transfer_source="$e2e_root/transfer-source"
 transfer_pull="$e2e_root/transfer-pull"
@@ -999,7 +1126,7 @@ cmp "$transfer_source/root.txt" "$transfer_pull/root.txt"
 cmp "$transfer_source/nested/file with space.txt" \
     "$transfer_pull/nested/file with space.txt"
 recursive_transfer_verified=true
-echo "beta.6 recursive push and pull round-trip passed."
+echo "beta.7 recursive push and pull round-trip passed."
 
 sync_source="$e2e_root/sync-source"
 sync_log="$e2e_root/sync.log"
@@ -1072,16 +1199,107 @@ if [ "$(printf '%s' "$sync_value" | tr -d '\r')" != sync-two ]; then
     exit 1
 fi
 watch_sync_verified=true
-echo "beta.6 additive sync --watch passed."
+echo "beta.7 additive sync --watch passed."
 terminate_sync
+
+share_source="$e2e_root/share-source"
+guest_share="C:\Windows\Temp\beta7-share-$$"
+mkdir -p -- "$share_source"
+printf 'host-to-guest' >"$share_source/host.txt"
+"$lsw" share add "$instance" source "$share_source" "$guest_share" --read-write
+"$lsw" share sync "$instance" source
+share_value=$(
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        "Get-Content -LiteralPath '$guest_share\host.txt' -Raw"
+)
+if [ "$(printf '%s' "$share_value" | tr -d '\r')" != host-to-guest ]; then
+    echo "error: declarative share did not synchronize host data" >&2
+    exit 1
+fi
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "Set-Content -LiteralPath '$guest_share\guest.txt' -Value 'guest-to-host' -NoNewline"
+"$lsw" share sync "$instance" source --from-guest
+if [ "$(cat "$share_source/guest.txt")" != guest-to-host ]; then
+    echo "error: read-write share did not synchronize guest data" >&2
+    exit 1
+fi
+mkdir -p -- "$share_source/escape"
+printf 'must-not-escape' >"$share_source/escape/out.txt"
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "New-Item -ItemType Junction -Path '$guest_share\escape' -Target 'C:\Windows\Temp' | Out-Null"
+if "$lsw" share sync "$instance" source >/dev/null 2>&1; then
+    echo "error: folder share followed a guest reparse point" >&2
+    exit 1
+fi
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "Remove-Item -LiteralPath '$guest_share\escape' -Force"
+rm -rf -- "$share_source/escape"
+ln -s -- "$share_source/host.txt" "$share_source/link.txt"
+if "$lsw" share sync "$instance" source >/dev/null 2>&1; then
+    echo "error: folder share followed a host symbolic link" >&2
+    exit 1
+fi
+rm -- "$share_source/link.txt"
+"$lsw" share remove "$instance" source
+"$lsw" share add "$instance" source "$share_source" "$guest_share" --read-only
+"$lsw" share sync "$instance" source
+read_only_acl=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" --env "LSW_SHARE_ROOT=$guest_share" -- \
+        powershell.exe -NoLogo -NoProfile -Command \
+        '$Rules=(Get-Acl -LiteralPath $env:LSW_SHARE_ROOT).Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq "S-1-5-32-545" -and $_.AccessControlType -eq "Deny" -and $_.IsInherited -eq $false }; [Console]::Out.Write(@($Rules).Count)'
+)
+case "$read_only_acl" in
+    ''|0|*[!0-9]*)
+        echo "error: read-only share did not install its explicit guest ACL" >&2
+        exit 1
+        ;;
+esac
+"$lsw" share remove "$instance" source
+folder_share_boundaries=true
+
+"$lsw" memory reclaim "$instance"
+if [ "$(cat "$LSW_STATE_DIR/instances/$instance/run/balloon.target")" != 2048 ]; then
+    echo "error: memory governor did not persist its minimum balloon target" >&2
+    exit 1
+fi
+"$lsw" memory restore "$instance"
+if [ "$(cat "$LSW_STATE_DIR/instances/$instance/run/balloon.target")" != 4096 ]; then
+    echo "error: memory governor did not restore the configured maximum" >&2
+    exit 1
+fi
+"$lsw" trim "$instance" >/dev/null
+hibernate_pid=$(awk 'NR == 1 { print $1 }' \
+    "$LSW_STATE_DIR/instances/$instance/run/qemu.pid")
+timeout 180s "$lsw" hibernate "$instance"
+if ! "$lsw" status "$instance" | grep -Fx 'STATE=hibernated' >/dev/null; then
+    echo "error: Windows hibernation did not reach the hibernated state" >&2
+    exit 1
+fi
+if kill -0 "$hibernate_pid" 2>/dev/null; then
+    echo "error: QEMU remained resident after Windows hibernation" >&2
+    exit 1
+fi
+hibernate_resume_marker=LSW_HIBERNATE_RESUME_OK
+hibernate_resume=$(
+    timeout 180s "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        "[Console]::Out.Write('$hibernate_resume_marker')"
+)
+if [ "$hibernate_resume" != "$hibernate_resume_marker" ]; then
+    echo "error: agent did not recover after Windows hibernation" >&2
+    exit 1
+fi
+resource_governor_verified=true
 # PowerShell, not the host shell, expands the cleanup variables.
 # shellcheck disable=SC2016
 if ! "$lsw" exec "$instance" \
     --env "LSW_CLEANUP_DETACHED=$guest_detached_marker" \
     --env "LSW_CLEANUP_TRANSFER=$guest_transfer" \
     --env "LSW_CLEANUP_SYNC=$guest_sync" \
+    --env "LSW_CLEANUP_SHARE=$guest_share" \
     -- powershell.exe -NoLogo -NoProfile -Command \
-    '$ErrorActionPreference="Stop"; foreach ($Path in @($env:LSW_CLEANUP_DETACHED,$env:LSW_CLEANUP_TRANSFER,$env:LSW_CLEANUP_SYNC)) { for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }; break } catch { if ($Attempt -eq 39) { throw }; Start-Sleep -Milliseconds 250 } } }'
+    '$ErrorActionPreference="Stop"; foreach ($Path in @($env:LSW_CLEANUP_DETACHED,$env:LSW_CLEANUP_TRANSFER,$env:LSW_CLEANUP_SYNC,$env:LSW_CLEANUP_SHARE)) { for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }; break } catch { if ($Attempt -eq 39) { throw }; Start-Sleep -Milliseconds 250 } } }'
 then
     echo "warning: guest test artifacts remained locked; instance removal will discard them" >&2
 fi
@@ -1122,6 +1340,7 @@ if [ "$agent_port" -lt 1 ] || [ "$agent_port" -gt 65535 ]; then
 fi
 "$lsw" shutdown "$instance"
 assert_stopped_runtime_released "$qemu_pid" "$agent_port"
+"$lsw" compact "$instance"
 
 # A daily-use instance has to cold-start from its disk and make the agent and
 # daemon available through a bare `lsw` invocation without a console sign-in

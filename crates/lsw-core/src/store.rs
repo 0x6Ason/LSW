@@ -306,7 +306,7 @@ fn reserve_host_ports(manifest: &InstanceManifest) -> Result<Vec<TcpListener>> {
         .collect()
 }
 
-fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -338,7 +338,7 @@ fn write_new_private(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn generate_agent_token() -> Result<String> {
+pub(crate) fn generate_agent_token() -> Result<String> {
     let mut random = fs::File::open("/dev/urandom")?;
     let mut bytes = [0_u8; 32];
     random.read_exact(&mut bytes)?;
@@ -350,7 +350,7 @@ fn generate_agent_token() -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn generate_agent_token() -> Result<String> {
+pub(crate) fn generate_agent_token() -> Result<String> {
     Err(LswError::InvalidValue {
         field: "agent token",
         reason: "secure token generation is not implemented for this host backend".to_owned(),

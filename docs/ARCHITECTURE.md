@@ -12,7 +12,7 @@ guest. Host platform and accelerator selection are separated from guest
 protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
 and QEMU argument generation exist as planner-level work only. There are no
 macOS or Windows host-side binaries, daemon IPC integrations, or runtime
-validation claims in the beta.6 release.
+validation claims in the beta.7 release.
 
 ## Components
 
@@ -26,22 +26,25 @@ validation claims in the beta.6 release.
 | ConPTY transport | Implemented; beta.6 exact KVM gate passed | Capability negotiation, console I/O, signals and terminal resize |
 | PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
 | WinPE DISM backend | Integrated; beta.6 exact KVM gate passed | Runs two network-disabled WinPE microVM phases using the official media's `dism.exe`: prepare a profile WIM, then partition/apply it to the private target qcow2 |
+| Image manager | Implemented | Content-addressed sealed qcow2 bases, linked overlays, and post-clone credential rotation |
+| Resource governor | Implemented; opt-in | QMP balloon targets, host-pressure response, pause, Windows hibernate, resume, TRIM, and compaction |
+| Folder-share mirror | Implemented; opt-in | Manifest-bound RO/RW roots over authenticated bulk transfer with additive change watch |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
 | Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
 ## Lifecycle
 
-1. `lsw install NAME` provides the beta.6 beginner path; `lsw create` remains an
+1. `lsw install NAME` provides the beta.7 beginner path; `lsw create` remains an
    advanced primitive. Before a new instance is created or media is downloaded,
    an interactive terminal requires `[y/N]` Windows-license confirmation and
    noninteractive use requires `--accept-windows-license`. The installer then
-   validates the requested shape and stores manifest v4 plus a random 256-bit
+   validates the requested shape and stores manifest v5 plus a random 256-bit
    per-instance agent token. Without `--iso`, it resolves the current official
    Windows 11 x64 media from Microsoft, downloads from an allowlisted HTTPS CDN
    with at most four connections, and verifies Microsoft's published SHA-256.
    `--iso` retains a local offline path. Version 1 and 2 manifests migrate with
-   no published ports; version 3 manifests receive the default idle-timeout
-   setting.
+   no published ports; version 3 manifests receive the default idle-timeout;
+   version 4 migrates with all beta.7 policies and shares disabled.
 2. The installer selects Windows 11 Pro by WIM metadata unless the user chooses
    another edition. A network-disabled WinPE microVM uses the official media's
    DISM to export and service a profile-specific WIM in a private workspace,
@@ -56,7 +59,7 @@ validation claims in the beta.6 release.
    after daemon restart.
 4. A normal guest shutdown leaves the base disk intact. Old preview manifests
    using the retired `ephemeral` selector retain their disposable-overlay
-   behavior, but new beta.6 installs expose only `vanilla` and `slim`.
+   behavior, but new beta.7 installs expose only `vanilla` and `slim`.
 5. During the first boot's `specialize` pass, the pre-applied unattend installs
    the agent as the automatic `LSWAgent` Windows service under the virtual account
    `NT SERVICE\LSWAgent`. It removes the legacy per-user startup entry and
@@ -66,7 +69,12 @@ validation claims in the beta.6 release.
    files, its own script, and the staging payload before writing the completion
    marker that the host waits for. Commands and ConPTY sessions therefore run
    in Windows Session 0 without storing a daily user's password or requiring login.
-   Visible desktop GUI work requires a future user-session companion.
+   After the service is ready, an interactive install registers a confirmed
+   permanent standard desktop account. The normal agent forwards one
+   authenticated loopback request to demand-start LocalSystem `LSWUserHelper`,
+   which calls native Windows NetAPI and exits. Automation must defer or invoke
+   the stdin-only recovery path. AutoLogon is never enabled.
+   Visible desktop GUI work still requires the beta.8 user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
@@ -78,9 +86,15 @@ validation claims in the beta.6 release.
    frames. When both ends also advertise `session-lease-v1`, the host then sends
    a bounded lease before the start request and heartbeats while the process is
    live. Older peers retain the version-one half-close behavior.
-7. `lsw suspend` sends QMP `stop` and records `suspended`; `lsw resume` requires
-   the same live QEMU process in QMP `paused` state and sends `cont`. This is
-   deliberately not a RAM snapshot, hibernation, or migration mechanism.
+7. `lsw suspend` sends QMP `stop`; `lsw resume` sends `cont` for a live paused
+   process. `lsw hibernate` briefly resumes a paused guest when necessary,
+   authenticates a Windows hibernate request, and records `hibernated` only
+   after QEMU exits. Resume then performs a normal boot from the Windows
+   hiberfile. The opt-in idle policy balloons, pauses, and later hibernates.
+8. A pristine stopped/hibernated instance can be sealed. A clone uses a qcow2
+   backing overlay and read-only FAT identity volume; the SCM agent rotates the
+   embedded token before binding its listener. Permanent users, shares, and
+   published ports are never copied into a clone manifest.
 
 Instance state is stored under `$LSW_STATE_DIR` or, by default,
 `$HOME/.local/share/lsw`:
@@ -97,6 +111,9 @@ instances/NAME/
   swtpm-state/          vTPM state
   run/                  QMP/VNC/swtpm sockets, retained WinPE logs/status,
                         and transient control media during installation
+images/SHA256/
+  image.lsw             exact non-secret identity and source/base SHA-256 values
+  base.qcow2            mode-0400 sealed base
 ```
 
 ## Control and guest protocols
@@ -106,7 +123,8 @@ available only on a mode-0600 socket in a mode-0700 directory. `lswd` can bind
 that socket directly or accept exactly one PID-scoped descriptor through the
 systemd activation environment; an inherited descriptor must resolve to the
 same private pathname before use. Mutations are
-strict commands (`START`, `SUSPEND`, `RESUME`, `STOP`) rather than shell strings.
+strict commands (`START`, `SUSPEND`, `RESUME`, `HIBERNATE`, `ACTIVITY`,
+`BALLOON`, `STOP`) rather than shell strings.
 QEMU state is read and changed through negotiated QMP commands, never by
 trusting a PID file.
 
@@ -114,7 +132,8 @@ The agent protocol uses a five-byte binary frame header, an 8 MiB frame limit,
 explicit UTF-8 string lengths, a protocol version, and constant-time comparison
 of the per-instance token. Capability strings negotiate ConPTY, terminal resize,
 `session-control-v1`, `session-lease-v1`, `process-environment-v1`,
-`detached-run-v1`, and `session-signal-v1` without breaking older pipe-only
+`detached-run-v1`, `session-signal-v1`, `power-hibernate-v1`, and
+`user-account-v1` without breaking older pipe-only
 agents. Host forwarding binds to `127.0.0.1`; commands and file payloads are
 binary-safe. Upload and download destinations are never overwritten implicitly.
 
@@ -146,6 +165,11 @@ only through the validated environment frame; paths are emitted as hexadecimal
 UTF-8 fields so whitespace cannot change framing. Watch sync uploads a unique
 temporary peer and renames it into place, which keeps each observed file update
 atomic without defining destructive mirror semantics.
+Manifest-bound folder shares reuse this channel. RO and RW are explicit; RO
+roots receive a built-in Users deny-write ACL while the SCM identity retains
+update access. Guest-to-host RW import is explicit, and neither direction
+propagates deletions. Every existing host component rejects symlinks and every
+existing guest component rejects Windows reparse points.
 
 On Unix the child enters a new process group in the pre-`exec` path. LSW signals
 that group after a normal leader exit and on cancellation, disconnect, protocol

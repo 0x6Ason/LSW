@@ -1205,7 +1205,7 @@ fn read_dism_progress(path: &Path) -> Result<Option<(String, u8)>> {
     let percent = command_output
         .match_indices('%')
         .filter_map(|(offset, _)| parse_percentage_before(&command_output[..offset]))
-        .last();
+        .next_back();
     Ok(percent.map(|percent| (stage.to_owned(), percent)))
 }
 

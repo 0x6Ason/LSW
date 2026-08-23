@@ -9,7 +9,7 @@ runners used KVM or installed Windows.
 ## Local checks
 
 Use the Rust version declared by `rust-version` in the workspace manifest. The
-beta.6 workflows pin Rust 1.76.0 instead of treating the moving `stable`
+beta.7 workflows pin Rust 1.76.0 instead of treating the moving `stable`
 toolchain as the MSRV gate:
 
 ```sh
@@ -101,19 +101,24 @@ executable with `--help`. Linux-side validation cannot execute the Windows
 binary. Neither gate exercises a managed guest session or a service-backed
 Windows ConPTY session.
 
-The beta.6 pre-applied unattend installs the agent during `specialize` as the
+The beta.7 pre-applied unattend installs the agent during `specialize` as the
 automatic Windows service `LSWAgent` under the virtual account
 `NT SERVICE\LSWAgent`; it must not restore the old per-user `HKCU` startup
-entry. It also registers the narrow, demand-start `LSWLicenseHelper` as
-LocalSystem. Cross-build and executable-load checks cannot prove SCM
-registration, Session 0 ConPTY, boot-time startup, or that helper's access
-boundary. The real Windows/KVM gate therefore queries both services, proves a
+entry. It also registers the narrow, demand-start `LSWLicenseHelper` and
+`LSWUserHelper` services as LocalSystem. Cross-build and executable-load checks
+cannot prove SCM registration, Session 0 ConPTY, boot-time startup, or those
+helpers' access boundaries. The real Windows/KVM gate therefore queries all
+three services, proves a
 license-status request returns the helper to `Stopped`, verifies that the agent
 service process and command identities resolve to the same `S-1-5-80-...` SID,
 and requires that SID to remain stable across a full shutdown and bare-`lsw`
-boot. The exact-commit gate also exercises beta.6 cwd/environment injection,
+boot. The exact-commit gate also exercises cwd/environment injection,
 SIGTERM status, detached completion, recursive tree round-trip, and live
 additive `sync --watch` against that service-backed guest.
+beta.7 additionally requires native standard-user creation through a stopped
+demand-start account helper, linked-clone
+identity isolation, folder-share escape rejection, balloon/TRIM, Windows
+hibernate/resume, offline compaction, and zero QEMU RSS after stop/hibernate.
 
 ## Release bundle
 
@@ -134,7 +139,7 @@ Useful controls are:
 - `CARGO_TARGET_DIR`: isolate Cargo artifacts; relative paths are resolved from
   the workspace root and are respected by both host and guest-agent builders.
 - `LSW_EXPECT_VERSION`: require the binary version to match a tag such as
-  `v1.0.0-beta.6`.
+  `v1.0.0-beta.7`.
 - `SOURCE_DATE_EPOCH`: set the reproducible build environment and all archive
   member timestamps. The default is a fixed epoch. Archive ownership and modes
   are normalized, and gzip timestamps are disabled.

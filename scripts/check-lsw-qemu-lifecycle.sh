@@ -208,7 +208,8 @@ assert_status_contains() {
 
 # The placeholder is intentionally not Windows media. OVMF remains alive, so
 # every host-side product lifecycle path can still be exercised truthfully.
-"$lsw" install "$instance_name" --without-agent --no-viewer > "$lifecycle_root/install.out"
+"$lsw" install "$instance_name" --without-agent --defer-user-setup --no-viewer \
+    > "$lifecycle_root/install.out"
 assert_status_contains 'STATE=installing' 'QMP=running' 'ACTIVE=true'
 python3 "$probe" ports bound "$control_port" "$published_port"
 python3 "$probe" qmp-tpm "$instance_dir/run/qmp.sock"

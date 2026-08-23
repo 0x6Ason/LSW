@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 1.0.0-beta.7
+
+- Added content-addressed sealed images and linked clones. Image identity covers
+  the ISO, declarative profile/preparation contract, agent, firmware, and
+  source disk. Sealed bases are read-only; clone overlays receive distinct
+  tokens, ports, and a private boot-time identity volume.
+- Added manifest v5 and the opt-in resource governor: minimum memory, QMP
+  balloon control, host-pressure reclaim, running-to-pause-to-Windows-hibernate
+  policy, automatic resume, guest TRIM, qcow2 discard/detect-zeroes, and safe
+  stopped/hibernated compaction. `lswd` exits after 30 idle seconds when no VM
+  is active, while optional systemd socket activation remains reversible via
+  `lsw daemon enable|disable|status|diagnose`.
+- Added declarative per-instance synchronized folders with explicit RO/RW
+  roots, additive host watch, explicit RW guest-to-host merge, built-in Users
+  deny-write ACLs for RO views, reconnect retries, and host-symlink plus Windows
+  reparse-point escape rejection. No share is enabled implicitly and deletions
+  are preserved on both sides.
+- Added WSL-style permanent Windows-user registration after interactive
+  installation and `lsw user setup` for deferred/recovery use. Passwords use
+  masked input or stdin, travel only through the authenticated protocol, are
+  redacted/zero-filled in mutable buffers, and reach Windows NetAPI only inside
+  a demand-start authenticated LocalSystem helper; they never enter argv,
+  environment, manifests, seeds, logs, or diagnostics.
+  Accounts are standard by default, administrator membership is explicit, and
+  AutoLogon remains disabled.
+- Expanded the exact Windows/KVM release gate with native account creation,
+  linked-clone secret isolation, share boundary escapes, balloon/TRIM,
+  hibernate/resume, offline compaction, and the existing no-login cold restart.
 - Added explicit Windows-license acceptance to new one-shot installations.
   Interactive terminals require `[y/N]` confirmation before media download or
   instance creation; noninteractive use requires `--accept-windows-license`.

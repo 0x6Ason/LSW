@@ -8,11 +8,14 @@ After=lswd.socket
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/lswd
+Environment=LSW_DAEMON_IDLE_SECONDS=30
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/share/lsw
+TasksMax=256
+TimeoutStopSec=15s
 
 [Install]
 Also=lswd.socket

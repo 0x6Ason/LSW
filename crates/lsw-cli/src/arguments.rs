@@ -33,6 +33,7 @@ pub(super) struct InstallArguments {
     pub(super) seed: InstallSeedOptions,
     pub(super) without_agent: bool,
     pub(super) no_viewer: bool,
+    pub(super) defer_user_setup: bool,
     viewer_option_seen: bool,
     pub(super) seed_option_seen: bool,
     pub(super) create_option_seen: bool,
@@ -57,6 +58,7 @@ impl InstallArguments {
             seed: InstallSeedOptions::default(),
             without_agent: false,
             no_viewer: true,
+            defer_user_setup: false,
             viewer_option_seen: false,
             seed_option_seen: false,
             create_option_seen: false,
@@ -155,6 +157,12 @@ impl InstallArguments {
                         return Err("Windows license acceptance was supplied more than once".into());
                     }
                     parsed.accept_windows_license = true;
+                }
+                "--defer-user-setup" => {
+                    if parsed.defer_user_setup {
+                        return Err("--defer-user-setup was supplied more than once".into());
+                    }
+                    parsed.defer_user_setup = true;
                 }
                 value if value.starts_with('-') => {
                     return Err(format!("unknown install option {value:?}").into())

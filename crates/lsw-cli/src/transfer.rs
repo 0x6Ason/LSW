@@ -71,20 +71,31 @@ pub(super) fn sync(
     let name = resolve_name(store, parsed.requested.as_deref())?;
     let source = PathBuf::from(&parsed.source);
     require_real_directory(&source)?;
-    push_tree(store, &name, &source, &parsed.destination, true)?;
-    if !parsed.watch {
+    sync_host_to_guest(store, &name, &source, &parsed.destination, parsed.watch)?;
+    Ok(())
+}
+
+pub(super) fn sync_host_to_guest(
+    store: &StateStore,
+    name: &str,
+    source: &Path,
+    destination: &str,
+    watch: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    push_tree(store, name, source, destination, true)?;
+    if !watch {
         return Ok(());
     }
 
     println!(
         "Watching {} and synchronizing changes to {name}:{} (remote deletions are preserved).",
         source.display(),
-        parsed.destination
+        destination
     );
-    let mut previous = local_snapshot(&source)?;
+    let mut previous = local_snapshot(source)?;
     loop {
         thread::sleep(WATCH_INTERVAL);
-        let current = match local_snapshot(&source) {
+        let current = match local_snapshot(source) {
             Ok(current) => current,
             Err(error) => {
                 eprintln!("lsw sync: {error}");
@@ -97,8 +108,8 @@ pub(super) fn sync(
         next.directories
             .retain(|relative| current.directories.contains(relative));
         for relative in current.directories.difference(&previous.directories) {
-            let remote = join_windows_path(&parsed.destination, relative)?;
-            if let Err(error) = remote_create_directory(store, &name, &remote) {
+            let remote = join_windows_path(destination, relative)?;
+            if let Err(error) = remote_create_directory(store, name, &remote) {
                 eprintln!("lsw sync: could not create {relative}: {error}");
             } else {
                 next.directories.insert(relative.clone());
@@ -110,8 +121,8 @@ pub(super) fn sync(
                 continue;
             }
             let local = source.join(relative_path(relative)?);
-            let remote = join_windows_path(&parsed.destination, relative)?;
-            if let Err(error) = put_file_replacing(store, &name, &local, &remote) {
+            let remote = join_windows_path(destination, relative)?;
+            if let Err(error) = put_file_replacing(store, name, &local, &remote) {
                 eprintln!("lsw sync: could not update {relative}: {error}");
             } else {
                 next.files.insert(relative.clone(), *stamp);
@@ -120,6 +131,15 @@ pub(super) fn sync(
         }
         previous = next;
     }
+}
+
+pub(super) fn sync_guest_to_host(
+    store: &StateStore,
+    name: &str,
+    source: &str,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    pull_tree_replacing(store, name, source, destination)
 }
 
 #[derive(Debug)]
@@ -275,6 +295,37 @@ fn pull_tree(
     }
     println!(
         "Transferred {files} files ({bytes} bytes) from {name}:{source} to {}",
+        destination.display()
+    );
+    Ok(())
+}
+
+fn pull_tree_replacing(
+    store: &StateStore,
+    name: &str,
+    source: &str,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_real_directory(destination)?;
+    let entries = remote_tree(store, name, source)?;
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let relative = relative_path(&entry.relative)?;
+        let local = destination.join(relative);
+        match entry.kind {
+            LocalEntryKind::Directory => ensure_local_directory(&local)?,
+            LocalEntryKind::File => {
+                let parent = local.parent().ok_or("local file has no parent directory")?;
+                ensure_local_directory(parent)?;
+                let remote = join_windows_path(source, &entry.relative)?;
+                bytes = bytes.saturating_add(get_file_replacing(store, name, &remote, &local)?);
+                files += 1;
+            }
+        }
+    }
+    println!(
+        "Synchronized {files} files ({bytes} bytes) from {name}:{source} to {}",
         destination.display()
     );
     Ok(())
@@ -453,7 +504,7 @@ fn remote_create_directory(
     remote_powershell(
         store,
         name,
-        r#"$ErrorActionPreference='Stop'; $Directory=[IO.Directory]::CreateDirectory($env:LSW_PATH); if (($Directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'transfer destination is a reparse point' }"#,
+        r#"$ErrorActionPreference='Stop'; $Full=[IO.Path]::GetFullPath($env:LSW_PATH); $Root=[IO.Path]::GetPathRoot($Full); $Current=$Root; foreach ($Part in $Full.Substring($Root.Length).Split([char[]]'\/',[StringSplitOptions]::RemoveEmptyEntries)) { $Current=[IO.Path]::Combine($Current,$Part); if (Test-Path -LiteralPath $Current) { $Item=Get-Item -LiteralPath $Current -Force; if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('transfer path crosses a reparse point: '+$Item.FullName) } } }; $Directory=[IO.Directory]::CreateDirectory($Full); if (($Directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'transfer destination is a reparse point' }"#,
         vec![("LSW_PATH".to_owned(), path.to_owned())],
     )
     .map(|_| ())
@@ -465,6 +516,12 @@ fn put_file_replacing(
     source: &Path,
     destination: &str,
 ) -> Result<u64, Box<dyn std::error::Error>> {
+    remote_powershell(
+        store,
+        name,
+        r#"$ErrorActionPreference='Stop'; $Full=[IO.Path]::GetFullPath($env:LSW_PATH); $Parent=[IO.Path]::GetDirectoryName($Full); $Root=[IO.Path]::GetPathRoot($Parent); $Current=$Root; foreach ($Part in $Parent.Substring($Root.Length).Split([char[]]'\/',[StringSplitOptions]::RemoveEmptyEntries)) { $Current=[IO.Path]::Combine($Current,$Part); $Item=Get-Item -LiteralPath $Current -Force; if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('transfer path crosses a reparse point: '+$Item.FullName) } }"#,
+        vec![("LSW_PATH".to_owned(), destination.to_owned())],
+    )?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let temporary = format!("{destination}.lsw-sync-{}-{nonce}", std::process::id());
     let bytes = connect_agent(store, name)?.put_file(source, &temporary)?;
@@ -488,6 +545,59 @@ fn put_file_replacing(
     result.map(|_| bytes)
 }
 
+pub(super) fn set_guest_share_read_only(
+    store: &StateStore,
+    name: &str,
+    path: &str,
+    read_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    remote_powershell(
+        store,
+        name,
+        r#"$ErrorActionPreference='Stop'; $Full=[IO.Path]::GetFullPath($env:LSW_PATH); $Drive=[IO.Path]::GetPathRoot($Full); $Current=$Drive; foreach ($Part in $Full.Substring($Drive.Length).Split([char[]]'\/',[StringSplitOptions]::RemoveEmptyEntries)) { $Current=[IO.Path]::Combine($Current,$Part); $Item=Get-Item -LiteralPath $Current -Force; if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('share path crosses a reparse point: '+$Item.FullName) } }; $Root=Get-Item -LiteralPath $Full -Force; if (-not $Root.PSIsContainer) { throw 'share root is not a directory' }; $Acl=Get-Acl -LiteralPath $Root.FullName; $Sid=[Security.Principal.SecurityIdentifier]'S-1-5-32-545'; $Rights=[Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'; $Inheritance=[Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'; $Rule=New-Object Security.AccessControl.FileSystemAccessRule($Sid,$Rights,$Inheritance,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Deny); $Acl.RemoveAccessRuleSpecific($Rule); if ($env:LSW_READ_ONLY -eq '1') { $Acl.AddAccessRule($Rule) | Out-Null }; Set-Acl -LiteralPath $Root.FullName -AclObject $Acl"#,
+        vec![
+            ("LSW_PATH".to_owned(), path.to_owned()),
+            (
+                "LSW_READ_ONLY".to_owned(),
+                if read_only { "1" } else { "0" }.to_owned(),
+            ),
+        ],
+    )
+    .map(|_| ())
+}
+
+fn get_file_replacing(
+    store: &StateStore,
+    name: &str,
+    source: &str,
+    destination: &Path,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} must be a regular non-symlink file",
+                destination.display()
+            )
+            .into())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let temporary = destination.with_file_name(format!(
+        ".lsw-download-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    ));
+    let bytes = connect_agent(store, name)?.get_file(source, &temporary)?;
+    let result = fs::rename(&temporary, destination);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(bytes)
+}
+
 fn remote_tree(
     store: &StateStore,
     name: &str,
@@ -496,7 +606,7 @@ fn remote_tree(
     let output = remote_powershell(
         store,
         name,
-        r#"$ErrorActionPreference='Stop'; $Root=Get-Item -LiteralPath $env:LSW_ROOT -Force; if (-not $Root.PSIsContainer) { throw 'remote source is not a directory' }; if (($Root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'remote source is a reparse point' }; $Prefix=$Root.FullName.TrimEnd('\')+'\'; Get-ChildItem -LiteralPath $Root.FullName -Force -Recurse | ForEach-Object { if (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('reparse points are not supported: '+$_.FullName) }; $Relative=$_.FullName.Substring($Prefix.Length); $Hex=([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($Relative))).Replace('-',''); if ($_.PSIsContainer) { [Console]::Out.WriteLine(("D`t{0}" -f $Hex)) } else { [Console]::Out.WriteLine(("F`t{0}`t{1}" -f $_.Length,$Hex)) } }"#,
+        r#"$ErrorActionPreference='Stop'; $Full=[IO.Path]::GetFullPath($env:LSW_ROOT); $Drive=[IO.Path]::GetPathRoot($Full); $Current=$Drive; foreach ($Part in $Full.Substring($Drive.Length).Split([char[]]'\/',[StringSplitOptions]::RemoveEmptyEntries)) { $Current=[IO.Path]::Combine($Current,$Part); $Item=Get-Item -LiteralPath $Current -Force; if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('remote source crosses a reparse point: '+$Item.FullName) } }; $Root=Get-Item -LiteralPath $Full -Force; if (-not $Root.PSIsContainer) { throw 'remote source is not a directory' }; $Prefix=$Root.FullName.TrimEnd('\')+'\'; Get-ChildItem -LiteralPath $Root.FullName -Force -Recurse | ForEach-Object { if (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('reparse points are not supported: '+$_.FullName) }; $Relative=$_.FullName.Substring($Prefix.Length); $Hex=([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($Relative))).Replace('-',''); if ($_.PSIsContainer) { [Console]::Out.WriteLine(("D`t{0}" -f $Hex)) } else { [Console]::Out.WriteLine(("F`t{0}`t{1}" -f $_.Length,$Hex)) } }"#,
         vec![("LSW_ROOT".to_owned(), root.to_owned())],
     )?;
     parse_remote_tree(&output)

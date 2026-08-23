@@ -45,6 +45,26 @@ fn token_parser_rejects_short_or_uppercase_secrets() {
     fs::remove_file(root).expect("fixture should be removed");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_identity_file_replacement_is_atomic_and_repeatable() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be valid")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("lsw-agent-identity-{nonce}"));
+    fs::create_dir(&root).expect("fixture directory should be created");
+    let token = root.join("agent.token");
+    fs::write(&token, b"old\n").expect("fixture token should be written");
+    windows_path::replace_file(&token, b"new\n").expect("token should be replaced");
+    windows_path::replace_file(&token, b"newer\n").expect("token should replace again");
+    assert_eq!(
+        fs::read(&token).expect("token should be readable"),
+        b"newer\n"
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
 #[test]
 fn session_limit_is_bounded() {
     let arguments = vec![
@@ -108,6 +128,30 @@ fn license_helper_is_loopback_only_and_uses_a_distinct_service_mode() {
         "agent.token".into(),
         "--listen".into(),
         "0.0.0.0:5041".into(),
+    ])
+    .is_err());
+}
+
+#[test]
+fn user_helper_is_loopback_only_and_uses_a_distinct_service_mode() {
+    let configuration = Configuration::parse(&[
+        "--user-helper".into(),
+        "--token-file".into(),
+        "agent.token".into(),
+        "--listen".into(),
+        "127.0.0.1:5042".into(),
+    ])
+    .expect("user helper configuration should parse");
+    assert!(configuration.service);
+    assert_eq!(configuration.service_kind, ServiceKind::UserHelper);
+    assert!(configuration.listen.ip().is_loopback());
+
+    assert!(Configuration::parse(&[
+        "--user-helper".into(),
+        "--token-file".into(),
+        "agent.token".into(),
+        "--listen".into(),
+        "0.0.0.0:5042".into(),
     ])
     .is_err());
 }
@@ -336,12 +380,32 @@ fn non_windows_agent_does_not_advertise_conpty() {
     assert!(!capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_TERMINAL_RESIZE_V1));
+    assert!(!capabilities
+        .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_USER_ACCOUNT_V1));
+    assert!(!capabilities
+        .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_POWER_HIBERNATE_V1));
     assert!(capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_SESSION_CONTROL_V1));
     assert!(capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_SESSION_LEASE_V1));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_agent_advertises_native_os_operations() {
+    let capabilities = agent_capabilities();
+    for expected in [
+        lsw_core::CAPABILITY_CONPTY_V1,
+        lsw_core::CAPABILITY_TERMINAL_RESIZE_V1,
+        lsw_core::CAPABILITY_POWER_HIBERNATE_V1,
+        lsw_core::CAPABILITY_USER_ACCOUNT_V1,
+    ] {
+        assert!(capabilities.iter().any(|capability| capability == expected));
+    }
 }
 
 fn controlled_test_connection(

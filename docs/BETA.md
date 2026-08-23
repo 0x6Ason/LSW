@@ -1,13 +1,13 @@
 # LSW 1.0 beta status
 
-`1.0.0-beta.6` is a Linux x86_64 engineering beta, not a claim that every
+`1.0.0-beta.7` is a Linux x86_64 engineering beta, not a claim that every
 target platform has passed general-availability hardware validation. It joins
 Microsoft ISO resolution and download, WinPE DISM pre-application, the instance
 lifecycle, the Windows agent, and a lawful activation boundary into one path.
 
 ## Completed and covered by source or CI gates
 
-- Manifest v4, v1/v2/v3 migration, default-instance selection, private state
+- Manifest v5, v1/v2/v3/v4 migration, default-instance selection, private state
   permissions, 256-bit tokens, and loopback TCP port validation.
 - `lsw install NAME` resolves the Microsoft media session, accepts only
   allowlisted Microsoft HTTPS CDNs, downloads with aria2c or a native four-range
@@ -59,6 +59,24 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   Bash/Zsh/Fish/PowerShell completion generation.
 - Strict systemd-compatible user socket activation and packaged hardened unit
   files, covered with a real `systemd-socket-activate` process/socket smoke.
+- Opt-in `lsw daemon enable|disable|status|diagnose`, 30-second idle daemon
+  exit, reported RSS, and a source gate enforcing the below-30-MiB idle target.
+- Content-addressed sealed qcow2 bases and linked clones with exact ISO,
+  profile/preparation, agent, firmware, and disk identity; read-only bases;
+  fresh clone tokens/ports; and boot-time credential rotation from a private
+  identity volume.
+- QMP balloon targets, host-pressure reclaim, opt-in pause/hibernate policy,
+  Windows hibernate/resume, guest TRIM, qcow2 discard/detect-zeroes, and offline
+  compaction. Stopped and hibernated instances retain no QEMU process.
+- Declarative RO/RW folder synchronization, additive change watch, explicit RW
+  guest merge, guest ACL enforcement, and host-symlink/guest-reparse boundary
+  rejection. Shares and background watch are never enabled implicitly.
+- Interactive post-install permanent-user registration and deferred
+  `lsw user setup`. A demand-start authenticated LocalSystem helper calls native
+  NetAPI once and exits; the normal agent remains an unprivileged virtual
+  service account. Standard accounts are the default, administrator membership
+  is explicit, AutoLogon remains disabled, and passwords never enter argv,
+  environment, LSW manifests, seeds, logs, or diagnostics.
 - Unix children enter a dedicated process group before `exec`; remaining group
   members are cleaned up after normal leader exit, cancellation, disconnect,
   protocol failure, or lease expiry. Windows children must enter a
@@ -94,6 +112,7 @@ In addition to the source and ordinary CI gates above, the tagged beta.6 commit
 [Windows/KVM release gate](https://github.com/0x6Ason/lsw/actions/runs/32651006829)
 before publication. That result is exact-commit evidence from one documented
 Linux x86_64/KVM host, not a claim about untested hardware or host platforms.
+Any beta.7 tag must point to an exact commit that passed the expanded gate.
 
 ## Real-host release gate and remaining matrix
 
@@ -149,8 +168,9 @@ The broader hardware and soak matrix still includes:
   remains after normal leader reaping. Windows Job Objects enforce ownership,
   but a host nested-job policy that rejects assignment makes the session fail
   closed. Neither mechanism is a guest security sandbox.
-- `sync` is intentionally one-way and additive, not a bidirectional conflict
-  resolver. It does not delete remote files when a host file disappears. Tree
+- `sync` and share watch are intentionally host-to-guest and additive, not a
+  bidirectional conflict resolver. RW share import is an explicit
+  `--from-guest` operation. Neither side's deletion is propagated, and tree
   transfer does not follow host symlinks or guest reparse points.
 - `run --detach` discards process standard streams and keeps the process owned
   by the agent's Job. It does not turn a Session 0 process into a visible desktop
@@ -164,9 +184,12 @@ The broader hardware and soak matrix still includes:
   `NT SERVICE\LSWAgent`; they do not impersonate a desktop user. This provides a
   CLI without login, but a service-launched GUI does not appear on the user's
   desktop. A user-session companion is not implemented.
-- Suspend/resume applies QMP `stop`/`cont` to a running QEMU process. There is
-  no RAM save-to-disk, cross-host restore, live migration, host folder, USB
-  passthrough, or image export.
+- Suspend/resume applies QMP `stop`/`cont`; hibernate uses Windows' hiberfile
+  and powers QEMU off. There is no cross-host live migration, kernel-mounted
+  host folder, USB passthrough, or portable image export.
+- The balloon device is present, but useful Windows reclaim requires a
+  compatible signed VirtIO driver. LSW does not bundle unsigned/test-signed
+  drivers and retains the inbox NVMe/e1000e recovery path.
 - Agent authentication is not encrypted and is limited to the designed local
   loopback/QEMU user-network path.
 - `--publish` creates only a `127.0.0.1` TCP listener, but the guest service is

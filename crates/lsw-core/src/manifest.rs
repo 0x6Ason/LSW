@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{LswError, Result, WindowsProfile};
 
-const MANIFEST_VERSION: u32 = 4;
+const MANIFEST_VERSION: u32 = 5;
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
+pub const DEFAULT_HIBERNATE_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const AGENT_CONTROL_PORT_START: u16 = 42_000;
 pub const AGENT_CONTROL_PORT_END_EXCLUSIVE: u16 = 44_000;
 
@@ -17,6 +18,89 @@ pub const AGENT_CONTROL_PORT_END_EXCLUSIVE: u16 = 44_000;
 pub enum NetworkMode {
     Nat,
     Offline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdlePolicy {
+    Off,
+    PauseHibernate,
+}
+
+impl fmt::Display for IdlePolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "off",
+            Self::PauseHibernate => "pause-hibernate",
+        })
+    }
+}
+
+impl FromStr for IdlePolicy {
+    type Err = LswError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "off" => Ok(Self::Off),
+            "pause-hibernate" => Ok(Self::PauseHibernate),
+            _ => Err(LswError::InvalidValue {
+                field: "idle policy",
+                reason: format!("unknown policy {value:?}; expected off or pause-hibernate"),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FolderShareMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl fmt::Display for FolderShareMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ReadOnly => "ro",
+            Self::ReadWrite => "rw",
+        })
+    }
+}
+
+impl FromStr for FolderShareMode {
+    type Err = LswError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "ro" => Ok(Self::ReadOnly),
+            "rw" => Ok(Self::ReadWrite),
+            _ => Err(LswError::InvalidValue {
+                field: "folder share mode",
+                reason: format!("unknown mode {value:?}; expected ro or rw"),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FolderShare {
+    pub name: String,
+    pub host_path: PathBuf,
+    pub guest_path: String,
+    pub mode: FolderShareMode,
+}
+
+impl FolderShare {
+    pub fn validate(&self) -> Result<()> {
+        validate_share_name(&self.name)?;
+        validate_serializable_value(&self.host_path, "folder share host path")?;
+        if !self.host_path.is_absolute() || self.host_path.parent().is_none() {
+            return Err(LswError::InvalidValue {
+                field: "folder share host path",
+                reason: "must be an absolute directory below the filesystem root".to_owned(),
+            });
+        }
+        validate_windows_absolute_path(&self.guest_path)?;
+        Ok(())
+    }
 }
 
 impl fmt::Display for NetworkMode {
@@ -217,6 +301,7 @@ pub enum InstanceState {
     Stopped,
     Running,
     Suspended,
+    Hibernated,
     Failed,
 }
 
@@ -228,6 +313,7 @@ impl fmt::Display for InstanceState {
             Self::Stopped => "stopped",
             Self::Running => "running",
             Self::Suspended => "suspended",
+            Self::Hibernated => "hibernated",
             Self::Failed => "failed",
         };
         formatter.write_str(value)
@@ -244,6 +330,7 @@ impl FromStr for InstanceState {
             "stopped" => Ok(Self::Stopped),
             "running" => Ok(Self::Running),
             "suspended" => Ok(Self::Suspended),
+            "hibernated" => Ok(Self::Hibernated),
             "failed" => Ok(Self::Failed),
             _ => Err(LswError::InvalidManifest(format!(
                 "unknown instance state {value:?}"
@@ -260,11 +347,19 @@ pub struct InstanceManifest {
     pub control_port: u16,
     pub created_unix_seconds: u64,
     pub idle_timeout_seconds: u64,
+    pub hibernate_timeout_seconds: u64,
+    pub idle_policy: IdlePolicy,
+    pub memory_min_mib: u32,
+    pub state_changed_unix_seconds: u64,
+    pub base_image_key: Option<String>,
+    pub default_user: Option<String>,
+    pub folder_shares: Vec<FolderShare>,
 }
 
 impl InstanceManifest {
     pub fn new(spec: InstanceSpec) -> Result<Self> {
         spec.validate_for_create()?;
+        let memory_min_mib = spec.memory_mib.min(2048);
         let created_unix_seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| LswError::InvalidValue {
@@ -280,12 +375,21 @@ impl InstanceManifest {
             state: InstanceState::Configured,
             created_unix_seconds,
             idle_timeout_seconds: DEFAULT_IDLE_TIMEOUT_SECONDS,
+            hibernate_timeout_seconds: DEFAULT_HIBERNATE_TIMEOUT_SECONDS,
+            idle_policy: IdlePolicy::Off,
+            memory_min_mib,
+            state_changed_unix_seconds: created_unix_seconds,
+            base_image_key: None,
+            default_user: None,
+            folder_shares: Vec::new(),
         })
     }
 
     pub fn encode(&self) -> Result<String> {
         self.spec.validate()?;
         validate_idle_timeout(self.idle_timeout_seconds)?;
+        validate_idle_timeout(self.hibernate_timeout_seconds)?;
+        validate_runtime_fields(self)?;
         let source_iso = self
             .spec
             .source_iso
@@ -301,6 +405,18 @@ impl InstanceManifest {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join(",");
+        let base_image_key = self.base_image_key.as_deref().unwrap_or("");
+        let default_user = self.default_user.as_deref().unwrap_or("");
+        let mut shares = String::new();
+        for (index, share) in self.folder_shares.iter().enumerate() {
+            shares.push_str(&format!(
+                "share.{index}.name={}\nshare.{index}.host={}\nshare.{index}.guest={}\nshare.{index}.mode={}\n",
+                share.name,
+                share.host_path.display(),
+                share.guest_path,
+                share.mode
+            ));
+        }
 
         Ok(format!(
             concat!(
@@ -318,7 +434,15 @@ impl InstanceManifest {
                 "state={}\n",
                 "control_port={}\n",
                 "created_unix_seconds={}\n",
-                "idle_timeout_seconds={}\n"
+                "idle_timeout_seconds={}\n",
+                "hibernate_timeout_seconds={}\n",
+                "idle_policy={}\n",
+                "memory_min_mib={}\n",
+                "state_changed_unix_seconds={}\n",
+                "base_image_key={}\n",
+                "default_user={}\n",
+                "share_count={}\n",
+                "{}"
             ),
             MANIFEST_VERSION,
             self.spec.name,
@@ -335,6 +459,14 @@ impl InstanceManifest {
             self.control_port,
             self.created_unix_seconds,
             self.idle_timeout_seconds,
+            self.hibernate_timeout_seconds,
+            self.idle_policy,
+            self.memory_min_mib,
+            self.state_changed_unix_seconds,
+            base_image_key,
+            default_user,
+            self.folder_shares.len(),
+            shares,
         ))
     }
 
@@ -355,7 +487,7 @@ impl InstanceManifest {
         }
 
         let version = parse_field::<u32>(&fields, "version")?;
-        if !matches!(version, 1 | 2 | 3 | MANIFEST_VERSION) {
+        if !(1..=MANIFEST_VERSION).contains(&version) {
             return Err(LswError::InvalidManifest(format!(
                 "unsupported manifest version {version}"
             )));
@@ -399,15 +531,139 @@ impl InstanceManifest {
         };
         validate_idle_timeout(idle_timeout_seconds)?;
 
-        Ok(Self {
+        let hibernate_timeout_seconds = if version >= 5 {
+            parse_field(&fields, "hibernate_timeout_seconds")?
+        } else {
+            0
+        };
+        validate_idle_timeout(hibernate_timeout_seconds)?;
+        let idle_policy = if version >= 5 {
+            required_field(&fields, "idle_policy")?.parse()?
+        } else {
+            IdlePolicy::Off
+        };
+        let memory_min_mib = if version >= 5 {
+            parse_field(&fields, "memory_min_mib")?
+        } else {
+            spec.memory_mib.min(2048)
+        };
+        let created_unix_seconds = parse_field(&fields, "created_unix_seconds")?;
+        let state_changed_unix_seconds = if version >= 5 {
+            parse_field(&fields, "state_changed_unix_seconds")?
+        } else {
+            created_unix_seconds
+        };
+        let base_image_key = if version >= 5 {
+            optional_nonempty_field(&fields, "base_image_key").map(str::to_owned)
+        } else {
+            None
+        };
+        let default_user = if version >= 5 {
+            optional_nonempty_field(&fields, "default_user").map(str::to_owned)
+        } else {
+            None
+        };
+        let folder_shares = if version >= 5 {
+            parse_folder_shares(&fields)?
+        } else {
+            Vec::new()
+        };
+
+        let manifest = Self {
             version: MANIFEST_VERSION,
             spec,
             state: required_field(&fields, "state")?.parse()?,
             control_port,
-            created_unix_seconds: parse_field(&fields, "created_unix_seconds")?,
+            created_unix_seconds,
             idle_timeout_seconds,
-        })
+            hibernate_timeout_seconds,
+            idle_policy,
+            memory_min_mib,
+            state_changed_unix_seconds,
+            base_image_key,
+            default_user,
+            folder_shares,
+        };
+        validate_runtime_fields(&manifest)?;
+        Ok(manifest)
     }
+}
+
+fn validate_runtime_fields(manifest: &InstanceManifest) -> Result<()> {
+    if !(256..=manifest.spec.memory_mib).contains(&manifest.memory_min_mib) {
+        return Err(LswError::InvalidValue {
+            field: "minimum memory",
+            reason: format!(
+                "must be between 256 MiB and memory.max ({} MiB)",
+                manifest.spec.memory_mib
+            ),
+        });
+    }
+    if let Some(key) = &manifest.base_image_key {
+        if key.len() != 64
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(LswError::InvalidValue {
+                field: "base image key",
+                reason: "must contain 64 lowercase hexadecimal characters".to_owned(),
+            });
+        }
+    }
+    if let Some(user) = &manifest.default_user {
+        validate_windows_user_name(user)?;
+    }
+    let mut names = BTreeSet::new();
+    for (index, share) in manifest.folder_shares.iter().enumerate() {
+        share.validate()?;
+        if !names.insert(&share.name) {
+            return Err(LswError::InvalidValue {
+                field: "folder shares",
+                reason: format!("share name {:?} appears more than once", share.name),
+            });
+        }
+        for existing in &manifest.folder_shares[..index] {
+            if share.host_path.starts_with(&existing.host_path)
+                || existing.host_path.starts_with(&share.host_path)
+                || windows_roots_overlap(&share.guest_path, &existing.guest_path)
+            {
+                return Err(LswError::InvalidValue {
+                    field: "folder shares",
+                    reason: format!(
+                        "share roots {:?} and {:?} overlap",
+                        existing.name, share.name
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_folder_shares(fields: &BTreeMap<&str, &str>) -> Result<Vec<FolderShare>> {
+    let count = parse_field::<usize>(fields, "share_count")?;
+    if count > 64 {
+        return Err(LswError::InvalidManifest(
+            "more than 64 folder shares".to_owned(),
+        ));
+    }
+    (0..count)
+        .map(|index| {
+            let share = FolderShare {
+                name: required_field(fields, &format!("share.{index}.name"))?.to_owned(),
+                host_path: PathBuf::from(required_field(fields, &format!("share.{index}.host"))?),
+                guest_path: required_field(fields, &format!("share.{index}.guest"))?.to_owned(),
+                mode: required_field(fields, &format!("share.{index}.mode"))?.parse()?,
+            };
+            share.validate()?;
+            Ok(share)
+        })
+        .collect()
+}
+
+fn optional_nonempty_field<'a>(fields: &'a BTreeMap<&str, &str>, key: &str) -> Option<&'a str> {
+    fields.get(key).copied().filter(|value| !value.is_empty())
 }
 
 fn validate_idle_timeout(seconds: u64) -> Result<()> {
@@ -473,17 +729,134 @@ pub(crate) fn validate_instance_name(name: &str) -> Result<()> {
 }
 
 fn validate_serializable_path(path: &std::path::Path) -> Result<()> {
+    validate_serializable_value(path, "source ISO")
+}
+
+fn validate_serializable_value(path: &std::path::Path, field: &'static str) -> Result<()> {
     let path = path.to_str().ok_or_else(|| LswError::InvalidValue {
-        field: "source ISO",
+        field,
         reason: "path is not valid UTF-8".to_owned(),
     })?;
     if path.contains('\n') || path.contains('\r') {
         return Err(LswError::InvalidValue {
-            field: "source ISO",
+            field,
             reason: "path cannot contain a newline".to_owned(),
         });
     }
     Ok(())
+}
+
+fn validate_share_name(name: &str) -> Result<()> {
+    let valid_length = (1..=32).contains(&name.len());
+    let valid_characters = name
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    let valid_edges = name
+        .as_bytes()
+        .first()
+        .zip(name.as_bytes().last())
+        .is_some_and(|(first, last)| first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric());
+    if valid_length && valid_characters && valid_edges {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "folder share name",
+            reason: "must use 1-32 lowercase letters, digits, or interior hyphens".to_owned(),
+        })
+    }
+}
+
+fn validate_windows_absolute_path(path: &str) -> Result<()> {
+    let bytes = path.as_bytes();
+    let drive_root = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let safe_components = drive_root
+        && path[3..]
+            .split(['\\', '/'])
+            .all(windows_share_component_is_safe);
+    if drive_root && safe_components {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "folder share guest path",
+            reason: "must be an absolute Windows drive path without parent traversal".to_owned(),
+        })
+    }
+}
+
+fn windows_share_component_is_safe(component: &str) -> bool {
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || component.ends_with([' ', '.'])
+        || component
+            .chars()
+            .any(|character| character <= '\u{1f}' || "<>:\"/\\|?*".contains(character))
+    {
+        return false;
+    }
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        && !matches!(
+            stem.as_str(),
+            "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+}
+
+fn windows_roots_overlap(left: &str, right: &str) -> bool {
+    let left = left.replace('/', "\\").to_ascii_lowercase();
+    let right = right.replace('/', "\\").to_ascii_lowercase();
+    left == right
+        || left
+            .strip_prefix(&right)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+        || right
+            .strip_prefix(&left)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+}
+
+pub fn validate_windows_user_name(name: &str) -> Result<()> {
+    const FORBIDDEN: [char; 16] = [
+        '"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>', '@',
+    ];
+    let valid = !name.is_empty()
+        && name.encode_utf16().count() <= 20
+        && name != "."
+        && name != ".."
+        && !name.ends_with([' ', '.'])
+        && !name
+            .chars()
+            .any(|character| character.is_control() || FORBIDDEN.contains(&character));
+    if valid {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "Windows user name",
+            reason: "must be 1-20 UTF-16 code units and contain no Windows account-name separators or trailing space/dot".to_owned(),
+        })
+    }
 }
 
 fn stable_control_port(name: &str) -> u16 {
@@ -524,10 +897,33 @@ mod tests {
         path
     }
 
+    fn remove_v5_fields(encoded: String, version: u32) -> String {
+        let mut legacy = encoded
+            .lines()
+            .filter(|line| {
+                ![
+                    "hibernate_timeout_seconds=",
+                    "idle_policy=",
+                    "memory_min_mib=",
+                    "state_changed_unix_seconds=",
+                    "base_image_key=",
+                    "default_user=",
+                    "share_count=",
+                    "share.",
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        legacy[0] = format!("version={version}");
+        format!("{}\n", legacy.join("\n"))
+    }
+
     #[test]
     fn manifest_round_trip_is_stable() {
         let iso = temporary_iso();
-        let manifest = InstanceManifest::new(InstanceSpec {
+        let mut manifest = InstanceManifest::new(InstanceSpec {
             name: "win-dev".to_owned(),
             source_iso: iso.clone(),
             profile: WindowsProfile::Slim,
@@ -540,6 +936,17 @@ mod tests {
             allow_unsupported_requirements: false,
         })
         .expect("manifest should be valid");
+        manifest.hibernate_timeout_seconds = 240;
+        manifest.idle_policy = IdlePolicy::PauseHibernate;
+        manifest.memory_min_mib = 1024;
+        manifest.base_image_key = Some("a".repeat(64));
+        manifest.default_user = Some("desktop-user".to_owned());
+        manifest.folder_shares.push(FolderShare {
+            name: "source".to_owned(),
+            host_path: PathBuf::from("/srv/source"),
+            guest_path: "C:\\Users\\desktop-user\\source".to_owned(),
+            mode: FolderShareMode::ReadWrite,
+        });
 
         let encoded = manifest.encode().expect("manifest should encode");
         let decoded = InstanceManifest::decode(&encoded).expect("manifest should decode");
@@ -553,6 +960,62 @@ mod tests {
         assert!(validate_instance_name("../escape").is_err());
         assert!(validate_instance_name("Uppercase").is_err());
         assert!(validate_instance_name("win-dev").is_ok());
+    }
+
+    #[test]
+    fn folder_share_roots_are_absolute_safe_and_non_overlapping() {
+        let (host_source, host_other, host_nested, host_filesystem_root) = if cfg!(windows) {
+            (
+                "C:\\srv\\source",
+                "C:\\srv\\other",
+                "C:\\srv\\source\\nested",
+                "C:\\",
+            )
+        } else {
+            ("/srv/source", "/srv/other", "/srv/source/nested", "/")
+        };
+        let valid = FolderShare {
+            name: "source".to_owned(),
+            host_path: PathBuf::from(host_source),
+            guest_path: "C:\\src".to_owned(),
+            mode: FolderShareMode::ReadWrite,
+        };
+        valid.validate().expect("ordinary roots should be valid");
+        for invalid_guest in ["C:\\", "C:\\src\\", "C:\\src:stream", "C:\\CON"] {
+            let mut invalid = valid.clone();
+            invalid.guest_path = invalid_guest.to_owned();
+            assert!(invalid.validate().is_err(), "accepted {invalid_guest:?}");
+        }
+        let mut host_root = valid.clone();
+        host_root.host_path = PathBuf::from(host_filesystem_root);
+        assert!(host_root.validate().is_err());
+
+        let iso = temporary_iso();
+        let mut manifest = InstanceManifest::new(InstanceSpec {
+            name: "share-overlap".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Vanilla,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("fixture manifest should be valid");
+        manifest.folder_shares.push(valid.clone());
+        manifest.folder_shares.push(FolderShare {
+            name: "nested".to_owned(),
+            host_path: PathBuf::from(host_other),
+            guest_path: "c:/SRC/nested".to_owned(),
+            mode: FolderShareMode::ReadOnly,
+        });
+        assert!(validate_runtime_fields(&manifest).is_err());
+        manifest.folder_shares[1].guest_path = "D:\\other".to_owned();
+        manifest.folder_shares[1].host_path = PathBuf::from(host_nested);
+        assert!(validate_runtime_fields(&manifest).is_err());
+        fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 
     #[test]
@@ -596,10 +1059,7 @@ mod tests {
             allow_unsupported_requirements: false,
         })
         .expect("manifest should be valid");
-        let legacy = manifest
-            .encode()
-            .expect("manifest should encode")
-            .replace("version=4\n", "version=1\n")
+        let legacy = remove_v5_fields(manifest.encode().expect("manifest should encode"), 1)
             .replace("profile=vanilla\n", "profile=standard\n")
             .replace("network=nat\n", "")
             .replace("port_forwards=\n", "")
@@ -628,10 +1088,7 @@ mod tests {
             allow_unsupported_requirements: false,
         })
         .expect("manifest should be valid");
-        let legacy = manifest
-            .encode()
-            .expect("manifest should encode")
-            .replace("version=4\n", "version=2\n")
+        let legacy = remove_v5_fields(manifest.encode().expect("manifest should encode"), 2)
             .replace("port_forwards=\n", "")
             .replace("idle_timeout_seconds=600\n", "");
         let migrated = InstanceManifest::decode(&legacy).expect("v2 manifest should migrate");
@@ -656,13 +1113,36 @@ mod tests {
             allow_unsupported_requirements: false,
         })
         .expect("manifest should be valid");
-        let legacy = manifest
-            .encode()
-            .expect("manifest should encode")
-            .replace("version=4\n", "version=3\n")
+        let legacy = remove_v5_fields(manifest.encode().expect("manifest should encode"), 3)
             .replace("idle_timeout_seconds=600\n", "");
         let migrated = InstanceManifest::decode(&legacy).expect("v3 manifest should migrate");
         assert_eq!(migrated.idle_timeout_seconds, DEFAULT_IDLE_TIMEOUT_SECONDS);
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn version_four_manifests_keep_beta7_features_opted_out() {
+        let iso = temporary_iso();
+        let manifest = InstanceManifest::new(InstanceSpec {
+            name: "version-four".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Vanilla,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("manifest should be valid");
+        let legacy = remove_v5_fields(manifest.encode().expect("manifest should encode"), 4);
+        let migrated = InstanceManifest::decode(&legacy).expect("v4 manifest should migrate");
+        assert_eq!(migrated.idle_policy, IdlePolicy::Off);
+        assert_eq!(migrated.memory_min_mib, 2048);
+        assert!(migrated.base_image_key.is_none());
+        assert!(migrated.default_user.is_none());
+        assert!(migrated.folder_shares.is_empty());
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 

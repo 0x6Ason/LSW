@@ -27,8 +27,9 @@ is complete.
 - QEMU lifecycle uses QMP. A PID file is diagnostic state, not authority for
   sending signals to an arbitrary process.
 - In-memory suspend uses QMP `stop`; resume requires the same reachable QEMU
-  process in `paused` state. LSW does not serialize guest RAM or claim that a
-  suspended instance survives QEMU or host termination.
+  process in `paused` state. Windows hibernation is a distinct authenticated
+  request: the guest writes its hiberfile and powers off, after which QEMU has
+  zero RSS. LSW does not implement cross-host migration.
 - Storage preparation and install-seed creation reject symlink destinations and
   do not overwrite existing disks, firmware stores, seeds, or transferred files.
 
@@ -50,6 +51,18 @@ encoding, which is not encryption. SetupComplete removes the one-shot account,
 cached answer files, its script, and the staging payload before the host accepts
 the setup marker. Visible desktop GUI integration will require a future
 user-session companion.
+
+After cleanup, interactive installation creates a separately confirmed
+permanent local account. `lsw user setup` validates the name locally and sends
+the password through a dedicated authenticated frame. The normal virtual-account
+agent starts `LSWUserHelper`, forwards the request over authenticated guest
+loopback, and the demand-start LocalSystem helper calls `NetUserAdd`; optional
+administrator membership uses the well-known local Administrators SID and
+`NetLocalGroupAddMembers`. The helper exits after one request. Password bytes
+never enter argv, environment, LSW manifests, seeds, logs, or diagnostics, and
+mutable protocol/UTF-16 buffers are cleared after use. Windows retains its
+normal account verifier. Standard membership is the default and Windows
+AutoLogon is never configured.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
 guest port 35040 only from the QEMU user-network host address. Authentication is
@@ -111,6 +124,20 @@ reparse points, and unsafe relative components. Explicit `sync` updates use a
 unique guest temporary file plus atomic rename; the operation is additive and
 never turns a host deletion into a guest deletion.
 
+Folder shares are synchronized mirrors rather than QEMU mounts. Each manifest
+entry names one canonical host directory, one absolute guest drive path, and an
+explicit RO/RW mode. Existing components on both sides are checked during every
+walk: host symbolic links and Windows reparse points fail the operation. RO
+roots receive an inheritable deny-write ACL for well-known BUILTIN Users while
+SYSTEM/service access remains available for synchronization. RW guest imports
+are explicit, and no background operation propagates deletion.
+
+Sealed bases are mode 0400 and content-addressed. Sealing rejects an instance
+that already contains a registered permanent user. Clones do not inherit host
+tokens, control ports, published ports, shares, or default-user metadata; a
+private read-only boot volume rotates the copied in-guest credential before the
+agent opens its listener.
+
 ## Network policy
 
 `nat` is the create default: QEMU user networking permits guest egress. The
@@ -145,16 +172,18 @@ instance.
 
 | Profile | Guest Secure Boot | Test-signed custom driver policy |
 | --- | --- | --- |
-| `vanilla`, `slim` | Off | No custom driver is enabled or installed by beta.6 |
+| `vanilla`, `slim` | Off | No unsigned or test-signed custom driver is enabled or installed by beta.7 |
 
 Old preview manifests named `standard` migrate to `vanilla`. Existing
 `ephemeral` and `secure` manifests retain their old runtime and firmware
-semantics when loaded, but those names cannot be selected for new beta.6
+semantics when loaded, but those names cannot be selected for new beta.7
 instances. The old secure mode still requires a key-enrolled OVMF variable
 template and SMM-backed flash protection.
 
 LSW beta does not generate a certificate, enable Windows test signing, install a
-root certificate, or ship a custom kernel driver. Any later developer-driver
+root certificate, or ship a custom kernel driver. The VirtIO balloon device is
+optional and harmless without a compatible signed guest driver; the default
+NVMe/e1000e install and recovery path never depends on it. Any later developer-driver
 workflow must require an explicit guest-only enrollment, keep private keys out
 of shared images, and retain a driverless path.
 
@@ -175,6 +204,16 @@ diagnostic material. PowerShell runs the fixed, installed
 `license-helper.ps1`; only the bounded action is passed as an argument and a
 product key is supplied to that process through stdin. Helper stderr is
 discarded so a failed WMI operation cannot echo a key.
+
+## Windows account helper
+
+Permanent-account creation follows the same least-privilege shape without
+sharing the activation protocol. `LSWUserHelper` is Manual/demand-start under
+LocalSystem, binds guest loopback port 35042, authenticates the per-instance
+token, accepts exactly one bounded `USER_CREATE` frame, calls NetAPI, and exits.
+Its service ACL gives `NT SERVICE\LSWAgent` query/start rights only. Password
+buffers are cleared at every mutable protocol/native boundary; no child process
+or shell receives the password.
 
 ## Remaining security work
 

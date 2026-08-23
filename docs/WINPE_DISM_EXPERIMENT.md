@@ -75,8 +75,8 @@ is enabled in the beta.6 installer. A real Windows 11 25H2/KVM run completed
 both WinPE phases, specialize, and SCM agent startup, then exposed a race where
 the first agent connection preceded the specialize-to-OOBE reboot. The headless
 installer now waits for a post-OOBE cleanup marker instead. The protected
-exact-commit release-gate job remains mandatory before tagging beta.6; partial
-or local runs do not replace that publication control.
+exact-commit release-gate job remains mandatory before tagging any release;
+partial or local runs do not replace that publication control.
 
 The command sequence follows Microsoft's documentation for
 [WinPE startup scripts](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/wpeinit-and-startnetcmd-using-winpe-startup-scripts?view=windows-11),

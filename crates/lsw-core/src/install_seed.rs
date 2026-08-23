@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     CustomizationPlan, InstanceManifest, LswError, Result, AGENT_GUEST_PORT,
-    LICENSE_HELPER_GUEST_PORT,
+    LICENSE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
@@ -427,6 +427,8 @@ $ServiceDisplayName = 'LSW Guest Agent'
 $ServiceAccount = 'NT SERVICE\LSWAgent'
 $LicenseServiceName = 'LSWLicenseHelper'
 $LicenseServiceDisplayName = 'LSW Windows Activation Helper'
+$UserServiceName = 'LSWUserHelper'
+$UserServiceDisplayName = 'LSW Windows Account Helper'
 $ScExe = Join-Path $env:SystemRoot 'System32\sc.exe'
 
 function ConvertTo-ScBinaryPathArgument {
@@ -460,7 +462,7 @@ $LicenseScriptTarget = Join-Path $InstallRoot 'license-helper.ps1'
 $TokenTarget = Join-Path $DataRoot 'agent.token'
 $LogTarget = Join-Path $DataRoot 'agent.log'
 $ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-foreach ($ServiceToStop in @($ServiceName, $LicenseServiceName)) {
+foreach ($ServiceToStop in @($ServiceName, $LicenseServiceName, $UserServiceName)) {
     $ExistingServiceToStop = Get-Service -Name $ServiceToStop -ErrorAction SilentlyContinue
     if ($null -ne $ExistingServiceToStop -and $ExistingServiceToStop.Status -ne 'Stopped') {
         if ($ExistingServiceToStop.Status -ne 'StopPending') {
@@ -587,20 +589,44 @@ Invoke-Sc @('description', $LicenseServiceName, 'Performs authenticated, on-dema
 $LicenseServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;{0})' -f $ServiceIdentity.Value
 Invoke-Sc @('sdset', $LicenseServiceName, $LicenseServiceSddl)
 
+$UserCommand = ('"{0}" --user-helper --token-file "{1}" --listen 127.0.0.1:__LSW_USER_HELPER_PORT__' -f $AgentTarget, $TokenTarget)
+$ScUserCommand = ConvertTo-ScBinaryPathArgument -Command $UserCommand
+$ExistingUserService = Get-Service -Name $UserServiceName -ErrorAction SilentlyContinue
+if ($null -eq $ExistingUserService) {
+    Invoke-Sc @(
+        'create', $UserServiceName,
+        'binPath=', $ScUserCommand,
+        'DisplayName=', $UserServiceDisplayName,
+        'start=', 'demand',
+        'obj=', 'LocalSystem'
+    )
+}
+Invoke-Sc @(
+    'config', $UserServiceName,
+    'binPath=', $ScUserCommand,
+    'DisplayName=', $UserServiceDisplayName,
+    'start=', 'demand',
+    'obj=', 'LocalSystem'
+)
+Invoke-Sc @('sidtype', $UserServiceName, 'unrestricted')
+Invoke-Sc @('description', $UserServiceName, 'Performs one authenticated local-account operation for LSW and exits.')
+$UserServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;{0})' -f $ServiceIdentity.Value
+Invoke-Sc @('sdset', $UserServiceName, $UserServiceSddl)
+
 $DirectoryAcl = New-Object System.Security.AccessControl.DirectorySecurity
 $DirectoryAcl.SetAccessRuleProtection($true, $false)
 $DirectoryAcl.SetOwner($Administrators)
 $Inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
 $NoPropagation = [System.Security.AccessControl.PropagationFlags]::None
 $FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
-$ReadAndExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+$Modify = [System.Security.AccessControl.FileSystemRights]::Modify
 foreach ($Identity in @($System, $Administrators)) {
     $DirectoryAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
         $Identity, $FullControl, $Inherit, $NoPropagation, $Allow
     )))
 }
 $DirectoryAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $ServiceIdentity, $ReadAndExecute, $Inherit, $NoPropagation, $Allow
+    $ServiceIdentity, $Modify, $Inherit, $NoPropagation, $Allow
 )))
 Set-Acl -LiteralPath $DataRoot -AclObject $DirectoryAcl
 
@@ -615,7 +641,7 @@ foreach ($Identity in @($System, $Administrators)) {
     )))
 }
 $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $ServiceIdentity, [System.Security.AccessControl.FileSystemRights]::Read, $Allow
+    $ServiceIdentity, $Modify, $Allow
 )))
 Set-Acl -LiteralPath $TokenTarget -AclObject $Acl
 
@@ -674,6 +700,10 @@ Set-LswSetupStage 'waiting-for-oobe'
         "__LSW_LICENSE_HELPER_PORT__",
         &LICENSE_HELPER_GUEST_PORT.to_string(),
     )
+    .replace(
+        "__LSW_USER_HELPER_PORT__",
+        &USER_HELPER_GUEST_PORT.to_string(),
+    )
     .replace("__LSW_SETUP_ACCOUNT__", SETUP_ACCOUNT_NAME)
 }
 
@@ -726,10 +756,9 @@ fn seed_readme(manifest: &InstanceManifest, options: &InstallSeedOptions) -> Str
 fn generate_setup_account_password() -> Result<String> {
     let mut random = [0_u8; 24];
     getrandom::getrandom(&mut random).map_err(|error| {
-        LswError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("the operating system random source failed: {error}"),
-        ))
+        LswError::Io(std::io::Error::other(format!(
+            "the operating system random source failed: {error}"
+        )))
     })?;
 
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -945,7 +974,10 @@ mod tests {
         assert!(installer.contains("'failure', $ServiceName"));
         assert!(installer.contains("$ExitCode = $LASTEXITCODE"));
         assert!(installer.contains("$ServiceIdentity"));
+        assert!(installer.contains("$ServiceIdentity, $Modify, $Inherit"));
+        assert!(installer.contains("$ServiceIdentity, $Modify, $Allow"));
         assert!(installer.contains("$LicenseServiceName = 'LSWLicenseHelper'"));
+        assert!(installer.contains("$UserServiceName = 'LSWUserHelper'"));
         assert!(installer.contains("--license-helper --token-file"));
         assert!(installer.contains("$LicenseScriptSource"));
         assert!(installer.contains("$LicenseScriptTarget"));
@@ -953,6 +985,7 @@ mod tests {
             "Copy-Item -LiteralPath $LicenseScriptSource -Destination $LicenseScriptTarget -Force"
         ));
         assert!(installer.contains(&format!("--listen 127.0.0.1:{LICENSE_HELPER_GUEST_PORT}")));
+        assert!(installer.contains(&format!("--listen 127.0.0.1:{USER_HELPER_GUEST_PORT}")));
         assert!(installer.contains(&format!("-LocalPort {AGENT_GUEST_PORT}")));
         assert!(installer.contains("$LogTarget = Join-Path $DataRoot 'agent.log'"));
         assert!(installer.contains("Set-Acl -LiteralPath $LogTarget"));

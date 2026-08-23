@@ -16,9 +16,10 @@ use lsw_core::{
     decode_exit, decode_file_length, decode_process_id, encode_file_length, read_frame,
     write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest,
     ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions, SessionSignal,
-    StartRequest, TerminalSize, TerminalStartRequest, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
-    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1,
-    CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
+    CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
@@ -85,6 +86,23 @@ impl AgentClient {
             return Err("agent returned an invalid PONG response".into());
         }
         Ok(())
+    }
+
+    pub fn create_user(
+        mut self,
+        request: &UserCreateRequest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_USER_ACCOUNT_V1)?;
+        let mut frame = Frame::new(FrameKind::UserCreate, request.encode()?);
+        let write_result = write_frame(&mut self.stream, &frame);
+        frame.payload.fill(0);
+        write_result?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::Pong if response.payload.is_empty() => Ok(()),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid user-creation response".into()),
+        }
     }
 
     pub fn run(

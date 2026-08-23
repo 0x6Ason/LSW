@@ -26,6 +26,7 @@ use supervisor::Supervisor;
 const MAX_REQUEST_BYTES: u64 = 4096;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(30);
 
 fn main() -> ExitCode {
     match run() {
@@ -54,9 +55,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("lswd listening on {}", socket_path.display());
 
     let mut supervisor = Supervisor::new(store, HostCapabilities::detect());
+    let idle_exit = daemon_idle_exit()?;
+    let mut last_request = std::time::Instant::now();
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                last_request = std::time::Instant::now();
                 stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
                 stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
                 if let Err(error) = handle_connection(stream, &mut supervisor) {
@@ -65,6 +69,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 supervisor.poll();
+                if !supervisor.has_active_work() && last_request.elapsed() >= idle_exit {
+                    println!("lswd exiting after {} idle seconds", idle_exit.as_secs());
+                    return Ok(());
+                }
                 thread::sleep(POLL_INTERVAL);
             }
             Err(error) => eprintln!("lswd: accept failed: {error}"),
@@ -168,7 +176,9 @@ fn dispatch(
         ["PING"] => Ok(vec![
             "PONG".to_owned(),
             format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
-            "FEATURES=suspend,resume".to_owned(),
+            "FEATURES=suspend,resume,hibernate,balloon,idle-exit".to_owned(),
+            format!("PID={}", std::process::id()),
+            format!("RSS_KIB={}", current_rss_kib().unwrap_or(0)),
         ]),
         ["LIST"] => Ok(supervisor
             .store()
@@ -193,11 +203,16 @@ fn dispatch(
         ["STATUS", name] => supervisor.status(name),
         ["SUSPEND", name] => supervisor.suspend(name),
         ["RESUME", name] => supervisor.resume(name),
+        ["HIBERNATE", name] => supervisor.hibernate(name),
+        ["ACTIVITY", name] => supervisor.activity(name),
+        ["BALLOON", name, memory_mib] => {
+            supervisor.balloon(name, memory_mib.parse().map_err(|_| "invalid balloon target")?)
+        }
         ["STOP", name, "graceful"] => supervisor.stop(name, false),
         ["STOP", name, "force"] => supervisor.stop(name, true),
         [] => Err("empty request".into()),
         _ => Err(
-            "unknown request; expected PING, LIST, SHOW, PLAN, START, STATUS, SUSPEND, RESUME, or STOP"
+            "unknown request; expected PING, LIST, SHOW, PLAN, START, STATUS, SUSPEND, RESUME, HIBERNATE, ACTIVITY, BALLOON, or STOP"
                 .into(),
         ),
     }
@@ -259,6 +274,33 @@ fn socket_path(store: &StateStore) -> PathBuf {
     store.root().join("run/lswd.sock")
 }
 
+fn daemon_idle_exit() -> Result<Duration, Box<dyn std::error::Error>> {
+    let seconds = match env::var("LSW_DAEMON_IDLE_SECONDS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|_| "LSW_DAEMON_IDLE_SECONDS must be an integer")?,
+        Err(env::VarError::NotPresent) => return Ok(DEFAULT_IDLE_EXIT),
+        Err(error) => return Err(error.into()),
+    };
+    if !(1..=3600).contains(&seconds) {
+        return Err("LSW_DAEMON_IDLE_SECONDS must be between 1 and 3600".into());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn current_rss_kib() -> Option<u64> {
+    fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("VmRSS:")?
+                .split_ascii_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,14 +314,18 @@ mod tests {
 
     #[test]
     fn ping_protocol_is_versioned() {
+        let response = dispatch("PING", &mut supervisor()).expect("ping should work");
+        assert_eq!(response.len(), 5);
+        assert_eq!(response[0], "PONG");
+        assert_eq!(response[1], format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"));
         assert_eq!(
-            dispatch("PING", &mut supervisor()).expect("ping should work"),
-            vec![
-                "PONG".to_owned(),
-                format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
-                "FEATURES=suspend,resume".to_owned()
-            ]
+            response[2],
+            "FEATURES=suspend,resume,hibernate,balloon,idle-exit"
         );
+        assert_eq!(response[3], format!("PID={}", std::process::id()));
+        assert!(response[4]
+            .strip_prefix("RSS_KIB=")
+            .is_some_and(|value| value.parse::<u64>().is_ok()));
     }
 
     #[test]

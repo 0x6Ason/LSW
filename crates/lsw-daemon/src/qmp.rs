@@ -56,6 +56,13 @@ impl QmpClient {
         Ok(())
     }
 
+    pub fn balloon(&mut self, target_bytes: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let request =
+            format!("{{\"execute\":\"balloon\",\"arguments\":{{\"value\":{target_bytes}}}}}");
+        self.execute_document(&request)?;
+        Ok(())
+    }
+
     pub fn quit(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(self.writer, "{{\"execute\":\"quit\"}}")?;
         self.writer.flush()?;
@@ -74,7 +81,14 @@ impl QmpClient {
         {
             return Err("invalid QMP command name".into());
         }
-        writeln!(self.writer, "{{\"execute\":\"{command}\"}}")?;
+        self.execute_document(&format!("{{\"execute\":\"{command}\"}}"))
+    }
+
+    fn execute_document(&mut self, document: &str) -> Result<String, Box<dyn std::error::Error>> {
+        if document.contains(['\r', '\n']) || document.len() > 4096 {
+            return Err("invalid QMP request document".into());
+        }
+        writeln!(self.writer, "{document}")?;
         self.writer.flush()?;
         self.read_response()
     }
@@ -219,10 +233,19 @@ mod tests {
                 assert!(command.contains(&format!("\"execute\":\"{expected}\"")));
                 writeln!(server, "{{\"return\":{{}}}}").expect("lifecycle response should be sent");
             }
+            command.clear();
+            reader
+                .read_line(&mut command)
+                .expect("balloon command should be read");
+            assert!(command.contains("\"execute\":\"balloon\""));
+            assert!(command.contains("\"value\":1073741824"));
+            writeln!(server, "{{\"return\":{{}}}}").expect("balloon response should be sent");
         });
         let mut qmp = QmpClient::from_stream(client).expect("QMP should negotiate");
         qmp.pause().expect("pause should succeed");
         qmp.resume().expect("resume should succeed");
+        qmp.balloon(1_073_741_824)
+            .expect("balloon command should succeed");
         server_thread.join().expect("server fixture should finish");
     }
 }

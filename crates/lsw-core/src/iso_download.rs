@@ -108,7 +108,7 @@ pub struct ResolvedWindowsIso {
     pub sku_id: String,
     /// Canonical Microsoft language label.
     pub language: String,
-    /// Selected media architecture; beta.6 requires `x64`.
+    /// Selected media architecture; beta.7 requires `x64`.
     pub architecture: String,
     /// Filename derived from the allowlisted CDN path.
     pub filename: String,

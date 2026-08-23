@@ -21,14 +21,17 @@ use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     encode_process_id, read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame,
     FrameKind, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
-    SessionOptions, SessionSignal, StartRequest, TerminalStartRequest, AGENT_GUEST_PORT,
-    AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
-    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
-    SESSION_CANCEL_EXIT_CODE,
+    SessionOptions, SessionSignal, StartRequest, TerminalStartRequest, UserCreateRequest,
+    AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1,
+    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
+    CAPABILITY_SESSION_SIGNAL_V1, SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
 use lsw_core::{
-    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_TERMINAL_RESIZE_V1, LICENSE_HELPER_GUEST_PORT,
+    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_POWER_HIBERNATE_V1,
+    CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1, CLONE_IDENTITY_MARKER_FILE,
+    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT,
+    USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,6 +42,10 @@ const DEFAULT_MAX_SESSIONS: usize = 32;
 const LICENSE_HELPER_PORT: u16 = LICENSE_HELPER_GUEST_PORT;
 #[cfg(windows)]
 const LICENSE_HELPER_SERVICE: &str = "LSWLicenseHelper";
+#[cfg(windows)]
+const USER_HELPER_PORT: u16 = USER_HELPER_GUEST_PORT;
+#[cfg(windows)]
+const USER_HELPER_SERVICE: &str = "LSWUserHelper";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -124,36 +131,14 @@ fn run_license_client(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn st
         }
     }
 
-    let _ = Command::new("sc.exe")
-        .args(["start", LICENSE_HELPER_SERVICE])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut next_start_attempt = Instant::now() + Duration::from_secs(1);
-    let mut stream = loop {
-        match TcpStream::connect(("127.0.0.1", LICENSE_HELPER_PORT)) {
-            Ok(stream) => break stream,
-            Err(error) if Instant::now() < deadline => {
-                let _ = error;
-                if Instant::now() >= next_start_attempt {
-                    let _ = Command::new("sc.exe")
-                        .args(["start", LICENSE_HELPER_SERVICE])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                    next_start_attempt = Instant::now() + Duration::from_secs(1);
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
+    let mut stream =
+        match connect_windows_helper(LICENSE_HELPER_SERVICE, LICENSE_HELPER_PORT, "activation") {
+            Ok(stream) => stream,
             Err(error) => {
                 key.fill(0);
-                return Err(format!("could not reach the activation helper: {error}").into());
+                return Err(error);
             }
-        }
-    };
+        };
     stream.set_read_timeout(Some(Duration::from_secs(120)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     stream.write_all(token.as_bytes())?;
@@ -178,6 +163,40 @@ fn run_license_client(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn st
         Ok(())
     } else {
         Err("activation helper rejected the operation".into())
+    }
+}
+
+#[cfg(windows)]
+fn connect_windows_helper(
+    service: &str,
+    port: u16,
+    operation: &str,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let start = || {
+        let _ = Command::new("sc.exe")
+            .args(["start", service])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    };
+    start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_start_attempt = Instant::now() + Duration::from_secs(1);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => return Ok(stream),
+            Err(_) if Instant::now() < deadline => {
+                if Instant::now() >= next_start_attempt {
+                    start();
+                    next_start_attempt = Instant::now() + Duration::from_secs(1);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(format!("could not reach the {operation} helper: {error}").into())
+            }
+        }
     }
 }
 
@@ -273,6 +292,102 @@ fn read_bounded_line(
     Ok(String::from_utf8(bytes)?)
 }
 
+#[cfg(windows)]
+fn run_user_helper(
+    configuration: Configuration,
+    ready: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = read_token(&configuration.token_file)?;
+    let listener = TcpListener::bind(configuration.listen)?;
+    listener.set_nonblocking(true)?;
+    ready()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match listener.accept() {
+            Ok((mut stream, peer)) if peer.ip().is_loopback() => {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+                if handle_user_helper_connection(&mut stream, &token)? {
+                    return Ok(());
+                }
+            }
+            Ok((_, _)) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "Windows account helper timed out without an authenticated request".into(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_user_helper_connection(
+    stream: &mut TcpStream,
+    expected_token: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut hello_frame = read_frame(stream)?;
+    if hello_frame.kind != FrameKind::Hello {
+        send_error(stream, "the first account-helper frame must be HELLO")?;
+        return Ok(false);
+    }
+    let hello = ClientHello::decode(&hello_frame.payload);
+    hello_frame.payload.fill(0);
+    let hello = match hello {
+        Ok(hello) => hello,
+        Err(error) => {
+            send_error(stream, &error.to_string())?;
+            return Ok(false);
+        }
+    };
+    if hello.version != AGENT_PROTOCOL_VERSION
+        || !constant_time_token_eq(&hello.token, expected_token)
+    {
+        send_error(stream, "account-helper authentication failed")?;
+        return Ok(false);
+    }
+    let server_hello = ServerHello {
+        version: AGENT_PROTOCOL_VERSION,
+        capabilities: vec![CAPABILITY_USER_ACCOUNT_V1.to_owned()],
+    };
+    write_frame(
+        stream,
+        &Frame::new(FrameKind::HelloOk, server_hello.encode()?),
+    )?;
+
+    let mut frame = read_frame(stream)?;
+    if frame.kind != FrameKind::UserCreate {
+        frame.payload.fill(0);
+        send_error(stream, "account helper accepts only USER_CREATE")?;
+        return Ok(true);
+    }
+    let request = UserCreateRequest::decode(&frame.payload);
+    frame.payload.fill(0);
+    let mut request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(stream, &error.to_string())?;
+            return Ok(true);
+        }
+    };
+    let result = windows_user::create_local_user(
+        &request.user_name,
+        &request.password,
+        request.administrator,
+    );
+    request.password.fill(0);
+    match result {
+        Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+        Err(error) => send_error(stream, &error.to_string())?,
+    }
+    Ok(true)
+}
+
 #[cfg(any(windows, test))]
 fn valid_product_key(key: &[u8]) -> bool {
     key.len() == 29
@@ -290,7 +405,7 @@ fn perform_windows_license_operation(
     action: &str,
     key: &[u8],
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if !matches!(action, "status" | "online") && !(action == "activate" && valid_product_key(key)) {
+    if !(matches!(action, "status" | "online") || action == "activate" && valid_product_key(key)) {
         return Err("unsupported activation helper operation".into());
     }
     run_license_powershell(action, key)
@@ -366,6 +481,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Err
             return match configuration.service_kind {
                 ServiceKind::Agent => windows_service::run(configuration),
                 ServiceKind::LicenseHelper => windows_license_service::run(configuration),
+                ServiceKind::UserHelper => windows_user_service::run(configuration),
             };
         }
         #[cfg(not(windows))]
@@ -373,6 +489,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Err
             return Err(match configuration.service_kind {
                 ServiceKind::Agent => "--service is only supported on Windows",
                 ServiceKind::LicenseHelper => "--license-helper is only supported on Windows",
+                ServiceKind::UserHelper => "--user-helper is only supported on Windows",
             }
             .into());
         }
@@ -389,6 +506,8 @@ fn run_agent(
     shutdown: Option<&Receiver<()>>,
     ready: impl FnOnce(SocketAddr) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    apply_clone_identity(&configuration)?;
     let token = Arc::new(read_token(&configuration.token_file)?);
     let listener = TcpListener::bind(configuration.listen)?;
     let active_sessions = Arc::new(AtomicUsize::new(0));
@@ -420,6 +539,60 @@ fn run_agent(
             Err(error) => write_stderr(format_args!("lsw-agent: accept failed: {error}")),
         }
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn apply_clone_identity(configuration: &Configuration) -> Result<(), Box<dyn std::error::Error>> {
+    let mut identity = None;
+    for letter in b'D'..=b'Z' {
+        let root = PathBuf::from(format!("{}:\\lsw", char::from(letter)));
+        let marker = root.join(CLONE_IDENTITY_MARKER_FILE);
+        if fs::read_to_string(&marker)
+            .map(|value| value.trim() == "LSW-CLONE-IDENTITY")
+            .unwrap_or(false)
+            && identity.replace(root).is_some()
+        {
+            return Err("more than one LSW clone identity volume is attached".into());
+        }
+    }
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+
+    let name = fs::read_to_string(identity.join(CLONE_IDENTITY_NAME_FILE))?
+        .trim()
+        .to_owned();
+    let valid_name = (1..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && name
+            .as_bytes()
+            .first()
+            .zip(name.as_bytes().last())
+            .is_some_and(|(first, last)| {
+                first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric()
+            });
+    if !valid_name {
+        return Err("clone identity name is invalid".into());
+    }
+    let mut token = read_token(&identity.join(CLONE_IDENTITY_TOKEN_FILE))?.into_bytes();
+    let token_parent = configuration
+        .token_file
+        .parent()
+        .ok_or("configured token path has no parent directory")?;
+    if !token_parent.is_dir() {
+        return Err("configured token parent is not a directory".into());
+    }
+    token.push(b'\n');
+    let token_result = windows_path::replace_file(&configuration.token_file, &token);
+    token.fill(0);
+    token_result?;
+    windows_path::replace_file(
+        &token_parent.join("instance.name"),
+        format!("{name}\n").as_bytes(),
+    )?;
     Ok(())
 }
 
@@ -656,7 +829,7 @@ fn handle_connection(
         write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
         return Ok(());
     }
-    let (request_frame, session_mode, environment, detached) = if request_frame.kind
+    let (mut request_frame, session_mode, environment, detached) = if request_frame.kind
         == FrameKind::SessionOptions
     {
         let options = match SessionOptions::decode(&request_frame.payload) {
@@ -754,6 +927,8 @@ fn handle_connection(
         }
         FrameKind::FilePut => receive_file(stream, &request_frame.payload),
         FrameKind::FileGet => send_file(stream, &request_frame.payload),
+        FrameKind::PowerHibernate => hibernate_guest(stream, &request_frame.payload),
+        FrameKind::UserCreate => create_user(stream, &mut request_frame.payload, expected_token),
         _ => {
             send_error(&mut stream, "unsupported request after HELLO")?;
             Err("client sent an unsupported request after authentication".into())
@@ -778,9 +953,125 @@ fn agent_capabilities() -> Vec<String> {
         let mut capabilities = capabilities;
         capabilities.push(CAPABILITY_CONPTY_V1.to_owned());
         capabilities.push(CAPABILITY_TERMINAL_RESIZE_V1.to_owned());
+        capabilities.push(CAPABILITY_POWER_HIBERNATE_V1.to_owned());
+        capabilities.push(CAPABILITY_USER_ACCOUNT_V1.to_owned());
         capabilities
     };
     capabilities
+}
+
+fn create_user(
+    mut stream: TcpStream,
+    payload: &mut [u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = UserCreateRequest::decode(payload);
+    payload.fill(0);
+    let mut request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_user_create(&request, expected_token);
+    #[cfg(not(windows))]
+    let result: Result<(), Box<dyn std::error::Error>> = {
+        let _ = expected_token;
+        Err("Windows user creation is unavailable on this platform".into())
+    };
+    request.password.fill(0);
+    if let Err(error) = result {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn forward_user_create(
+    request: &UserCreateRequest,
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_windows_helper(USER_HELPER_SERVICE, USER_HELPER_PORT, "account")?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token: expected_token.to_owned(),
+    };
+    write_frame(&mut stream, &Frame::new(FrameKind::Hello, hello.encode()?))?;
+    let response = read_frame(&mut stream)?;
+    if response.kind != FrameKind::HelloOk {
+        return Err("Windows account helper rejected authentication".into());
+    }
+    let hello = ServerHello::decode(&response.payload)?;
+    if hello.version != AGENT_PROTOCOL_VERSION
+        || !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_USER_ACCOUNT_V1)
+    {
+        return Err("Windows account helper returned incompatible capabilities".into());
+    }
+    let mut frame = Frame::new(FrameKind::UserCreate, request.encode()?);
+    let write_result = write_frame(&mut stream, &frame);
+    frame.payload.fill(0);
+    write_result?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::Pong if response.payload.is_empty() => Ok(()),
+        FrameKind::Error => Err(format!(
+            "Windows account helper refused the request: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows account helper returned an invalid response".into()),
+    }
+}
+
+#[cfg(windows)]
+fn hibernate_guest(
+    mut stream: TcpStream,
+    payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !payload.is_empty() {
+        send_error(&mut stream, "POWER_HIBERNATE payload must be empty")?;
+        return Err("client sent an invalid hibernate request".into());
+    }
+    let powercfg = Command::new("powercfg.exe")
+        .args(["/hibernate", "on"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if !powercfg.success() {
+        send_error(&mut stream, "Windows could not enable hibernation")?;
+        return Err("powercfg could not enable hibernation".into());
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Command::new("shutdown.exe")
+        .arg("/h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn hibernate_guest(
+    mut stream: TcpStream,
+    payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !payload.is_empty() {
+        send_error(&mut stream, "POWER_HIBERNATE payload must be empty")?;
+    } else {
+        send_error(&mut stream, "hibernation is available only on Windows")?;
+    }
+    Err("client requested hibernation from a non-Windows agent".into())
 }
 
 fn run_process_request(
@@ -880,6 +1171,7 @@ fn receive_file(mut stream: TcpStream, payload: &[u8]) -> Result<(), Box<dyn std
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    ensure_no_link_boundary(parent)?;
     if !parent.is_dir() {
         send_error(&mut stream, "destination parent directory does not exist")?;
         return Err("destination parent directory does not exist".into());
@@ -952,6 +1244,7 @@ fn receive_file(mut stream: TcpStream, payload: &[u8]) -> Result<(), Box<dyn std
 fn send_file(mut stream: TcpStream, payload: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
     let request = FileGetRequest::decode(payload)?;
     let source = PathBuf::from(request.source);
+    ensure_no_link_boundary(&source)?;
     let metadata = match fs::symlink_metadata(&source) {
         Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
             metadata
@@ -987,6 +1280,27 @@ fn send_file(mut stream: TcpStream, payload: &[u8]) -> Result<(), Box<dyn std::e
         &mut stream,
         &Frame::new(FrameKind::FileDone, encode_file_length(sent)),
     )?;
+    Ok(())
+}
+
+fn ensure_no_link_boundary(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    windows_path::ensure_no_reparse_components(path)?;
+    #[cfg(not(windows))]
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "transfer path crosses a symbolic link: {}",
+                    ancestor.display()
+                )
+                .into())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(())
 }
 
@@ -1973,6 +2287,18 @@ mod windows_license_service;
 #[allow(unsafe_code)]
 mod windows_service;
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_path;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_user;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_user_service;
+
 struct Configuration {
     listen: SocketAddr,
     token_file: PathBuf,
@@ -1986,6 +2312,7 @@ struct Configuration {
 enum ServiceKind {
     Agent,
     LicenseHelper,
+    UserHelper,
 }
 
 impl Configuration {
@@ -2033,6 +2360,10 @@ impl Configuration {
                     service = true;
                     service_kind = ServiceKind::LicenseHelper;
                 }
+                "--user-helper" => {
+                    service = true;
+                    service_kind = ServiceKind::UserHelper;
+                }
                 "--help" | "-h" => {
                     println!(
                         "lsw-agent --token-file PATH [--listen IP:PORT] [--max-sessions N] [--once] [--service]\n\
@@ -2045,8 +2376,12 @@ impl Configuration {
             }
             index += 1;
         }
-        if service_kind == ServiceKind::LicenseHelper && !listen.ip().is_loopback() {
-            return Err("the license helper listener must use guest loopback".into());
+        if matches!(
+            service_kind,
+            ServiceKind::LicenseHelper | ServiceKind::UserHelper
+        ) && !listen.ip().is_loopback()
+        {
+            return Err("privileged helper listeners must use guest loopback".into());
         }
         Ok(Self {
             listen,

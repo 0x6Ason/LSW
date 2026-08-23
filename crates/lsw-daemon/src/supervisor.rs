@@ -3,15 +3,17 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
-    CommandInvocation, HostCapabilities, InstanceState, LaunchPhase, Provisioner, QemuPlanner,
-    StateStore, WindowsProfile,
+    read_frame, write_frame, ClientHello, CommandInvocation, Frame, FrameKind, HostCapabilities,
+    IdlePolicy, InstanceManifest, InstanceState, LaunchPhase, Provisioner, QemuPlanner,
+    ServerHello, StateStore, WindowsProfile, AGENT_PROTOCOL_VERSION, CAPABILITY_POWER_HIBERNATE_V1,
 };
 
 use crate::qmp::QmpClient;
@@ -19,6 +21,8 @@ use crate::qmp::QmpClient;
 const START_TIMEOUT: Duration = Duration::from_secs(8);
 const HELPER_TIMEOUT: Duration = Duration::from_secs(4);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(4);
+const POLICY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const AGENT_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ManagedVm {
     qemu: Child,
@@ -29,6 +33,7 @@ pub struct Supervisor {
     store: StateStore,
     capabilities: HostCapabilities,
     processes: BTreeMap<String, ManagedVm>,
+    last_policy_poll: Instant,
 }
 
 impl Supervisor {
@@ -37,6 +42,7 @@ impl Supervisor {
             store,
             capabilities,
             processes: BTreeMap::new(),
+            last_policy_poll: Instant::now(),
         }
     }
 
@@ -53,12 +59,18 @@ impl Supervisor {
                 .and_then(|managed| managed.qemu.try_wait().ok().flatten());
             if let Some(status) = exit {
                 let shutdown_requested = shutdown_was_requested(&self.store, &name);
+                let hibernate_requested = hibernate_was_requested(&self.store, &name);
                 if let Some(mut managed) = self.processes.remove(&name) {
                     stop_helpers(&mut managed.helpers);
                     remove_shutdown_marker(&self.store, &name);
+                    remove_hibernate_marker(&self.store, &name);
                     cleanup_stopped_runtime_artifacts(&self.store, &name);
                     self.remove_ephemeral_overlay(&name);
-                    let next = state_after_qemu_exit(shutdown_requested, status.success());
+                    let next = state_after_qemu_exit(
+                        shutdown_requested,
+                        hibernate_requested,
+                        status.success(),
+                    );
                     if let Err(error) = self.set_state(&name, next) {
                         eprintln!("lswd: could not update {name:?} after QEMU exit: {error}");
                     }
@@ -80,6 +92,7 @@ impl Supervisor {
                     stop_helpers(&mut managed.helpers);
                 }
                 remove_shutdown_marker(&self.store, &name);
+                remove_hibernate_marker(&self.store, &name);
                 cleanup_stopped_runtime_artifacts(&self.store, &name);
                 self.remove_ephemeral_overlay(&name);
                 let next = if shutdown_requested {
@@ -92,6 +105,26 @@ impl Supervisor {
                 }
             }
         }
+        if self.last_policy_poll.elapsed() >= POLICY_POLL_INTERVAL {
+            self.last_policy_poll = Instant::now();
+            if let Err(error) = self.apply_idle_policies() {
+                eprintln!("lswd: idle policy failed: {error}");
+            }
+        }
+    }
+
+    pub fn has_active_work(&self) -> bool {
+        !self.processes.is_empty()
+            || self.store.list().is_ok_and(|manifests| {
+                manifests.into_iter().any(|manifest| {
+                    matches!(
+                        manifest.state,
+                        InstanceState::Installing
+                            | InstanceState::Running
+                            | InstanceState::Suspended
+                    ) && self.qmp_status(&manifest.spec.name).is_ok()
+                })
+            })
     }
 
     pub fn start(
@@ -132,6 +165,7 @@ impl Supervisor {
         cleanup_stopped_runtime_artifacts(&self.store, name);
         cleanup_runtime_sockets(&instance_dir)?;
         remove_shutdown_marker(&self.store, name);
+        remove_hibernate_marker(&self.store, name);
         if phase == LaunchPhase::Run && manifest.spec.profile == WindowsProfile::Ephemeral {
             self.prepare_ephemeral_overlay(&instance_dir, manifest.state)?;
         }
@@ -200,6 +234,8 @@ impl Supervisor {
                 LaunchPhase::Run => InstanceState::Running,
             },
         )?;
+        self.record_activity(name)?;
+        let _ = self.set_balloon_target(name, manifest.spec.memory_mib);
         Ok(vec![
             format!("instance {name} started in {phase} phase"),
             format!("QMP={}", instance_dir.join("run/qmp.sock").display()),
@@ -215,6 +251,9 @@ impl Supervisor {
         self.poll();
         let instance_dir = self.store.instance_dir(name)?;
         let manifest = self.store.load(name)?;
+        if manifest.state == InstanceState::Hibernated {
+            return Ok(vec![format!("instance {name} is hibernated")]);
+        }
         let qmp_path = instance_dir.join("run/qmp.sock");
 
         let mut requested_qmp_quit = false;
@@ -264,6 +303,7 @@ impl Supervisor {
         }
         self.set_state(name, InstanceState::Stopped)?;
         remove_shutdown_marker(&self.store, name);
+        remove_hibernate_marker(&self.store, name);
         cleanup_stopped_runtime_artifacts(&self.store, name);
         self.remove_ephemeral_overlay(name);
         Ok(vec![format!("instance {name} stopped")])
@@ -294,13 +334,17 @@ impl Supervisor {
                     InstanceState::Running | InstanceState::Installing | InstanceState::Suspended
                 ) {
                     let requested = shutdown_was_requested(&self.store, name);
-                    let state = if requested {
+                    let hibernated = hibernate_was_requested(&self.store, name);
+                    let state = if hibernated {
+                        InstanceState::Hibernated
+                    } else if requested {
                         InstanceState::Stopped
                     } else {
                         InstanceState::Failed
                     };
                     self.set_state(name, state)?;
                     remove_shutdown_marker(&self.store, name);
+                    remove_hibernate_marker(&self.store, name);
                     cleanup_stopped_runtime_artifacts(&self.store, name);
                     self.remove_ephemeral_overlay(name);
                     state
@@ -357,6 +401,9 @@ impl Supervisor {
     pub fn resume(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         self.poll();
         let manifest = self.store.load(name)?;
+        if manifest.state == InstanceState::Hibernated {
+            return self.start(name, LaunchPhase::Run);
+        }
         let qmp_path = self.store.instance_dir(name)?.join("run/qmp.sock");
         let mut qmp = QmpClient::connect(&qmp_path)?;
         let status = qmp.status()?;
@@ -380,7 +427,64 @@ impl Supervisor {
             .into());
         }
         self.set_state(name, InstanceState::Running)?;
+        self.record_activity(name)?;
+        let _ = self.set_balloon_target(name, manifest.spec.memory_mib);
         Ok(vec![format!("instance {name} resumed")])
+    }
+
+    pub fn hibernate(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        self.poll();
+        let mut manifest = self.store.load(name)?;
+        if manifest.state == InstanceState::Hibernated {
+            return Ok(vec![format!("instance {name} is already hibernated")]);
+        }
+        if manifest.state == InstanceState::Suspended {
+            self.resume(name)?;
+            manifest = self.store.load(name)?;
+        }
+        if manifest.state != InstanceState::Running {
+            return Err(format!(
+                "instance {name} cannot hibernate from state {}",
+                manifest.state
+            )
+            .into());
+        }
+        let instance_dir = self.store.instance_dir(name)?;
+        write_hibernate_marker(&instance_dir)?;
+        let token = self.store.read_agent_token(name)?;
+        if let Err(error) = request_guest_hibernate(&manifest, &token) {
+            remove_hibernate_marker(&self.store, name);
+            return Err(error);
+        }
+        Ok(vec![format!("Windows hibernation requested for {name}")])
+    }
+
+    pub fn activity(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let manifest = self.store.load(name)?;
+        self.record_activity(name)?;
+        if manifest.state == InstanceState::Running {
+            let _ = self.set_balloon_target(name, manifest.spec.memory_mib);
+        }
+        Ok(vec![format!("activity recorded for {name}")])
+    }
+
+    pub fn balloon(
+        &mut self,
+        name: &str,
+        memory_mib: u32,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let manifest = self.store.load(name)?;
+        if !(manifest.memory_min_mib..=manifest.spec.memory_mib).contains(&memory_mib) {
+            return Err(format!(
+                "balloon target must be between {} and {} MiB",
+                manifest.memory_min_mib, manifest.spec.memory_mib
+            )
+            .into());
+        }
+        self.set_balloon_target(name, memory_mib)?;
+        Ok(vec![format!(
+            "instance {name} balloon target is {memory_mib} MiB"
+        )])
     }
 
     pub fn qmp_status(&self, name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -418,7 +522,71 @@ impl Supervisor {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut manifest = self.store.load(name)?;
         manifest.state = state;
+        manifest.state_changed_unix_seconds = unix_seconds();
         self.store.update(&manifest)?;
+        Ok(())
+    }
+
+    fn record_activity(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.store.instance_dir(name)?.join("run/last-activity");
+        write_private_marker(&path, &unix_seconds().to_string())
+    }
+
+    fn set_balloon_target(
+        &self,
+        name: &str,
+        memory_mib: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let instance_dir = self.store.instance_dir(name)?;
+        let marker = instance_dir.join("run/balloon.target");
+        if fs::read_to_string(&marker)
+            .map(|value| value.trim() == memory_mib.to_string())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let bytes = u64::from(memory_mib)
+            .checked_mul(1024 * 1024)
+            .ok_or("balloon target overflowed")?;
+        QmpClient::connect(&instance_dir.join("run/qmp.sock"))?.balloon(bytes)?;
+        write_private_marker(&marker, &memory_mib.to_string())
+    }
+
+    fn apply_idle_policies(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let now = unix_seconds();
+        let memory_pressure = host_memory_pressure();
+        for manifest in self.store.list()? {
+            if manifest.idle_policy == IdlePolicy::Off {
+                continue;
+            }
+            let activity = read_activity(&self.store, &manifest.spec.name)
+                .unwrap_or(manifest.state_changed_unix_seconds);
+            let idle_seconds = now.saturating_sub(activity);
+            match manifest.state {
+                InstanceState::Running => {
+                    if memory_pressure
+                        || (manifest.idle_timeout_seconds > 0
+                            && idle_seconds >= manifest.idle_timeout_seconds / 2)
+                    {
+                        let _ =
+                            self.set_balloon_target(&manifest.spec.name, manifest.memory_min_mib);
+                    }
+                    if manifest.idle_timeout_seconds > 0
+                        && idle_seconds >= manifest.idle_timeout_seconds
+                    {
+                        let _ = self.suspend(&manifest.spec.name);
+                    }
+                }
+                InstanceState::Suspended
+                    if manifest.hibernate_timeout_seconds > 0
+                        && now.saturating_sub(manifest.state_changed_unix_seconds)
+                            >= manifest.hibernate_timeout_seconds =>
+                {
+                    let _ = self.hibernate(&manifest.spec.name);
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -531,6 +699,23 @@ fn write_shutdown_marker(instance_dir: &Path) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn write_hibernate_marker(instance_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    write_private_marker(&instance_dir.join("run/hibernate.requested"), "requested")
+}
+
+fn write_private_marker(path: &Path, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    use std::io::Write;
+    writeln!(file, "{value}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn shutdown_was_requested(store: &StateStore, name: &str) -> bool {
     let Ok(path) = store
         .instance_dir(name)
@@ -544,8 +729,31 @@ fn shutdown_was_requested(store: &StateStore, name: &str) -> bool {
     )
 }
 
-fn state_after_qemu_exit(shutdown_requested: bool, exit_success: bool) -> InstanceState {
-    if shutdown_requested || exit_success {
+fn hibernate_was_requested(store: &StateStore, name: &str) -> bool {
+    requested_marker_exists(store, name, "hibernate.requested")
+}
+
+fn requested_marker_exists(store: &StateStore, name: &str, file: &str) -> bool {
+    let Ok(path) = store
+        .instance_dir(name)
+        .map(|directory| directory.join("run").join(file))
+    else {
+        return false;
+    };
+    matches!(
+        fs::symlink_metadata(path),
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+    )
+}
+
+fn state_after_qemu_exit(
+    shutdown_requested: bool,
+    hibernate_requested: bool,
+    exit_success: bool,
+) -> InstanceState {
+    if hibernate_requested {
+        InstanceState::Hibernated
+    } else if shutdown_requested || exit_success {
         InstanceState::Stopped
     } else {
         InstanceState::Failed
@@ -553,9 +761,17 @@ fn state_after_qemu_exit(shutdown_requested: bool, exit_success: bool) -> Instan
 }
 
 fn remove_shutdown_marker(store: &StateStore, name: &str) {
+    remove_requested_marker(store, name, "shutdown.requested");
+}
+
+fn remove_hibernate_marker(store: &StateStore, name: &str) {
+    remove_requested_marker(store, name, "hibernate.requested");
+}
+
+fn remove_requested_marker(store: &StateStore, name: &str, file: &str) {
     let Ok(path) = store
         .instance_dir(name)
-        .map(|directory| directory.join("run/shutdown.requested"))
+        .map(|directory| directory.join("run").join(file))
     else {
         return;
     };
@@ -564,6 +780,78 @@ fn remove_shutdown_marker(store: &StateStore, name: &str) {
             let _ = fs::remove_file(path);
         }
         _ => {}
+    }
+}
+
+fn read_activity(store: &StateStore, name: &str) -> Option<u64> {
+    let path = store.instance_dir(name).ok()?.join("run/last-activity");
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+fn host_memory_pressure() -> bool {
+    let Ok(meminfo) = fs::read_to_string("/proc/meminfo") else {
+        return false;
+    };
+    let value = |name: &str| -> Option<u64> {
+        meminfo.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?.trim();
+            value.split_ascii_whitespace().next()?.parse().ok()
+        })
+    };
+    match (value("MemAvailable:"), value("MemTotal:")) {
+        (Some(available), Some(total)) if total > 0 => available.saturating_mul(100) < total * 10,
+        _ => false,
+    }
+}
+
+fn request_guest_hibernate(
+    manifest: &InstanceManifest,
+    token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, manifest.control_port);
+    let mut stream = TcpStream::connect_timeout(&address.into(), AGENT_CONTROL_TIMEOUT)?;
+    stream.set_read_timeout(Some(AGENT_CONTROL_TIMEOUT))?;
+    stream.set_write_timeout(Some(AGENT_CONTROL_TIMEOUT))?;
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token: token.to_owned(),
+    };
+    write_frame(&mut stream, &Frame::new(FrameKind::Hello, hello.encode()?))?;
+    let response = read_frame(&mut stream)?;
+    if response.kind != FrameKind::HelloOk {
+        return Err("guest agent rejected the hibernate control connection".into());
+    }
+    let hello = ServerHello::decode(&response.payload)?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == CAPABILITY_POWER_HIBERNATE_V1)
+    {
+        return Err("guest agent does not support Windows hibernation".into());
+    }
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::PowerHibernate, Vec::new()),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::Pong if response.payload.is_empty() => Ok(()),
+        FrameKind::Error => Err(format!(
+            "guest agent refused hibernation: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("guest agent returned an invalid hibernate response".into()),
     }
 }
 
@@ -736,8 +1024,21 @@ mod tests {
 
     #[test]
     fn requested_shutdown_wins_qemu_exit_status() {
-        assert_eq!(state_after_qemu_exit(true, false), InstanceState::Stopped);
-        assert_eq!(state_after_qemu_exit(false, true), InstanceState::Stopped);
-        assert_eq!(state_after_qemu_exit(false, false), InstanceState::Failed);
+        assert_eq!(
+            state_after_qemu_exit(true, false, false),
+            InstanceState::Stopped
+        );
+        assert_eq!(
+            state_after_qemu_exit(false, false, true),
+            InstanceState::Stopped
+        );
+        assert_eq!(
+            state_after_qemu_exit(false, false, false),
+            InstanceState::Failed
+        );
+        assert_eq!(
+            state_after_qemu_exit(false, true, false),
+            InstanceState::Hibernated
+        );
     }
 }

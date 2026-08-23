@@ -13,7 +13,9 @@ mod installation;
 mod license;
 mod path_translation;
 mod progress;
+mod shares;
 mod transfer;
+mod user_setup;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -31,13 +33,14 @@ use arguments::{
     next_value, parse_number, resolve_port_forwards, CreateArguments, InstallArguments,
 };
 use daemon_client::DaemonClient;
-use installation::install_instance;
+use installation::{find_windows_agent, install_instance};
 use license::{license, show_activation_notice_once};
 use lsw_core::{
-    CustomizationPlan, HostCapabilities, InstallSeedBuilder, InstallSeedOptions, InstanceManifest,
-    InstanceSpec, InstanceState, LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver,
-    PeImage, PeImportSymbol, ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner,
-    SessionKind, StartRequest, StateStore, VmAccelerator, WindowsProfile,
+    CustomizationPlan, HostCapabilities, IdlePolicy, ImageManager, InstallSeedBuilder,
+    InstallSeedOptions, InstanceManifest, InstanceSpec, InstanceState, LaunchPhase, LswError,
+    MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage, PeImportSymbol, ProcessEnvironment,
+    Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest, StateStore, VmAccelerator,
+    WindowsProfile,
 };
 
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(90);
@@ -95,6 +98,8 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
     let store = StateStore::new(state_root()?);
     match command {
         "doctor" => doctor(&store, remaining)?,
+        "image" => image_command(&store, remaining)?,
+        "clone" => clone_instance(&store, remaining)?,
         "bench" => bench(&store, remaining)?,
         "create" => create(&store, remaining)?,
         "prepare" => prepare(&store, remaining)?,
@@ -112,10 +117,16 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "daemon" => daemon(&store, remaining)?,
         "install" => install_instance(&store, remaining)?,
         "license" => license(&store, remaining)?,
+        "user" => user_command(&store, remaining)?,
+        "share" => shares::command(&store, remaining)?,
         "start" => start_instance(&store, remaining, LaunchPhase::Run)?,
         "status" => status(&store, remaining)?,
         "suspend" => suspend(&store, remaining)?,
         "resume" => resume(&store, remaining)?,
+        "hibernate" => hibernate(&store, remaining)?,
+        "memory" => memory_command(&store, remaining)?,
+        "trim" => trim_instance(&store, remaining)?,
+        "compact" => compact_instance(&store, remaining)?,
         "stop" => stop(&store, remaining)?,
         "shell" => return shell(&store, remaining),
         "exec" => return guest_command(&store, remaining, SessionKind::Exec),
@@ -128,6 +139,132 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         }
     }
     Ok(0)
+}
+
+fn user_command(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.first().and_then(|value| value.to_str()) {
+        Some("setup") => user_setup::command(store, &arguments[1..]),
+        _ => Err(
+            "usage: lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]"
+                .into(),
+        ),
+    }
+}
+
+fn image_command(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let action = arguments
+        .first()
+        .and_then(|value| value.to_str())
+        .ok_or("usage: lsw image <list|seal NAME|verify KEY>")?;
+    let capabilities = HostCapabilities::detect();
+    let manager = ImageManager::new(store, &capabilities);
+    match action {
+        "list" if arguments.len() == 1 => {
+            let images = manager.list()?;
+            if images.is_empty() {
+                println!("No sealed base images.");
+            } else {
+                println!("KEY\tDISK");
+                for image in images {
+                    println!("{}\t{}", image.key, image.disk.display());
+                }
+            }
+        }
+        "seal" if arguments.len() == 2 => {
+            let name = arguments[1]
+                .to_str()
+                .ok_or("instance name must be valid UTF-8")?;
+            let agent = find_windows_agent().ok_or(
+                "lsw-agent.exe was not found; set LSW_WINDOWS_AGENT before sealing an image",
+            )?;
+            let manifest = store.load(name)?;
+            if !matches!(
+                manifest.state,
+                InstanceState::Stopped | InstanceState::Hibernated
+            ) {
+                return Err(format!(
+                    "instance {name:?} must be stopped or hibernated before sealing"
+                )
+                .into());
+            }
+            if manifest.default_user.is_some() {
+                return Err("seal a pristine instance before permanent user registration".into());
+            }
+            println!("Retiring the installed instance token before capturing the shared base...");
+            manager.rotate_instance_identity(name)?;
+            connect_agent(store, name)?.probe()?;
+            request_graceful_stop_and_wait(store, name, Duration::from_secs(5 * 60))?;
+            let mut manifest = store.load(name)?;
+            let image = manager.seal(&manifest, &agent)?;
+            manager.rotate_instance_identity(name)?;
+            manifest.base_image_key = Some(image.key.clone());
+            store.update(&manifest)?;
+            println!("Sealed base image for {name:?}.");
+            println!("IMAGE={}", image.key);
+            println!("DISK={}", image.disk.display());
+        }
+        "verify" if arguments.len() == 2 => {
+            let key = arguments[1]
+                .to_str()
+                .ok_or("sealed image key must be valid UTF-8")?;
+            let image = manager.verify(key)?;
+            println!("Verified sealed image {}.", image.key);
+            println!("BASE_SHA256={}", image.base_disk_sha256);
+        }
+        _ => return Err("usage: lsw image <list|seal NAME|verify KEY>".into()),
+    }
+    Ok(())
+}
+
+fn request_graceful_stop_and_wait(
+    store: &StateStore,
+    name: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    DaemonClient::new(store).request_checked(&format!("STOP {name} graceful"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match store.load(name)?.state {
+            InstanceState::Stopped => return Ok(()),
+            InstanceState::Failed => {
+                return Err(
+                    format!("instance {name:?} failed while preparing its sealed image").into(),
+                )
+            }
+            _ if Instant::now() >= deadline => {
+                return Err(format!("timed out waiting for {name:?} to stop before sealing").into())
+            }
+            _ => thread::sleep(Duration::from_millis(250)),
+        }
+    }
+}
+
+fn clone_instance(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (source, target) = match arguments {
+        [source, target] => (
+            source.to_str().ok_or("source name must be valid UTF-8")?,
+            target.to_str().ok_or("target name must be valid UTF-8")?,
+        ),
+        _ => return Err("usage: lsw clone SOURCE NAME".into()),
+    };
+    let capabilities = HostCapabilities::detect();
+    let directory = ImageManager::new(store, &capabilities).clone_instance(source, target)?;
+    if store.default_name()?.is_none() {
+        store.set_default(target)?;
+    }
+    println!("Created linked clone {target:?} from {source:?}.");
+    println!("INSTANCE={}", directory.display());
+    println!("Run `lsw start {target}` to boot it with its private identity.");
+    Ok(())
 }
 
 fn seed(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
@@ -196,14 +333,14 @@ fn doctor(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
         let missing = capabilities.missing_for_install_workflow();
         let install_aria2 = capabilities.aria2c.is_none();
         if missing.is_empty() && !install_aria2 {
-            println!("All beta.6 host dependencies are already installed.\n");
+            println!("All beta.7 host dependencies are already installed.\n");
         } else {
             let mut requested = missing;
             if install_aria2 {
                 requested.push("aria2c (optional download accelerator)");
             }
             println!(
-                "Installing beta.6 host dependencies: {}",
+                "Installing beta.7 host dependencies: {}",
                 requested.join(", ")
             );
             fix_host_dependencies(false)?;
@@ -712,13 +849,34 @@ fn daemon(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
         .and_then(|value| value.to_str())
         .unwrap_or("status");
     if arguments.len() > 1 {
-        return Err("usage: lsw daemon [start|status]".into());
+        return Err("usage: lsw daemon [enable|disable|start|status|diagnose]".into());
     }
     let client = DaemonClient::new(store);
     match action {
         "start" => {
             client.ensure_running()?;
             println!("lswd is ready at {}", client.socket().display());
+        }
+        "enable" => {
+            run_systemctl_user(&["enable", "--now", "lswd.socket"])?;
+            println!("Enabled optional LSW socket activation for this user.");
+        }
+        "disable" => {
+            run_systemctl_user(&["disable", "--now", "lswd.socket", "lswd.service"])?;
+            println!("Disabled LSW background socket activation for this user.");
+        }
+        "diagnose" => {
+            print_systemd_state();
+            match client.request("PING") {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(error) => println!("DAEMON=unavailable ({error})"),
+            }
+            println!("Idle daemon RSS gate: below 30720 KiB.");
+            println!("With only lswd.socket waiting, lswd.service must be inactive.");
         }
         "status" => match client.request("PING") {
             Ok(lines) => {
@@ -734,9 +892,41 @@ fn daemon(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
                 );
             }
         },
-        _ => return Err("usage: lsw daemon [start|status]".into()),
+        _ => return Err("usage: lsw daemon [enable|disable|start|status|diagnose]".into()),
     }
     Ok(())
+}
+
+fn run_systemctl_user(arguments: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl --user {} failed with {status}",
+            arguments.join(" ")
+        )
+        .into())
+    }
+}
+
+fn print_systemd_state() {
+    for unit in ["lswd.socket", "lswd.service"] {
+        for property in ["is-enabled", "is-active"] {
+            let output = Command::new("systemctl")
+                .args(["--user", property, unit])
+                .output();
+            let value = output
+                .ok()
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unavailable".to_owned());
+            println!("SYSTEMD_{unit}_{property}={value}");
+        }
+    }
 }
 
 fn start_instance(
@@ -900,6 +1090,132 @@ fn resume(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
     for line in client.request_checked(&format!("RESUME {name}"))? {
         println!("{line}");
     }
+    Ok(())
+}
+
+fn hibernate(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = optional_name(arguments, "hibernate")?;
+    let name = resolve_name(store, requested)?;
+    let client = DaemonClient::new(store);
+    for line in client.request_checked(&format!("HIBERNATE {name}"))? {
+        println!("{line}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let manifest = store.load(&name)?;
+        if manifest.state == InstanceState::Hibernated {
+            println!("Instance {name:?} hibernated; QEMU is no longer resident.");
+            return Ok(());
+        }
+        if manifest.state == InstanceState::Failed {
+            return Err(format!("instance {name:?} failed while hibernating").into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {name:?} to hibernate").into());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn memory_command(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let action = arguments
+        .first()
+        .and_then(|value| value.to_str())
+        .ok_or("usage: lsw memory <reclaim|restore> [NAME]")?;
+    let requested = optional_name(&arguments[1..], "memory reclaim|restore")?;
+    let name = resolve_name(store, requested)?;
+    let manifest = store.load(&name)?;
+    let target = match action {
+        "reclaim" => manifest.memory_min_mib,
+        "restore" => manifest.spec.memory_mib,
+        _ => return Err("usage: lsw memory <reclaim|restore> [NAME]".into()),
+    };
+    for line in DaemonClient::new(store).request_checked(&format!("BALLOON {name} {target}"))? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn trim_instance(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = optional_name(arguments, "trim")?;
+    let name = resolve_name(store, requested)?;
+    let request = StartRequest {
+        kind: SessionKind::Exec,
+        argv: vec![
+            "powershell.exe".to_owned(),
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            "$ErrorActionPreference='Stop'; Optimize-Volume -DriveLetter C -ReTrim -Verbose"
+                .to_owned(),
+        ],
+        working_directory: None,
+    };
+    let result = connect_agent(store, &name)?.run_capture(&request, &[], 1024 * 1024)?;
+    if result.exit_code != 0 {
+        return Err(format!(
+            "Windows TRIM failed with exit code {}: {}",
+            result.exit_code,
+            String::from_utf8_lossy(&result.stderr).trim()
+        )
+        .into());
+    }
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+    println!("Guest TRIM completed for {name:?}.");
+    Ok(())
+}
+
+fn compact_instance(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = required_exact_name(arguments, "compact")?;
+    let manifest = store.load(name)?;
+    if !matches!(
+        manifest.state,
+        InstanceState::Stopped | InstanceState::Hibernated
+    ) {
+        return Err(
+            format!("instance {name:?} must be stopped or hibernated before compaction").into(),
+        );
+    }
+    let qemu_img = HostCapabilities::detect()
+        .qemu_img
+        .ok_or("qemu-img is required for compaction")?;
+    let instance_dir = store.instance_dir(name)?;
+    let disk = instance_dir.join("disk.qcow2");
+    let metadata = fs::symlink_metadata(&disk)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("{} must be a regular non-symlink file", disk.display()).into());
+    }
+    let temporary = instance_dir.join(format!("disk.compact-{}.qcow2", std::process::id()));
+    if temporary.exists() {
+        return Err(format!("refusing to replace {}", temporary.display()).into());
+    }
+    let mut command = Command::new(qemu_img);
+    command.args(["convert", "-p", "-O", "qcow2"]);
+    if let Some(key) = &manifest.base_image_key {
+        let base = fs::canonicalize(store.root().join("images").join(key).join("base.qcow2"))?;
+        command.args(["-F", "qcow2", "-B"]).arg(base);
+    }
+    let status = command.arg(&disk).arg(&temporary).status()?;
+    if !status.success() {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("qemu-img compaction failed with {status}").into());
+    }
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = fs::rename(&temporary, &disk) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    println!("Compacted storage for {name:?}. Run `lsw trim {name}` before the next compaction for best results.");
     Ok(())
 }
 
@@ -1067,6 +1383,7 @@ fn connect_agent(
     let mut manifest = store.load(name)?;
     let token = store.read_agent_token(name)?;
     if let Ok(client) = AgentClient::connect(&manifest, &token) {
+        let _ = DaemonClient::new(store).request_checked(&format!("ACTIVITY {name}"));
         return Ok(client);
     }
 
@@ -1076,7 +1393,7 @@ fn connect_agent(
                 format!("instance {name:?} is not installed; run `lsw install {name}`").into(),
             )
         }
-        InstanceState::Stopped | InstanceState::Failed => {
+        InstanceState::Stopped | InstanceState::Hibernated | InstanceState::Failed => {
             println!("Starting {name:?}...");
             let daemon = DaemonClient::new(store);
             for line in daemon.request_checked(&format!("START {name} run"))? {
@@ -1268,11 +1585,17 @@ fn config(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
             println!("profile={}", manifest.spec.profile);
             println!("cpus={}", manifest.spec.cpus);
             println!("memory.max={}", format_memory(manifest.spec.memory_mib));
+            println!("memory.min={}", format_memory(manifest.memory_min_mib));
             println!("disk.max={}GiB", manifest.spec.disk_gib);
             println!("network={}", manifest.spec.network);
             println!(
                 "idle-timeout={}",
                 format_duration(manifest.idle_timeout_seconds)
+            );
+            println!("idle-policy={}", manifest.idle_policy);
+            println!(
+                "hibernate-timeout={}",
+                format_duration(manifest.hibernate_timeout_seconds)
             );
         }
         "set" => {
@@ -1303,12 +1626,17 @@ fn config(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
                     .ok_or("configuration assignments must use KEY=VALUE syntax")?;
                 match key {
                     "memory.max" => manifest.spec.memory_mib = parse_memory_mib(value)?,
+                    "memory.min" => manifest.memory_min_mib = parse_memory_mib(value)?,
                     "idle-timeout" => {
                         manifest.idle_timeout_seconds = parse_duration_seconds(value)?
                     }
+                    "hibernate-timeout" => {
+                        manifest.hibernate_timeout_seconds = parse_duration_seconds(value)?
+                    }
+                    "idle-policy" => manifest.idle_policy = value.parse::<IdlePolicy>()?,
                     _ => {
                         return Err(format!(
-                            "unknown configuration key {key:?}; supported keys are memory.max and idle-timeout"
+                            "unknown configuration key {key:?}; supported keys are memory.max, memory.min, idle-timeout, hibernate-timeout, and idle-policy"
                         )
                         .into())
                     }
@@ -1317,9 +1645,15 @@ fn config(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
             store.update(&manifest)?;
             println!("Updated configuration for {name:?}.");
             println!("memory.max={}", format_memory(manifest.spec.memory_mib));
+            println!("memory.min={}", format_memory(manifest.memory_min_mib));
             println!(
                 "idle-timeout={}",
                 format_duration(manifest.idle_timeout_seconds)
+            );
+            println!("idle-policy={}", manifest.idle_policy);
+            println!(
+                "hibernate-timeout={}",
+                format_duration(manifest.hibernate_timeout_seconds)
             );
         }
         _ => {
@@ -1808,7 +2142,7 @@ fn bench(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::
         );
         println!("{output}");
     } else {
-        println!("LSW beta.6 performance baseline");
+        println!("LSW beta.7 performance baseline");
         println!(
             "  accelerator: {}",
             QemuBackend::select(&capabilities).accelerator()
@@ -1882,11 +2216,26 @@ fn show(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
     );
     println!("CPUs:                 {}", manifest.spec.cpus);
     println!("memory:               {} MiB", manifest.spec.memory_mib);
+    println!("minimum memory:       {} MiB", manifest.memory_min_mib);
     println!("disk:                 {} GiB", manifest.spec.disk_gib);
     println!(
         "idle timeout:         {}",
         format_duration(manifest.idle_timeout_seconds)
     );
+    println!("idle policy:          {}", manifest.idle_policy);
+    println!(
+        "hibernate timeout:    {}",
+        format_duration(manifest.hibernate_timeout_seconds)
+    );
+    println!(
+        "default Windows user: {}",
+        manifest.default_user.as_deref().unwrap_or("not registered")
+    );
+    println!(
+        "sealed base image:    {}",
+        manifest.base_image_key.as_deref().unwrap_or("none")
+    );
+    println!("folder shares:        {}", manifest.folder_shares.len());
     println!("network:              {}", manifest.spec.network);
     if manifest.spec.port_forwards.is_empty() {
         println!("published TCP ports:  none");
@@ -2038,7 +2387,8 @@ fn print_help() {
         "  lsw install NAME --iso PATH --edition EDITION [--profile PROFILE] [--accept-windows-license] [OPTIONS]\n",
         "  lsw install [NAME] [--locale LOCALE] [--edition EDITION] [--agent PATH]\n",
         "              [--unattended-index N] [--without-agent] [--viewer]\n",
-        "              [--accept-windows-license]\n",
+        "              [--accept-windows-license] [--defer-user-setup]\n",
+        "  lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]\n",
         "  lsw license status [NAME]\n",
         "  lsw license activate [NAME] [--key-stdin | --online]\n",
         "  lsw license open [NAME]\n",
@@ -2047,6 +2397,10 @@ fn print_help() {
         "  lsw status [NAME]\n",
         "  lsw suspend [NAME]\n",
         "  lsw resume [NAME]\n",
+        "  lsw hibernate [NAME]\n",
+        "  lsw memory <reclaim|restore> [NAME]\n",
+        "  lsw trim [NAME]\n",
+        "  lsw compact NAME\n",
         "  lsw stop [NAME] [--force]\n",
         "  lsw shell [NAME]\n",
         "  lsw exec [NAME] [--cwd PATH] [-e KEY=VALUE] -- COMMAND [ARG ...]\n",
@@ -2054,7 +2408,11 @@ fn print_help() {
         "  lsw push [NAME] [--recursive] HOST_PATH WINDOWS_PATH\n",
         "  lsw pull [NAME] [--recursive] WINDOWS_PATH HOST_PATH\n",
         "  lsw sync [NAME] [--watch] HOST_DIRECTORY WINDOWS_DIRECTORY\n",
-        "  lsw daemon [start|status]\n",
+        "  lsw share add [NAME] SHARE HOST_PATH GUEST_PATH (--read-only|--read-write)\n",
+        "  lsw share <list|remove|sync|watch> [NAME] [SHARE]\n",
+        "  lsw image <list|seal NAME|verify KEY>\n",
+        "  lsw clone SOURCE NAME\n",
+        "  lsw daemon <enable|disable|start|status|diagnose>\n",
         "  lsw                    enter the default instance shell\n\n",
         "CREATE OPTIONS:\n",
         "  --profile PROFILE    vanilla or slim (default: slim)\n",
@@ -2074,6 +2432,7 @@ fn print_help() {
         "  --edition EDITION   select an edition by its ISO name or a friendly alias such as pro\n",
         "  --viewer            open the optional installation viewer (headless by default)\n",
         "  --no-viewer         keep headless installation explicit (compatibility option)\n",
+        "  --defer-user-setup  skip permanent desktop-user registration for later automation\n",
         "  interactive new installs ask [y/N]; automation must pass --accept-windows-license\n",
         "  the flag accepts Windows terms only; LSW remains GPL-3.0-or-later\n\n",
         "SEED SAFETY:\n",

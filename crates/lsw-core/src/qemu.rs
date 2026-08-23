@@ -167,7 +167,7 @@ impl QemuPlanner {
             &mut arguments,
             "-drive",
             format!(
-                "file={},if=none,id=system,format=qcow2,discard=unmap",
+                "file={},if=none,id=system,format=qcow2,discard=unmap,detect-zeroes=unmap",
                 qemu_path(&disk)
             ),
         );
@@ -220,6 +220,7 @@ impl QemuPlanner {
         push_pair(&mut arguments, "-device", "usb-kbd");
         push_pair(&mut arguments, "-device", "usb-tablet");
         push_pair(&mut arguments, "-device", "virtio-rng-pci");
+        push_pair(&mut arguments, "-device", "virtio-balloon-pci,id=balloon0");
         // -nodefaults removes QEMU's implicit display adapter. Standard VGA is
         // available to Windows Setup without an additional guest driver.
         push_pair(&mut arguments, "-device", "VGA");
@@ -272,6 +273,40 @@ impl QemuPlanner {
             (LaunchPhase::Install, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
             (LaunchPhase::Install, Err(error)) => return Err(error.into()),
             (LaunchPhase::Run, _) => {}
+        }
+
+        let identity_seed = instance_dir.join("identity-seed");
+        match (phase, fs::symlink_metadata(&identity_seed)) {
+            (LaunchPhase::Run, Ok(metadata))
+                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+            {
+                push_pair(
+                    &mut arguments,
+                    "-drive",
+                    format!(
+                        "file=fat:ro:{},format=raw,if=none,id=lsw-identity,snapshot=on",
+                        qemu_path(&identity_seed)
+                    ),
+                );
+                push_pair(
+                    &mut arguments,
+                    "-device",
+                    "usb-storage,drive=lsw-identity,removable=on",
+                );
+                notes.push(
+                    "the linked clone identity is attached read-only and consumed before the agent listens"
+                        .to_owned(),
+                );
+            }
+            (LaunchPhase::Run, Ok(_)) => {
+                return Err(crate::LswError::InvalidValue {
+                    field: "clone identity seed",
+                    reason: format!("{} must be a real directory", identity_seed.display()),
+                })
+            }
+            (_, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
+            (_, Err(error)) => return Err(error.into()),
+            (LaunchPhase::Install, Ok(_)) => {}
         }
 
         if security.vtpm {
@@ -469,6 +504,8 @@ mod tests {
             .expect("plan should be built");
         let command = plan.display_command();
         assert!(command.contains("nvme,drive=system"));
+        assert!(command.contains("discard=unmap,detect-zeroes=unmap"));
+        assert!(command.contains("virtio-balloon-pci,id=balloon0"));
         assert!(command.contains("e1000e,netdev=net0"));
         assert!(command.contains("-device VGA"));
         assert!(command.contains("-boot once=d,menu=on"));

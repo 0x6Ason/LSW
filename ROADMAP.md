@@ -24,10 +24,11 @@ unattended OOBE, the boot-time SCM agent, complete remote process semantics,
 recursive transfer and watch sync, dynamic ports, shell completion, and systemd
 user socket activation.
 
-## beta.7: fast, quiet background runtime and folder sharing
+## 1.0.0-beta.7: fast, quiet background runtime and folder sharing
 
-The next release makes an installed environment inexpensive to keep available
-and gives desktop work a safe file-sharing foundation.
+This release makes an installed environment inexpensive to keep available and
+gives desktop work a safe file-sharing foundation. Its tag is permitted only
+after the exact commit passes the expanded Windows/KVM gate.
 
 - Add prepared and sealed base images keyed by the exact ISO, profile, agent,
   firmware, and preparation identity; create instances as linked clones with
@@ -43,11 +44,11 @@ and gives desktop work a safe file-sharing foundation.
   running -> pause -> hibernate policy, automatic resume, guest TRIM, qcow2
   discard, and offline compaction.
 - Add opt-in per-instance host-folder sharing with explicit roots, read-only and
-  read-write modes, reconnect/resume behavior, change notifications, and strict
+  read-write modes, reconnect/resume behavior, periodic change detection, and strict
   host-symlink and guest-reparse-point boundaries.
-- Establish the Windows interactive-user companion and authenticated bulk
-  transport needed by later GUI, clipboard, and drag-and-drop work without
-  weakening the Session 0 service boundary.
+- Establish the permanent interactive-user identity and authenticated bulk
+  transport boundary needed by the later companion, clipboard, and
+  drag-and-drop work without weakening the Session 0 service boundary.
 - After the agent becomes ready, make interactive `lsw install` enter a
   WSL-style registration flow before returning: create a permanent standard
   Windows desktop user and make it the instance's default interactive identity.
