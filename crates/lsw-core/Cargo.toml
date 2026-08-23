@@ -8,11 +8,11 @@ description = "Core manifest, installer, protocol, and QEMU planning logic for L
 publish = false
 
 [dependencies]
+getrandom = "=0.2.15"
 serde = { version = "=1.0.203", features = ["derive"] }
 serde_json = "=1.0.117"
 
 [target.'cfg(not(windows))'.dependencies]
-getrandom = "=0.2.15"
 sha2 = "=0.10.8"
 ureq = { version = "=2.10.1", default-features = false, features = ["tls"] }
 url = "=2.5.0"

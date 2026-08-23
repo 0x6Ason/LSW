@@ -6,7 +6,7 @@ QEMU/KVM virtual machine per instance.
 
 The current source candidate is `1.0.0-beta.5`. Its focus is daily usability on
 Linux x86_64: one-command installation, automatic host dependency repair, Windows
-edition selection by name, an automatically opened installation viewer,
+edition selection by name, fully unattended headless setup, an optional viewer,
 configuration and log commands, redacted diagnostic bundles, safe instance
 removal, all-instance shutdown, and a machine-readable performance baseline.
 
@@ -35,8 +35,9 @@ guest.
   only.
 - Guest: the current official Windows 11 x64 ISO downloaded from Microsoft, or
   a user-supplied authorized ISO selected with `--iso`.
-- Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, a
-  UDF-capable `7z`, and remote-viewer.
+- Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, and a
+  UDF-capable `7z`. `remote-viewer` is optional and used only for `--viewer` or
+  `lsw view`.
 - LSW downloads official media directly from allowlisted Microsoft HTTPS CDNs
   and verifies Microsoft's published SHA-256. It never redistributes Windows,
   product keys, activation data, preactivated disks, or modified images.
@@ -72,7 +73,8 @@ The one-shot installer performs the following steps:
    prepare the selected `slim` image with the boot-time agent and answer file.
 5. Applies the prepared WIM to the instance qcow2, validates the resulting
    qcow2, creates UEFI boot files, and deletes temporary seeds/workspace media.
-6. Boots Windows, opens the viewer when available, and verifies the agent.
+6. Boots Windows headlessly, completes OOBE, removes the one-shot setup account
+   and cached answer file, then verifies the boot-time agent.
 
 `--edition pro` remains available to override the default and is matched against
 ISO metadata; users never need to guess a WIM index. The WinPE jobs attach only
@@ -84,13 +86,16 @@ private state directory and removes it immediately after reading its metadata.
 Ensure the state filesystem has enough free space for that temporary file.
 
 The command records that the user is responsible for the license terms of the
-media they selected. It does not add a product key, bypass activation, skip
-OOBE, or create a prebuilt account.
+media they selected. It does not add a product key, bypass activation, use the
+deprecated `SkipMachineOOBE` setting, or disable UAC. It automates the supported
+OOBE settings with a random one-shot local account, then removes that account
+before installation is reported complete.
 
 The pre-applied unattend registers the guest agent during `specialize` as the
 automatic Windows service `LSWAgent`, running as the virtual account
-`NT SERVICE\LSWAgent`. It does not add a per-user `HKCU` startup entry, store an
-OOBE user's password, or require automatic logon for a cold start.
+`NT SERVICE\LSWAgent`. It does not add a per-user `HKCU` startup entry or require
+automatic logon for a cold start. The temporary password is independent from
+the agent token; its cached answer files are deleted after OOBE.
 
 Offline media is still supported:
 
@@ -98,14 +103,14 @@ Offline media is still supported:
 lsw install win-dev --iso ~/Downloads/Windows11.iso
 ```
 
-On a headless host, pass `--no-viewer`; later, reopen the display from a Linux
-graphical session without handling a socket path:
+Installation is headless by default. Pass `--viewer` when a graphical session
+is available, or reopen the display later without handling a socket path:
 
 ```bash
 lsw view win-dev
 ```
 
-After completing OOBE and the first administrative login:
+After `lsw install` returns:
 
 ```bash
 lsw use win-dev
@@ -265,8 +270,9 @@ fall back to pipe sessions.
 
 The beta.5 agent runs at boot as the automatic `LSWAgent` Windows service under
 `NT SERVICE\LSWAgent`. Shell and `exec` processes therefore use that service
-identity in Windows Session 0; they do not impersonate the OOBE desktop user.
-This provides command access before login without storing a user credential.
+identity in Windows Session 0; they do not impersonate a desktop user. This
+provides command access at the Windows sign-in screen without storing a daily
+user credential.
 A later user-session companion will be required for visible desktop GUI
 processes, clipboard, audio, and per-window integration.
 
@@ -302,16 +308,16 @@ scripts/check-windows-kvm-e2e.sh
 
 The harness first resolves Microsoft's current English x64 metadata, requires
 the provisioned media to match its published SHA-256, and verifies both WinPE
-completion markers plus transient-media cleanup. The operator completes normal
-OOBE in the viewer. The harness then verifies
-the Windows 11 build and requested edition, the password and automatic-logon
-policy of the active OOBE user, and the automatic `LSWAgent` service's name,
-state, startup mode, virtual-account identity, and `S-1-5-80-...` process SID.
-It exercises true ConPTY, command execution, exit-code propagation, and graceful
-shutdown. It then closes the viewer, uses a bare `lsw` to cold-start the
-installed guest without installation media or an interactive Windows login,
-and requires the same service SID, ConPTY shell, and command transport before
-checking cleanup of QEMU, the daemon, the viewer, sockets, and loopback ports.
+completion markers plus transient-media cleanup. Without a desktop session or
+manual guest input, it then proves that OOBE completed, the one-shot setup
+account, cached answer file, setup script, and staging payload were removed,
+and no console user or automatic-logon credential exists. It verifies the
+Windows 11 build, requested edition, and the automatic `LSWAgent` service's
+name, state, startup mode, virtual-account identity, and `S-1-5-80-...` process
+SID. It exercises true ConPTY, command execution, exit-code propagation, and
+graceful shutdown, then uses a bare `lsw` to cold-start the installed guest
+without installation media or an interactive Windows login and checks complete
+runtime cleanup.
 
 ## Roadmap
 
@@ -365,16 +371,16 @@ targets, Zig, or operating-system media.
 
 ## Current limitations
 
-- A real WinPE DISM → OOBE → agent/helper → ConPTY → shutdown →
+- A real WinPE DISM → unattended OOBE → agent/helper → ConPTY → shutdown →
   cold-restart run still requires the dedicated KVM-capable release host and a
   pre-provisioned current official ISO.
 - The guest agent now runs as the automatic `LSWAgent` Windows service under
   `NT SERVICE\LSWAgent`, but that boot-time path has not yet passed the real
   Windows/KVM release gate. beta.5 must not be tagged until the exact candidate
-  passes WinPE prepare/apply, OOBE, service/helper identity, true ConPTY,
+  passes WinPE prepare/apply, unattended OOBE cleanup, service/helper identity, true ConPTY,
   shutdown, and no-login cold restart on the dedicated hardware runner.
-- The installation and recovery display uses private Unix-socket VNC internally;
-  LSW opens the viewer and does not expose TCP VNC or RDP.
+- The optional installation and recovery display uses private Unix-socket VNC
+  internally; LSW opens it only when requested and does not expose TCP VNC or RDP.
 - `lsw run` can start a Session 0 process, but a service-launched GUI is not a
   visible desktop application. A user-session companion and per-window
   Wayland/X11 integration are not implemented yet.

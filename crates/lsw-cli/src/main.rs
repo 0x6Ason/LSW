@@ -191,7 +191,7 @@ fn doctor(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
                 "Installing beta.5 host dependencies: {}",
                 requested.join(", ")
             );
-            fix_host_dependencies()?;
+            fix_host_dependencies(false)?;
             capabilities = HostCapabilities::detect();
         }
     }
@@ -297,7 +297,7 @@ fn print_host_report(store: &StateStore, capabilities: &HostCapabilities) {
     }
 }
 
-fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
+fn fix_host_dependencies(needs_viewer: bool) -> Result<(), Box<dyn std::error::Error>> {
     let os_release = fs::read_to_string("/etc/os-release").unwrap_or_default();
     let distribution = os_release
         .lines()
@@ -314,85 +314,82 @@ fn fix_host_dependencies() -> Result<(), Box<dyn std::error::Error>> {
 
     if family.contains("debian") || family.contains("ubuntu") {
         run_package_command(&elevated, "apt-get", &["update"])?;
-        run_package_command(
-            &elevated,
-            "apt-get",
-            &[
-                "install",
-                "--yes",
-                "qemu-system-x86",
-                "qemu-utils",
-                "util-linux",
-                "ovmf",
-                "swtpm",
-                "aria2",
-                "wimtools",
-                "xorriso",
-                "7zip",
-                "virt-viewer",
-            ],
-        )?;
+        let mut packages = vec![
+            "install",
+            "--yes",
+            "qemu-system-x86",
+            "qemu-utils",
+            "util-linux",
+            "ovmf",
+            "swtpm",
+            "aria2",
+            "wimtools",
+            "xorriso",
+            "7zip",
+        ];
+        if needs_viewer {
+            packages.push("virt-viewer");
+        }
+        run_package_command(&elevated, "apt-get", &packages)?;
     } else if family.contains("fedora") || family.contains("rhel") {
-        run_package_command(
-            &elevated,
-            "dnf",
-            &[
-                "install",
-                "--assumeyes",
-                "qemu-system-x86-core",
-                "qemu-img",
-                "util-linux",
-                "edk2-ovmf",
-                "swtpm",
-                "aria2",
-                "wimlib-utils",
-                "xorriso",
-                "p7zip",
-                "p7zip-plugins",
-                "virt-viewer",
-            ],
-        )?;
+        let mut packages = vec![
+            "install",
+            "--assumeyes",
+            "qemu-system-x86-core",
+            "qemu-img",
+            "util-linux",
+            "edk2-ovmf",
+            "swtpm",
+            "aria2",
+            "wimlib-utils",
+            "xorriso",
+            "p7zip",
+            "p7zip-plugins",
+        ];
+        if needs_viewer {
+            packages.push("virt-viewer");
+        }
+        run_package_command(&elevated, "dnf", &packages)?;
     } else if family.contains("arch") {
-        run_package_command(
-            &elevated,
-            "pacman",
-            &[
-                "--sync",
-                "--needed",
-                "--noconfirm",
-                "qemu-desktop",
-                "util-linux",
-                "edk2-ovmf",
-                "swtpm",
-                "aria2",
-                "wimlib",
-                "xorriso",
-                "7zip",
-                "virt-viewer",
-            ],
-        )?;
+        let mut packages = vec![
+            "--sync",
+            "--needed",
+            "--noconfirm",
+            "qemu-desktop",
+            "util-linux",
+            "edk2-ovmf",
+            "swtpm",
+            "aria2",
+            "wimlib",
+            "xorriso",
+            "7zip",
+        ];
+        if needs_viewer {
+            packages.push("virt-viewer");
+        }
+        run_package_command(&elevated, "pacman", &packages)?;
     } else if family.contains("suse") {
-        run_package_command(
-            &elevated,
-            "zypper",
-            &[
-                "--non-interactive",
-                "install",
-                "qemu-x86",
-                "qemu-tools",
-                "util-linux",
-                "qemu-ovmf-x86_64",
-                "swtpm",
-                "aria2",
-                "wimlib",
-                "xorriso",
-                "7zip",
-                "virt-viewer",
-            ],
-        )?;
+        let mut packages = vec![
+            "--non-interactive",
+            "install",
+            "qemu-x86",
+            "qemu-tools",
+            "util-linux",
+            "qemu-ovmf-x86_64",
+            "swtpm",
+            "aria2",
+            "wimlib",
+            "xorriso",
+            "7zip",
+        ];
+        if needs_viewer {
+            packages.push("virt-viewer");
+        }
+        run_package_command(&elevated, "zypper", &packages)?;
     } else {
         return Err(format!(
-            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, util-linux, aria2, wimlib-imagex, xorriso, 7z, and remote-viewer manually"
+            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, util-linux, aria2, wimlib-imagex, xorriso, and 7z manually{}",
+            if needs_viewer { ", plus remote-viewer" } else { "" }
         )
         .into());
     }
@@ -785,7 +782,7 @@ fn launch_viewer(
         .map(PathBuf::from)
         .or(capabilities.remote_viewer);
     let Some(viewer) = viewer else {
-        let message = "remote-viewer was not found; run `lsw doctor --fix`";
+        let message = "remote-viewer was not found; install the optional virt-viewer package";
         if explicit {
             return Err(message.into());
         }
@@ -1133,9 +1130,9 @@ fn media(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let action = arguments
         .first()
         .and_then(|value| value.to_str())
-        .ok_or("usage: lsw media resolve [--language LANGUAGE]")?;
-    if action != "resolve" {
-        return Err("usage: lsw media resolve [--language LANGUAGE]".into());
+        .ok_or("usage: lsw media <resolve|published-sha256> [--language LANGUAGE]")?;
+    if action != "resolve" && action != "published-sha256" {
+        return Err("usage: lsw media <resolve|published-sha256> [--language LANGUAGE]".into());
     }
     let mut language = "English";
     match &arguments[1..] {
@@ -1143,11 +1140,19 @@ fn media(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
         [option, value] if option == "--language" => {
             language = value.to_str().ok_or("language must be valid UTF-8")?;
         }
-        _ => return Err("usage: lsw media resolve [--language LANGUAGE]".into()),
+        _ => {
+            return Err("usage: lsw media <resolve|published-sha256> [--language LANGUAGE]".into());
+        }
     }
-    let resolved = MicrosoftIsoResolver::new().resolve(&MicrosoftIsoRequest {
+    let request = MicrosoftIsoRequest {
         language: language.to_owned(),
-    })?;
+    };
+    let resolver = MicrosoftIsoResolver::new();
+    if action == "published-sha256" {
+        println!("SHA256={}", resolver.published_sha256(&request)?);
+        return Ok(());
+    }
+    let resolved = resolver.resolve(&request)?;
     println!("PRODUCT_ID={}", resolved.product_id);
     println!("SKU_ID={}", resolved.sku_id);
     println!("LANGUAGE={}", resolved.language);
@@ -1961,7 +1966,7 @@ fn print_help() {
         "  lsw plan NAME [--run]\n",
         "  lsw install NAME --iso PATH --edition EDITION [--profile PROFILE] [OPTIONS]\n",
         "  lsw install [NAME] [--locale LOCALE] [--edition EDITION] [--agent PATH]\n",
-        "              [--unattended-index N] [--without-agent] [--no-viewer]\n",
+        "              [--unattended-index N] [--without-agent] [--viewer]\n",
         "  lsw license status [NAME]\n",
         "  lsw license activate [NAME] [--key-stdin | --online]\n",
         "  lsw license open [NAME]\n",
@@ -1991,7 +1996,8 @@ fn print_help() {
         "ONE-SHOT INSTALL:\n",
         "  --language LANGUAGE download that language from Microsoft (default: English)\n",
         "  --edition EDITION   select an edition by its ISO name or a friendly alias such as pro\n",
-        "  --no-viewer         do not open the installation viewer (for headless automation)\n",
+        "  --viewer            open the optional installation viewer (headless by default)\n",
+        "  --no-viewer         keep headless installation explicit (compatibility option)\n",
         "  supplying --iso records responsibility for the user-provided Windows license\n\n",
         "SEED SAFETY:\n",
         "  --unattended-index N  select image N and explicitly wipe the dedicated VM disk\n",

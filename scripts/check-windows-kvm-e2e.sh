@@ -14,8 +14,9 @@ root_base=${LSW_E2E_ROOT_BASE:-/tmp}
 artifact_dir=${LSW_E2E_ARTIFACT_DIR:-}
 keep_state=${LSW_E2E_KEEP_STATE:-0}
 expected_iso_sha256=${LSW_WINDOWS_ISO_SHA256:-}
+e2e_no_viewer=${LSW_E2E_NO_VIEWER:-1}
 
-for required_command in awk chmod date grep kill mkdir mktemp mv python3 rm script setsid sha256sum sleep timeout tr uname; do
+for required_command in awk chmod date grep kill mkdir mktemp mv python3 rm setsid sha256sum sleep timeout tr uname; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "error: required command $required_command was not found" >&2
         exit 1
@@ -51,6 +52,13 @@ case "$keep_state" in
     0|1) ;;
     *)
         echo "error: LSW_E2E_KEEP_STATE must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+case "$e2e_no_viewer" in
+    0|1) ;;
+    *)
+        echo "error: LSW_E2E_NO_VIEWER must be 0 or 1" >&2
         exit 1
         ;;
 esac
@@ -125,7 +133,7 @@ viewer_pid=
 artifacts_collected=0
 guest_build=unknown
 guest_edition=unknown
-interactive_user_sid=unknown
+setup_account_removed=unknown
 agent_service_sid=unknown
 cold_agent_service_sid=unknown
 agent_service_pid=unknown
@@ -135,8 +143,9 @@ agent_service_start_mode=unknown
 agent_service_start_name=unknown
 agent_service_state=unknown
 cold_interactive_user=unknown
-account_password_required=unknown
-blank_password_rejected=unknown
+initial_interactive_user=unknown
+cached_unattend_removed=unknown
+setup_payload_removed=unknown
 automatic_logon=unknown
 ovmf_code_sha256=unknown
 ovmf_vars_sha256=unknown
@@ -157,6 +166,98 @@ if len(path) > 100:
     )
 PY
 
+run_conpty_probe() {
+    probe_timeout=$1
+    probe_marker=$2
+    probe_command=$3
+    shift 3
+    python3 - "$probe_timeout" "$probe_marker" "$probe_command" "$@" <<'PY'
+import errno
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+timeout_seconds = int(sys.argv[1])
+marker = os.fsencode(sys.argv[2])
+command = os.fsencode(sys.argv[3])
+argv = sys.argv[4:]
+if not argv:
+    raise SystemExit("error: ConPTY probe received no command")
+
+master, slave = pty.openpty()
+fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+process = subprocess.Popen(
+    argv,
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    close_fds=True,
+    start_new_session=True,
+)
+os.close(slave)
+deadline = time.monotonic() + timeout_seconds
+transcript = bytearray()
+command_sent = False
+exit_sent = False
+timed_out = False
+
+while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        timed_out = True
+        break
+    ready, _, _ = select.select([master], [], [], min(0.1, remaining))
+    if ready:
+        try:
+            data = os.read(master, 32768)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            data = b""
+        if data:
+            os.write(sys.stdout.fileno(), data)
+            transcript.extend(data)
+            if len(transcript) > 1024 * 1024:
+                del transcript[: len(transcript) - 1024 * 1024]
+            prompt = transcript.find(b"PS C:\\")
+            if not command_sent and prompt >= 0 and b">" in transcript[prompt:]:
+                os.write(master, command + b"\r")
+                command_sent = True
+            if command_sent and not exit_sent and marker in transcript:
+                os.write(master, b"exit\r")
+                exit_sent = True
+        elif process.poll() is not None:
+            break
+    elif process.poll() is not None:
+        break
+
+if timed_out:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+    raise SystemExit("error: timed out waiting for the ConPTY probe")
+
+status = process.wait()
+if not command_sent:
+    raise SystemExit("error: ConPTY shell never produced a PowerShell prompt")
+if marker not in transcript:
+    raise SystemExit("error: ConPTY shell exited before returning its marker")
+if status < 0 or status > 255:
+    raise SystemExit(f"error: ConPTY probe returned unsupported status {status}")
+raise SystemExit(status)
+PY
+}
+
 collect_e2e_artifacts() {
     result=$1
     if [ -z "$artifact_dir" ]; then
@@ -172,7 +273,7 @@ collect_e2e_artifacts() {
         printf 'edition_installed=%s\n' "$guest_edition"
         printf 'profile_requested=%s\n' "$profile"
         printf 'windows_build=%s\n' "$guest_build"
-        printf 'interactive_user_sid=%s\n' "$interactive_user_sid"
+        printf 'setup_account_removed=%s\n' "$setup_account_removed"
         printf 'agent_service_name=%s\n' "$agent_service_name"
         printf 'agent_service_start_mode=%s\n' "$agent_service_start_mode"
         printf 'agent_service_start_name=%s\n' "$agent_service_start_name"
@@ -182,8 +283,9 @@ collect_e2e_artifacts() {
         printf 'agent_service_pid_initial=%s\n' "$agent_service_pid"
         printf 'agent_service_pid_cold=%s\n' "$cold_agent_service_pid"
         printf 'cold_interactive_user=%s\n' "$cold_interactive_user"
-        printf 'account_password_required=%s\n' "$account_password_required"
-        printf 'blank_password_rejected=%s\n' "$blank_password_rejected"
+        printf 'initial_interactive_user=%s\n' "$initial_interactive_user"
+        printf 'cached_unattend_removed=%s\n' "$cached_unattend_removed"
+        printf 'setup_payload_removed=%s\n' "$setup_payload_removed"
         printf 'automatic_logon=%s\n' "$automatic_logon"
         printf 'iso_sha256=%s\n' "$iso_sha256"
         printf 'official_iso_sha256=%s\n' "$official_iso_sha256"
@@ -363,6 +465,10 @@ import sys
 
 port = int(sys.argv[1])
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    # A completed agent connection can leave the old host-forward endpoint in
+    # TIME_WAIT after QEMU exits. Match QEMU's reusable-listener semantics while
+    # still rejecting a port held by a live runtime.
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", port))
 PY
 }
@@ -473,14 +579,32 @@ ovmf_vars_path=$(printf '%s\n' "$doctor_output" |
 ovmf_code_sha256=$(sha256sum -- "$ovmf_code_path" | awk '{ print $1 }')
 ovmf_vars_sha256=$(sha256sum -- "$ovmf_vars_path" | awk '{ print $1 }')
 
-media_output=$(timeout 60s "$lsw" media resolve --language English)
+media_output=
+media_status=1
+for media_retry_delay in 0 15 30 60; do
+    if [ "$media_retry_delay" -ne 0 ]; then
+        echo "warning: Microsoft ISO resolution failed; retrying in ${media_retry_delay}s" >&2
+        sleep "$media_retry_delay"
+    fi
+    set +e
+    media_output=$(timeout 60s "$lsw" media published-sha256 --language English)
+    media_status=$?
+    set -e
+    if [ "$media_status" -eq 0 ]; then
+        break
+    fi
+done
+if [ "$media_status" -ne 0 ]; then
+    echo "error: Microsoft ISO resolution failed after bounded retries" >&2
+    exit 1
+fi
 official_iso_sha256=$(printf '%s\n' "$media_output" |
     awk -F= '$1 == "SHA256" { print tolower($2); exit }')
 if [ "$official_iso_sha256" != "$iso_sha256" ]; then
     echo "error: provisioned ISO does not match Microsoft's current published SHA-256" >&2
     exit 1
 fi
-if [ "${LSW_E2E_NO_VIEWER:-0}" != 1 ]; then
+if [ "$e2e_no_viewer" != 1 ]; then
     viewer_value=$(printf '%s\n' "$doctor_output" |
         awk -v prefix='  viewer:      ' 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }')
     if [ -z "$viewer_value" ] || [ "$viewer_value" = 'not found' ]; then
@@ -512,9 +636,8 @@ if [ "$daemon_ready" -ne 1 ]; then
 fi
 
 viewer_option=
-if [ "${LSW_E2E_NO_VIEWER:-0}" = 1 ]; then
-    viewer_option=--no-viewer
-else
+if [ "$e2e_no_viewer" != 1 ]; then
+    viewer_option=--viewer
     viewer_command=${LSW_INSTALL_VIEWER:-$(command -v remote-viewer || :)}
     if [ -z "$viewer_command" ] || [ ! -x "$viewer_command" ]; then
         echo "error: remote-viewer is required unless LSW_E2E_NO_VIEWER=1" >&2
@@ -546,19 +669,19 @@ else
     export LSW_INSTALL_VIEWER="$viewer_wrapper"
 fi
 
-if [ -n "$viewer_option" ]; then
+if [ -z "$viewer_option" ]; then
+    "$lsw" install "$instance" \
+        --iso "$iso" \
+        --edition "$edition" \
+        --profile "$profile" \
+        --agent "$agent"
+else
     "$lsw" install "$instance" \
         --iso "$iso" \
         --edition "$edition" \
         --profile "$profile" \
         --agent "$agent" \
         "$viewer_option"
-else
-    "$lsw" install "$instance" \
-        --iso "$iso" \
-        --edition "$edition" \
-        --profile "$profile" \
-        --agent "$agent"
 
     viewer_ready=0
     viewer_attempt=0
@@ -619,6 +742,7 @@ fi
 
 license_output=$(timeout 120s "$lsw" license status "$instance")
 license_status=$(printf '%s\n' "$license_output" |
+    tr -d '\r' |
     awk -F= '$1 == "STATUS" { print $2; exit }')
 case "$license_status" in
     licensed|unlicensed) ;;
@@ -644,23 +768,6 @@ license_helper_start_mode=$(printf '%s\n' "$license_helper_output" | awk -F'|' '
 license_helper_start_name=$(printf '%s\n' "$license_helper_output" | awk -F'|' '{ print $2 }')
 if [ "$license_helper_start_mode" != Manual ] || [ "$license_helper_start_name" != LocalSystem ]; then
     echo "error: activation helper is not a stopped demand-start LocalSystem service" >&2
-    exit 1
-fi
-
-echo "Complete normal Windows OOBE and the first administrative login in the LSW viewer."
-echo "The gate will continue automatically when an eligible local console user appears."
-
-deadline=$(( $(date +%s) + timeout_seconds ))
-agent_ready=0
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    if "$lsw" status "$instance" 2>/dev/null | grep -Fx 'AGENT=ready' >/dev/null; then
-        agent_ready=1
-        break
-    fi
-    sleep 5
-done
-if [ "$agent_ready" -ne 1 ]; then
-    echo "error: Windows guest agent did not become ready before the E2E timeout" >&2
     exit 1
 fi
 
@@ -690,74 +797,22 @@ agent_service_start_mode=Auto
 agent_service_start_name='NT SERVICE\LSWAgent'
 agent_service_state=Running
 
-# The agent intentionally runs as a boot-time virtual service account, so its
-# exec identity is not the OOBE user. Capture the active console identity from
-# Win32_ComputerSystem while the operator is still signed in, and apply the
-# credential-policy checks to that local user explicitly.
-interactive_user_sid=
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    set +e
-    # PowerShell expands its own variables in the guest.
-    # shellcheck disable=SC2016
-    interactive_user_probe=$("$lsw" exec "$instance" -- \
-        powershell.exe -NoLogo -NoProfile -Command \
-        '$Interactive=[string](Get-CimInstance -ClassName Win32_ComputerSystem).UserName; if ([string]::IsNullOrWhiteSpace($Interactive)) { exit 46 }; $Separator=$Interactive.IndexOf([char]92); if ($Separator -le 0) { exit 47 }; $Domain=$Interactive.Substring(0,$Separator); $Name=$Interactive.Substring($Separator+1); if ($Domain -ine $env:COMPUTERNAME -and $Domain -ne ".") { exit 47 }; $Account=Get-LocalUser -Name $Name; if ($null -eq $Account -or @($Account).Count -ne 1 -or -not $Account.Enabled) { exit 48 }; [Console]::Out.Write($Account.SID.Value)' 2>/dev/null)
-    interactive_user_status=$?
-    set -e
-    if [ "$interactive_user_status" -eq 0 ]; then
-        if printf '%s\n' "$interactive_user_probe" |
-            grep -E '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-[0-9]+$' >/dev/null
-        then
-            interactive_user_sid=$interactive_user_probe
-            break
-        fi
-        echo "error: OOBE console user did not report a valid local-account SID" >&2
-        exit 1
-    fi
-    if [ "$interactive_user_status" -ne 46 ]; then
-        echo "error: OOBE must finish with an enabled local user at the Windows console" >&2
-        exit 1
-    fi
-    sleep 5
-done
-if [ -z "$interactive_user_sid" ]; then
-    echo "error: no interactive OOBE user appeared before the E2E timeout" >&2
-    exit 1
-fi
-password_marker='LSW_WINDOWS_KVM_ACCOUNT_SECURE'
+headless_marker='LSW_WINDOWS_KVM_HEADLESS_SETUP_COMPLETE'
 set +e
 # PowerShell expands its own variables in the guest.
 # shellcheck disable=SC2016
-password_output=$("$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-    '$ErrorActionPreference="Stop"; $ComputerSystem=Get-CimInstance -ClassName Win32_ComputerSystem; if ($null -eq $ComputerSystem -or @($ComputerSystem).Count -ne 1) { exit 40 }; $Interactive=[string]$ComputerSystem.UserName; $Separator=$Interactive.IndexOf([char]92); if ($Separator -le 0) { exit 40 }; $Domain=$Interactive.Substring(0,$Separator); $Name=$Interactive.Substring($Separator+1); if ($Domain -ine $env:COMPUTERNAME -and $Domain -ne ".") { exit 40 }; $Account=Get-LocalUser -Name $Name; if ($null -eq $Account -or @($Account).Count -ne 1 -or -not $Account.PasswordRequired) { exit 41 }; $Winlogon=Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; if ($null -eq $Winlogon) { exit 43 }; if ([string]$Winlogon.AutoAdminLogon -eq "1") { exit 42 }; $StoredPassword=$Winlogon.PSObject.Properties["DefaultPassword"]; if ($null -ne $StoredPassword -and -not [string]::IsNullOrEmpty([string]$StoredPassword.Value)) { exit 43 }; [Console]::Out.Write("LSW_WINDOWS_KVM_ACCOUNT_SECURE|$($Account.SID.Value)")')
-password_status=$?
+headless_output=$("$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    '$ErrorActionPreference="Stop"; $Marker="C:\ProgramData\LSW\setup-complete.marker"; if (-not (Test-Path -LiteralPath $Marker -PathType Leaf) -or [System.IO.File]::ReadAllText($Marker).Trim() -cne "LSW-SETUP-COMPLETE") { exit 50 }; if ($null -ne (Get-LocalUser -Name "LSWSetup" -ErrorAction SilentlyContinue)) { exit 51 }; $Interactive=[string](Get-CimInstance -ClassName Win32_ComputerSystem).UserName; if (-not [string]::IsNullOrWhiteSpace($Interactive)) { exit 52 }; $Winlogon=Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; if ([string]$Winlogon.AutoAdminLogon -eq "1") { exit 53 }; $StoredPassword=$Winlogon.PSObject.Properties["DefaultPassword"]; if ($null -ne $StoredPassword -and -not [string]::IsNullOrEmpty([string]$StoredPassword.Value)) { exit 54 }; foreach ($Path in @("C:\Windows\Panther\unattend.xml", "C:\Windows\Panther\Unattend\unattend.xml", "C:\Windows\Setup\Scripts\SetupComplete.cmd", "C:\ProgramData\LSW\setup")) { if (Test-Path -LiteralPath $Path) { exit 55 } }; [Console]::Out.Write("LSW_WINDOWS_KVM_HEADLESS_SETUP_COMPLETE")')
+headless_status=$?
 set -e
-if [ "$password_status" -ne 0 ] \
-    || [ "$password_output" != "$password_marker|$interactive_user_sid" ]
-then
-    echo "error: the cold-start gate requires a password-protected account with automatic logon disabled" >&2
+if [ "$headless_status" -ne 0 ] || [ "$headless_output" != "$headless_marker" ]; then
+    echo "error: unattended setup did not remove its account, cached answer file, or staging payload" >&2
     exit 1
 fi
-blank_password_marker='LSW_WINDOWS_KVM_BLANK_PASSWORD_REJECTED'
-set +e
-# An account flag alone does not prove that its current password is nonblank.
-# Probe the local SAM through LogonUserW and reject an empty password that
-# authenticates successfully. Resolve the console user again so this cannot
-# accidentally test the LSWAgent virtual account. PowerShell expands its own
-# variables here.
-# shellcheck disable=SC2016
-blank_password_output=$("$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-    '$ErrorActionPreference="Stop"; $Interactive=[string](Get-CimInstance -ClassName Win32_ComputerSystem).UserName; $Separator=$Interactive.IndexOf([char]92); if ($Separator -le 0) { exit 40 }; $Domain=$Interactive.Substring(0,$Separator); $Name=$Interactive.Substring($Separator+1); if ($Domain -ine $env:COMPUTERNAME -and $Domain -ne ".") { exit 40 }; $Account=Get-LocalUser -Name $Name; if ($null -eq $Account -or @($Account).Count -ne 1) { exit 40 }; $Definition="[System.Runtime.InteropServices.DllImport(`"advapi32.dll`", EntryPoint=`"LogonUserW`", ExactSpelling=true, CharSet=System.Runtime.InteropServices.CharSet.Unicode, SetLastError=true)] public static extern bool LogonUserW(string user, string domain, string password, int logonType, int provider, out System.IntPtr token); [System.Runtime.InteropServices.DllImport(`"kernel32.dll`", SetLastError=true)] public static extern bool CloseHandle(System.IntPtr handle);"; $Native=Add-Type -MemberDefinition $Definition -Name NativeLogon -Namespace LswE2e -PassThru; $Token=[IntPtr]::Zero; if ($Native::LogonUserW($Account.Name, ".", "", 2, 0, [ref]$Token)) { [void]$Native::CloseHandle($Token); exit 44 }; if ([System.Runtime.InteropServices.Marshal]::GetLastWin32Error() -ne 1326) { exit 45 }; [Console]::Out.Write("LSW_WINDOWS_KVM_BLANK_PASSWORD_REJECTED|$($Account.SID.Value)")')
-blank_password_status=$?
-set -e
-if [ "$blank_password_status" -ne 0 ] \
-    || [ "$blank_password_output" != "$blank_password_marker|$interactive_user_sid" ]
-then
-    echo "error: the cold-start gate could not prove that the local account rejects a blank password" >&2
-    exit 1
-fi
-account_password_required=true
-blank_password_rejected=true
+setup_account_removed=true
+initial_interactive_user=none
+cached_unattend_removed=true
+setup_payload_removed=true
 automatic_logon=false
 edition_normalized=$(printf '%s' "$edition" | tr '[:upper:]' '[:lower:]')
 case "$edition_normalized" in
@@ -790,25 +845,40 @@ conpty_prefix='LSW_WINDOWS_KVM_CONPTY_'
 conpty_suffix="OK_$$"
 conpty_marker="$conpty_prefix$conpty_suffix"
 conpty_identity="$agent_service_sid|0"
-# The inner shell expands the exported paths inside the pseudo-TTY.
-# shellcheck disable=SC2016
+conpty_command=$(printf "\$a='%s'; \$b='%s'; Write-Output (\$a+\$b); \$s=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \$i=[System.Diagnostics.Process]::GetCurrentProcess().SessionId; Write-Output (\$s+'|'+\$i)" \
+    "$conpty_prefix" "$conpty_suffix")
+set +e
 conpty_output=$(
-    printf "\$a='%s'; \$b='%s'; Write-Output (\$a+\$b); \$s=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \$i=[System.Diagnostics.Process]::GetCurrentProcess().SessionId; Write-Output (\$s+'|'+\$i)\rexit\r" \
-        "$conpty_prefix" "$conpty_suffix" |
-        timeout 60s script -qefc \
-            'exec "$LSW_E2E_LSW" shell "$LSW_E2E_INSTANCE"' /dev/null 2>&1
+    run_conpty_probe 60 "$conpty_marker" "$conpty_command" \
+        "$LSW_E2E_LSW" shell "$LSW_E2E_INSTANCE" 2>&1
 )
+conpty_status=$?
+set -e
+if [ "$conpty_status" -ne 0 ]; then
+    printf '%s\n' "$conpty_output" >&2
+    echo "error: live ConPTY probe exited with status $conpty_status" >&2
+    exit 1
+fi
 if printf '%s\n' "$conpty_output" | grep -F 'ConPTY is not available' >/dev/null; then
     echo "error: guest agent fell back to a pipe shell instead of ConPTY" >&2
     exit 1
 fi
-printf '%s\n' "$conpty_output" | tr -d '\r' | grep -F "$conpty_marker" >/dev/null
-printf '%s\n' "$conpty_output" | tr -d '\r' | grep -Fx "$conpty_identity" >/dev/null
+if ! printf '%s\n' "$conpty_output" | tr -d '\r' | grep -F "$conpty_marker" >/dev/null; then
+    echo "error: live ConPTY probe did not return its marker" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$conpty_output" | tr -d '\r' | grep -Fx "$conpty_identity" >/dev/null; then
+    echo "error: live ConPTY shell did not run as the expected service SID in session 0" >&2
+    exit 1
+fi
 
 exec_marker="LSW_WINDOWS_KVM_EXEC_OK_$$"
 output=$("$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
     "Write-Output '$exec_marker'")
-printf '%s\n' "$output" | grep -Fx "$exec_marker" >/dev/null
+if ! printf '%s\n' "$output" | tr -d '\r' | grep -Fx "$exec_marker" >/dev/null; then
+    echo "error: lsw exec did not return its marker" >&2
+    exit 1
+fi
 
 set +e
 "$lsw" exec "$instance" -- cmd.exe /d /c exit 37
@@ -855,10 +925,9 @@ fi
 "$lsw" shutdown "$instance"
 assert_stopped_runtime_released "$qemu_pid" "$agent_port"
 
-# The installation viewer must not make this pass by allowing a second manual
-# sign-in. A daily-use instance has to cold-start from its disk and make the
-# agent and daemon available through a bare `lsw` invocation without
-# installation media.
+# A daily-use instance has to cold-start from its disk and make the agent and
+# daemon available through a bare `lsw` invocation without a console sign-in
+# or installation media.
 terminate_viewer
 terminate_daemon
 cold_daemon_wrapper="$e2e_root/cold-daemon-wrapper.sh"
@@ -887,13 +956,11 @@ cold_prefix='LSW_WINDOWS_KVM_COLD_START_'
 cold_suffix="OK_$$"
 cold_marker="$cold_prefix$cold_suffix"
 cold_conpty_identity="$agent_service_sid|0"
+cold_command=$(printf "\$a='%s'; \$b='%s'; Write-Output (\$a+\$b); \$s=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \$i=[System.Diagnostics.Process]::GetCurrentProcess().SessionId; Write-Output (\$s+'|'+\$i)" \
+    "$cold_prefix" "$cold_suffix")
 set +e
-# The inner shell expands the exported CLI path inside the pseudo-TTY.
-# shellcheck disable=SC2016
 cold_output=$(
-    printf "\$a='%s'; \$b='%s'; Write-Output (\$a+\$b); \$s=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; \$i=[System.Diagnostics.Process]::GetCurrentProcess().SessionId; Write-Output (\$s+'|'+\$i)\rexit\r" \
-        "$cold_prefix" "$cold_suffix" |
-        timeout 180s script -qefc 'exec "$LSW_E2E_LSW"' /dev/null 2>&1
+    run_conpty_probe 180 "$cold_marker" "$cold_command" "$LSW_E2E_LSW" 2>&1
 )
 cold_status=$?
 set -e
@@ -912,8 +979,14 @@ if printf '%s\n' "$cold_output" | grep -F 'ConPTY is not available' >/dev/null; 
     echo "error: cold-start shell fell back to pipes instead of ConPTY" >&2
     exit 1
 fi
-printf '%s\n' "$cold_output" | tr -d '\r' | grep -F "$cold_marker" >/dev/null
-printf '%s\n' "$cold_output" | tr -d '\r' | grep -Fx "$cold_conpty_identity" >/dev/null
+if ! printf '%s\n' "$cold_output" | tr -d '\r' | grep -F "$cold_marker" >/dev/null; then
+    echo "error: cold-start ConPTY probe did not return its marker" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$cold_output" | tr -d '\r' | grep -Fx "$cold_conpty_identity" >/dev/null; then
+    echo "error: cold-start ConPTY shell did not run as the expected service SID in session 0" >&2
+    exit 1
+fi
 
 read_agent_service_identity
 cold_agent_service_sid=$service_sid
@@ -985,7 +1058,10 @@ cold_exec_output=$(
     "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
         "Write-Output '$cold_exec_marker'"
 )
-printf '%s\n' "$cold_exec_output" | grep -Fx "$cold_exec_marker" >/dev/null
+if ! printf '%s\n' "$cold_exec_output" | tr -d '\r' | grep -Fx "$cold_exec_marker" >/dev/null; then
+    echo "error: cold-start lsw exec did not return its marker" >&2
+    exit 1
+fi
 assert_daemon_alive
 
 "$lsw" shutdown "$instance"
@@ -1006,4 +1082,4 @@ fi
 terminate_daemon
 collect_e2e_artifacts success
 
-echo "Windows/KVM E2E passed: Setup -> OOBE -> LSWAgent service -> ConPTY -> shutdown -> cold restart -> cleanup."
+echo "Windows/KVM E2E passed: WinPE -> unattended OOBE -> LSWAgent service -> ConPTY -> shutdown -> cold restart -> cleanup."

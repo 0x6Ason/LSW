@@ -81,6 +81,23 @@ fn automatic_install_defaults_to_slim_english_and_microsoft_media() {
     assert_eq!(parsed.language, "English");
     assert!(parsed.iso.is_none());
     assert!(!parsed.language_option_seen);
+    assert!(parsed.no_viewer);
+}
+
+#[test]
+fn automatic_install_opens_a_viewer_only_when_requested() {
+    let arguments = ["win-dev", "--viewer"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let parsed = InstallArguments::parse(&arguments).expect("install options should parse");
+    assert!(!parsed.no_viewer);
+
+    let conflicting = ["win-dev", "--viewer", "--no-viewer"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(InstallArguments::parse(&conflicting).is_err());
 }
 
 #[test]

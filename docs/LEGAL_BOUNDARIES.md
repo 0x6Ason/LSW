@@ -19,9 +19,11 @@ systems, firmware, hypervisors, installation media, trademarks, or user data.
 - The installation command records the user's request to install Windows. The
   generated answer file may set the documented Windows Setup `AcceptEula`
   value; LSW does not grant a Windows license or activation entitlement.
-- The beta does not add a `ProductKey`, bypass activation, hide required license
-  pages, use `SkipMachineOOBE`, pre-create a user, or disable UAC. Normal OOBE and
-  activation remain the operating system's responsibility.
+- The beta does not add a `ProductKey`, bypass activation, use the deprecated
+  `SkipMachineOOBE` setting, or disable UAC. The user accepts the media's license
+  terms before install. LSW then uses Microsoft's supported unattended OOBE
+  settings and a random one-shot local account, which is removed before setup
+  is marked complete. Activation remains the operating system's responsibility.
 - Optional activation installs a user-provided key only through Windows WMI.
   The key is accepted through masked input or stdin and is excluded from host
   and guest command lines, environment, seeds, base images, logs and diagnostic

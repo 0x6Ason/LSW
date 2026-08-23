@@ -37,14 +37,17 @@ host copy never appears in `lsw show` or the manifest. Installation staging
 copies the guest copy to
 `ProgramData\LSW` with an ACL for SYSTEM, Administrators, and the
 `NT SERVICE\LSWAgent` virtual service identity. No ACE is added for the
-individual OOBE user; administrators retain access through the Administrators
+one-shot OOBE user; administrators retain access through the Administrators
 group.
 
 The pre-applied `specialize` pass registers `LSWAgent` as an automatic Windows
-service. It runs in Session 0 under `NT SERVICE\LSWAgent`, without a stored user
-password or an automatic desktop logon. This boot-time identity is intentionally
-separate from the interactive OOBE account; visible desktop GUI integration
-will require a future user-session companion.
+service. It runs in Session 0 under `NT SERVICE\LSWAgent`, without an automatic
+desktop logon. OOBE receives a per-install random password that is independent
+from the agent token and obfuscated with Windows unattend's `PlainText=false`
+encoding, which is not encryption. SetupComplete removes the one-shot account,
+cached answer files, its script, and the staging payload before the host accepts
+the setup marker. Visible desktop GUI integration will require a future
+user-session companion.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
 guest port 35040 only from the QEMU user-network host address. Authentication is
@@ -90,8 +93,8 @@ gate.
 
 Agent powers are intentionally broad after authentication: it can execute
 arbitrary processes as the `NT SERVICE\LSWAgent` virtual account and read or
-create files that service identity can access. It does not impersonate the OOBE
-desktop user. Protect the host token and state backups accordingly. Transfers
+create files that service identity can access. It does not impersonate a desktop
+user. Protect the host token and state backups accordingly. Transfers
 reject symlinks and existing destinations and verify declared byte counts before
 committing a temporary file.
 

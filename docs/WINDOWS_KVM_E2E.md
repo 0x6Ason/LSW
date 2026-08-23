@@ -3,17 +3,18 @@
 The real Windows gate validates the release candidate on an explicitly
 dedicated Linux x86_64 KVM runner. It resolves Microsoft's current English x64
 ISO metadata, requires the operator-supplied read-only media to match that exact
-published SHA-256, runs the network-disabled WinPE DISM prepare/apply path, and
-checks the boot-time agent before normal OOBE and first login. It then checks
-the exact automatic `LSWAgent` Windows service configuration and virtual-account
-process SID, PowerShell command execution, guest exit-code propagation,
-graceful shutdown, an interactive ConPTY shell, QEMU/daemon/viewer cleanup,
-socket cleanup, and host-port release. The release job exercises the beta.5
-beginner `slim` profile. It then closes the installation viewer, cold-starts
-the installed guest through a bare `lsw`, proves ConPTY and service-backed agent
-execution return at the Windows sign-in screen, requires the same service SID,
-and verifies that neither the ISO nor the seed is attached to the restarted
-QEMU process.
+published SHA-256, and runs the network-disabled WinPE DISM prepare/apply path.
+The normal boot then completes OOBE without a viewer, desktop session, or guest
+input. The gate verifies that the one-shot setup account, cached answer files,
+SetupComplete script, and staging payload are removed before accepting the
+completion marker. It checks the exact automatic `LSWAgent` Windows service
+configuration and virtual-account process SID, PowerShell command execution,
+guest exit-code propagation, graceful shutdown, an interactive ConPTY shell,
+QEMU/daemon cleanup, socket cleanup, and host-port release. The release job
+exercises the beta.5 beginner `slim` profile, cold-starts the installed guest
+through a bare `lsw`, proves ConPTY and service-backed agent execution return at
+the Windows sign-in screen, requires the same service SID, and verifies that
+neither the ISO nor the seed is attached to the restarted QEMU process.
 
 The gate also requires both private-volume WinPE completion markers, proves that the
 workspace and all token-bearing seeds were removed, queries WMI license status
@@ -21,9 +22,9 @@ without a key, and verifies that `LSWLicenseHelper` returns to a stopped,
 demand-start LocalSystem state while `LSWAgent` remains the narrow virtual
 account.
 
-The workflow is deliberately manual. GitHub-hosted runners do not expose KVM,
-and the beta.5 harness requires an operator to complete OOBE in the private LSW
-viewer. A successful ordinary CI run is not a substitute for this gate.
+The workflow dispatch and protected-environment approval are deliberately
+manual because GitHub-hosted runners do not expose KVM. Guest setup itself is
+fully headless. A successful ordinary CI run is not a substitute for this gate.
 
 ## Security boundary
 
@@ -63,7 +64,7 @@ normally through the `kvm` group.
 Install these dependencies before registering the runner:
 
 - QEMU x86_64, `qemu-img`, OVMF, and swtpm;
-- wimlib, xorriso, a UDF-capable `7z`, and virt-viewer (`remote-viewer`);
+- wimlib, xorriso, and a UDF-capable `7z`;
 - Git, Python 3, GNU coreutils, and standard POSIX shell tools;
 - rustup with Rust 1.76.0 and the `x86_64-pc-windows-gnu` target; and
 - the MinGW-w64 x86_64 compiler.
@@ -73,7 +74,7 @@ On Debian or Ubuntu, the relevant packages include:
 ```sh
 sudo apt-get install \
   coreutils gcc-mingw-w64-x86-64 git ovmf python3 qemu-system-x86 \
-  7zip qemu-utils swtpm util-linux virt-viewer wimtools xorriso
+  7zip qemu-utils swtpm util-linux wimtools xorriso
 rustup toolchain install 1.76.0 --profile minimal
 rustup target add --toolchain 1.76.0 x86_64-pc-windows-gnu
 ```
@@ -87,10 +88,8 @@ distribution does not use one of LSW's standard OVMF paths, set both
 environment. The preflight fails before installation if no complete firmware
 pair is available.
 
-The beta.5 gate is attended. Start the runner interactively from a logged-in
-Linux desktop session where `DISPLAY` or `WAYLAND_DISPLAY`, the session bus,
-and `remote-viewer` work. A background service without access to that desktop
-session will fail the preflight instead of starting an unreachable installer.
+The beta.5 gate is headless. The runner may run as a background service and does
+not need `DISPLAY`, `WAYLAND_DISPLAY`, a session bus, or `remote-viewer`.
 
 Provision a short, dedicated, encrypted, disk-backed state directory. Long
 Actions paths can exceed Linux's 107-byte AF_UNIX socket pathname limit after
@@ -146,23 +145,16 @@ firewall if a fully controlled network boundary is required.
 3. Select `master`, enter the exact 40-character commit, and enter
    `RUN-WINDOWS-KVM-E2E` as the confirmation.
 4. Leave **keep_state** disabled for normal release validation.
-5. Approve the protected environment. After WinPE prepare/apply and the
-   boot-time agent checks pass, attend the LSW viewer and complete normal
-   Windows OOBE and the first administrative login.
+5. Approve the protected environment. No further operator action is required;
+   the job owns WinPE, unattended OOBE, agent verification, cold restart, and
+   cleanup.
 
-After first login, the harness owns the remaining sequence. It closes the
-viewer before the cold-restart check; do not perform a second manual sign-in.
-The gate fails unless a bare `lsw` restores an agent-backed ConPTY shell from
+The gate fails unless `lsw install` waits through the specialize-to-OOBE reboot
+for the exact setup-complete marker. It then requires `LSWSetup` to be absent,
+`Win32_ComputerSystem.UserName` to be empty, the cached unattend and staging
+paths to be gone, and Winlogon to contain neither automatic logon nor a stored
+`DefaultPassword`. A bare `lsw` must restore an agent-backed ConPTY shell from
 the installed disk without installation media or an interactive console user.
-
-Use a disposable, password-protected local Windows test identity. Do not enable
-automatic logon or use a blank password. While the operator is still signed in,
-the harness captures the console identity from `Win32_ComputerSystem.UserName`,
-requires an enabled local-account SID, checks `PasswordRequired`, rejects a
-blank-password `LogonUserW` success, and rejects Winlogon automatic-logon state
-or a stored `DefaultPassword`. These checks apply to the OOBE user, not to the
-agent service account. Do not enter a personal Microsoft account or production
-credential into a release-gate guest.
 
 ## Guest service contract
 
@@ -170,7 +162,7 @@ The `specialize` pass must register exactly one service named `LSWAgent` with
 `StartMode=Auto`, `State=Running`, and
 `StartName=NT SERVICE\LSWAgent`. All agent commands, including ConPTY sessions,
 intentionally run in Windows Session 0 under that virtual service account; the
-service does not impersonate the OOBE user or store that user's password.
+service does not impersonate a desktop user or store a daily user password.
 
 It must also register `LSWLicenseHelper` as Manual/demand-start under
 LocalSystem. The E2E status request proves that the agent SID can start it and

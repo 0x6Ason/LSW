@@ -276,6 +276,53 @@ fn windows_conpty_process_starts_inside_a_job() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_conpty_process_round_trips_input_and_output() {
+    let request = StartRequest {
+        kind: SessionKind::Shell,
+        argv: vec!["cmd.exe".to_owned()],
+        working_directory: None,
+    };
+    let mut process = windows_conpty::spawn_shell(
+        &request,
+        TerminalSize {
+            columns: 80,
+            rows: 25,
+        },
+    )
+    .expect("ConPTY shell should start");
+    process
+        .input
+        .write_all(b"echo LSW_CONPTY_DIRECT_OK & exit\r")
+        .and_then(|()| process.input.flush())
+        .expect("ConPTY input should be writable");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let exit_code = loop {
+        if let Some(code) = windows_conpty::wait_for_process_timeout(&process.process, 100)
+            .expect("ConPTY process wait should succeed")
+        {
+            break code;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ConPTY command did not exit after receiving input"
+        );
+    };
+    process
+        .job
+        .terminate(SESSION_CANCEL_EXIT_CODE)
+        .expect("ConPTY descendants should terminate");
+    drop(process.console);
+    let mut output = Vec::new();
+    process
+        .output
+        .read_to_end(&mut output)
+        .expect("ConPTY output should be readable to EOF");
+    assert_eq!(exit_code, 0);
+    assert!(String::from_utf8_lossy(&output).contains("LSW_CONPTY_DIRECT_OK"));
+}
+
 #[cfg(not(windows))]
 #[test]
 fn non_windows_agent_does_not_advertise_conpty() {
@@ -294,7 +341,6 @@ fn non_windows_agent_does_not_advertise_conpty() {
         .any(|capability| capability == lsw_core::CAPABILITY_SESSION_LEASE_V1));
 }
 
-#[cfg(unix)]
 fn controlled_test_connection(
     token: String,
 ) -> (TcpStream, Receiver<Result<(), String>>, Arc<AtomicUsize>) {
@@ -340,6 +386,89 @@ fn controlled_test_connection(
         .iter()
         .any(|capability| capability == CAPABILITY_SESSION_LEASE_V1));
     (stream, done_receiver, active_sessions)
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_conpty_shell_sends_exit_after_normal_completion() {
+    let token = "d".repeat(64);
+    let (mut stream, done, active_sessions) = controlled_test_connection(token);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("terminal read timeout should apply");
+    write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::SessionOptions,
+            SessionOptions {
+                cancel_on_disconnect: true,
+            }
+            .encode(),
+        ),
+    )
+    .expect("session options should be sent");
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionLease, SessionLease::standard().encode()),
+    )
+    .expect("session lease should be sent");
+    let request = TerminalStartRequest {
+        size: TerminalSize::new(25, 80).expect("terminal size should be valid"),
+        request: StartRequest {
+            kind: SessionKind::Shell,
+            argv: vec!["cmd.exe".to_owned()],
+            working_directory: None,
+        },
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::TerminalStart,
+            request.encode().expect("terminal request should encode"),
+        ),
+    )
+    .expect("terminal start should be sent");
+    if let Err(error) = write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::Stdin,
+            b"echo LSW_CONPTY_EXIT_OK & exit\r".to_vec(),
+        ),
+    ) {
+        panic!(
+            "terminal input should be sent: {error}; server={:?}",
+            done.recv_timeout(Duration::from_secs(2))
+        );
+    }
+
+    let mut output = Vec::new();
+    let exit_code = loop {
+        let frame = read_frame(&mut stream).unwrap_or_else(|error| {
+            panic!(
+                "terminal completion frame should arrive: {error}; output={:?}; server={:?}",
+                String::from_utf8_lossy(&output),
+                done.try_recv()
+            )
+        });
+        match frame.kind {
+            FrameKind::Stdout => output.extend(frame.payload),
+            FrameKind::Exit => {
+                break lsw_core::decode_exit(&frame.payload).expect("exit should decode")
+            }
+            FrameKind::Error => panic!(
+                "terminal returned an error: {}",
+                String::from_utf8_lossy(&frame.payload)
+            ),
+            other => panic!("unexpected terminal frame {other:?}"),
+        }
+    };
+    assert_eq!(exit_code, 0);
+    assert!(String::from_utf8_lossy(&output).contains("LSW_CONPTY_EXIT_OK"));
+    drop(stream);
+    done.recv_timeout(Duration::from_secs(5))
+        .expect("server session should finish")
+        .expect("server session should succeed");
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
 }
 
 #[cfg(unix)]

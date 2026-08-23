@@ -139,19 +139,20 @@ impl MicrosoftIsoResolver {
         }
     }
 
+    /// Reads Microsoft's current published SHA-256 for one x64 language.
+    ///
+    /// This does not request a short-lived download URL, so callers that
+    /// already have an ISO can verify it without consuming a Microsoft
+    /// download session.
+    pub fn published_sha256(&self, request: &MicrosoftIsoRequest) -> Result<String> {
+        validate_language(&request.language)?;
+        self.fetch_catalog()?.hash_for(&request.language, "x64")
+    }
+
     /// Resolves one x64 ISO and its Microsoft-published SHA-256.
     pub fn resolve(&self, request: &MicrosoftIsoRequest) -> Result<ResolvedWindowsIso> {
         validate_language(&request.language)?;
-        let page = read_response(
-            self.agent
-                .get(MICROSOFT_DOWNLOAD_PAGE)
-                .set("User-Agent", MICROSOFT_USER_AGENT)
-                .set("Accept", "text/html,application/xhtml+xml")
-                .call()
-                .map_err(|error| http_error("fetching the Microsoft download page", error))?,
-            "Microsoft download page",
-        )?;
-        let catalog = parse_download_page(&page)?;
+        let catalog = self.fetch_catalog()?;
         let mut session = MicrosoftSession::new(self.agent.clone())?;
         session.register()?;
         let languages = session.fetch_languages(&catalog.product_id)?;
@@ -179,6 +180,19 @@ impl MicrosoftIsoResolver {
             expires_at: response.expiration,
             download_url,
         })
+    }
+
+    fn fetch_catalog(&self) -> Result<DownloadPageCatalog> {
+        let page = read_response(
+            self.agent
+                .get(MICROSOFT_DOWNLOAD_PAGE)
+                .set("User-Agent", MICROSOFT_USER_AGENT)
+                .set("Accept", "text/html,application/xhtml+xml")
+                .call()
+                .map_err(|error| http_error("fetching the Microsoft download page", error))?,
+            "Microsoft download page",
+        )?;
+        parse_download_page(&page)
     }
 }
 

@@ -59,7 +59,7 @@ jobs:
           fi
 
   windows-kvm-e2e:
-    name: Windows 11 WinPE, agent, ConPTY, and cold restart
+    name: Windows 11 headless WinPE, agent, ConPTY, and cold restart
     needs: authorize
     environment: windows-kvm-e2e
     runs-on:
@@ -76,6 +76,7 @@ jobs:
       LSW_WINDOWS_EDITION: pro
       LSW_WINDOWS_PROFILE: slim
       LSW_E2E_TIMEOUT_SECONDS: "2700"
+      LSW_E2E_NO_VIEWER: "1"
       LSW_E2E_KEEP_STATE: ${{ inputs.keep_state && '1' || '0' }}
     steps:
       - name: Initialize isolated build paths
@@ -118,15 +119,10 @@ jobs:
             echo "error: the runner does not have readable and writable /dev/kvm" >&2
             exit 1
           fi
-          if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-            echo "error: the attended OOBE gate requires an interactive desktop session" >&2
-            exit 1
-          fi
-
           for command in \
             awk cargo findmnt git grep id python3 qemu-img \
-            qemu-system-x86_64 realpath remote-viewer rustc rustup \
-            script setsid sha256sum stat swtpm timeout tr \
+            qemu-system-x86_64 realpath rustc rustup \
+            setsid sha256sum stat swtpm timeout tr \
             7z wimlib-imagex xorriso \
             x86_64-w64-mingw32-gcc; do
             if ! command -v "$command" >/dev/null 2>&1; then

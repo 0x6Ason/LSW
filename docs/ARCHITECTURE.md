@@ -58,8 +58,11 @@ validation claims in the beta.5 candidate.
    the agent as the automatic `LSWAgent` Windows service under the virtual account
    `NT SERVICE\LSWAgent`. It removes the legacy per-user startup entry and
    restricts the guest token to SYSTEM, Administrators, and that service
-   identity. Commands and ConPTY sessions therefore run in Windows Session 0
-   without storing the OOBE user's password or requiring automatic logon.
+   identity. Supported OOBE settings create a random one-shot `LSWSetup` user
+   without automatic logon. `SetupComplete.cmd` removes that user, cached answer
+   files, its own script, and the staging payload before writing the completion
+   marker that the host waits for. Commands and ConPTY sessions therefore run
+   in Windows Session 0 without storing a daily user's password or requiring login.
    Visible desktop GUI work requires a future user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
@@ -154,7 +157,7 @@ That environment has no `/dev/kvm`, licensed Windows ISO, graphical desktop, or
 pathname Unix sockets (AF_UNIX `bind` returns `EPERM`). The firmware smoke
 therefore validates the QEMU building blocks locally, while the product daemon's
 Unix-socket lifecycle is a CI-only gate in this environment. Neither gate
-validates KVM acceleration, WinPE DISM execution, Windows OOBE, the installed
+validates KVM acceleration, WinPE DISM execution, unattended Windows OOBE, the installed
 service agent, the licensing helper, or ConPTY end to end. Those are required
 by the dedicated real Windows/KVM release gate.
 

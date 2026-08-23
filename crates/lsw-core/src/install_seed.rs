@@ -15,6 +15,7 @@ use crate::{
 
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const LICENSE_HELPER_SCRIPT: &[u8] = include_bytes!("../assets/license-helper.ps1");
+const SETUP_ACCOUNT_NAME: &str = "LSWSetup";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallSeedOptions {
@@ -42,6 +43,7 @@ pub struct InstallSeedPlan {
     pub wipes_virtual_disk: bool,
     pub includes_agent: bool,
     generated: BTreeMap<PathBuf, Vec<u8>>,
+    setup_account_password_value: String,
 }
 
 impl InstallSeedPlan {
@@ -63,6 +65,15 @@ impl InstallSeedPlan {
             );
         }
         lines
+    }
+
+    /// Returns the obfuscated unattend value for the one-shot OOBE account.
+    ///
+    /// The value is not encrypted. It remains in memory only so the WinPE
+    /// backend can generate the offline answer file without persisting a
+    /// second copy in the installation seed.
+    pub fn setup_account_password_value(&self) -> &str {
+        &self.setup_account_password_value
     }
 }
 
@@ -123,10 +134,12 @@ impl InstallSeedBuilder {
             });
         }
 
+        let setup_account_password = generate_setup_account_password()?;
+        let setup_account_password_value = unattend_password_value(&setup_account_password);
         let mut generated = BTreeMap::new();
         generated.insert(
             PathBuf::from("Autounattend.xml"),
-            autounattend(manifest, options).into_bytes(),
+            autounattend(manifest, options, &setup_account_password_value).into_bytes(),
         );
         generated.insert(
             PathBuf::from("lsw/agent.token"),
@@ -189,6 +202,7 @@ impl InstallSeedBuilder {
                 || options.unattended_image_name.is_some(),
             includes_agent: options.agent_binary.is_some(),
             generated,
+            setup_account_password_value,
         })
     }
 
@@ -244,7 +258,11 @@ impl InstallSeedBuilder {
     }
 }
 
-fn autounattend(manifest: &InstanceManifest, options: &InstallSeedOptions) -> String {
+fn autounattend(
+    manifest: &InstanceManifest,
+    options: &InstallSeedOptions,
+    setup_account_password_value: &str,
+) -> String {
     let selection = options
         .unattended_image_name
         .as_ref()
@@ -296,24 +314,50 @@ fn autounattend(manifest: &InstanceManifest, options: &InstallSeedOptions) -> St
       <UserData><AcceptEula>true</AcceptEula><FullName>LSW User</FullName><Organization>LSW</Organization></UserData>
     </component>
   </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order><Description>Install LSW guest services</Description>
+          <Path>cmd.exe /d /c for %D in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist "%D:\lsw\install-agent.ps1" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%D:\lsw\install-agent.ps1"</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>{computer_name}</ComputerName>
+    </component>
+  </settings>
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <InputLocale>{locale}</InputLocale><SystemLocale>{locale}</SystemLocale><UILanguage>{locale}</UILanguage><UserLocale>{locale}</UserLocale>
     </component>
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <ComputerName>{computer_name}</ComputerName>
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add">
-          <Order>1</Order><Description>Install LSW guest agent</Description><RequiresUserInput>false</RequiresUserInput>
-          <CommandLine>cmd.exe /d /c for %D in (D E F G H I J K L M N O P Q R S T U V W X Y Z) do @if exist "%D:\lsw\install-agent.ps1" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%D:\lsw\install-agent.ps1"</CommandLine>
-        </SynchronousCommand>
-      </FirstLogonCommands>
+      <RegisteredOrganization>LSW</RegisteredOrganization>
+      <RegisteredOwner>LSW User</RegisteredOwner>
+      <TimeZone>UTC</TimeZone>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Password><Value>{setup_account_password_value}</Value><PlainText>false</PlainText></Password>
+            <Description>Temporary account removed when unattended setup completes</Description>
+            <DisplayName>LSW Setup</DisplayName><Group>Users</Group><Name>{setup_account_name}</Name>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
     </component>
   </settings>
 </unattend>
 "#,
         locale = options.locale,
         computer_name = windows_computer_name(&manifest.spec.name),
+        setup_account_name = SETUP_ACCOUNT_NAME,
+        setup_account_password_value = setup_account_password_value,
     )
 }
 
@@ -322,16 +366,46 @@ fn install_agent_script() -> String {
 $AgentSource = Join-Path $PSScriptRoot 'lsw-agent.exe'
 $TokenSource = Join-Path $PSScriptRoot 'agent.token'
 $LicenseScriptSource = Join-Path $PSScriptRoot 'license-helper.ps1'
+$InstallRoot = Join-Path $env:ProgramFiles 'LSW'
+$DataRoot = Join-Path $env:ProgramData 'LSW'
+$SetupScriptsRoot = Join-Path $env:SystemRoot 'Setup\Scripts'
+$SetupCompletePath = Join-Path $SetupScriptsRoot 'SetupComplete.cmd'
+$SetupCompleteMarker = Join-Path $DataRoot 'setup-complete.marker'
+$SetupCompleteMarkerTemporary = Join-Path $DataRoot 'setup-complete.marker.tmp'
+
+New-Item -ItemType Directory -Force -Path $DataRoot, $SetupScriptsRoot | Out-Null
+Remove-Item -LiteralPath $SetupCompleteMarker, $SetupCompleteMarkerTemporary -Force -ErrorAction SilentlyContinue
+$SetupCompleteContents = @'
+@echo off
+setlocal EnableExtensions
+reg.exe add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul
+if errorlevel 1 exit /b 70
+for %%V in (DefaultUserName DefaultDomainName DefaultPassword) do reg.exe delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v %%V /f >nul 2>&1
+net.exe user "__LSW_SETUP_ACCOUNT__" /delete >nul 2>&1
+if errorlevel 1 exit /b 71
+del /f /q "%WINDIR%\Panther\unattend.xml" >nul 2>&1
+del /f /q "%WINDIR%\Panther\Unattend\unattend.xml" >nul 2>&1
+rd /s /q "%ProgramData%\LSW\setup" >nul 2>&1
+>"%ProgramData%\LSW\setup-complete.marker.tmp" echo LSW-SETUP-COMPLETE
+move /y "%ProgramData%\LSW\setup-complete.marker.tmp" "%ProgramData%\LSW\setup-complete.marker" >nul
+if errorlevel 1 exit /b 72
+del /f /q "%~f0" >nul 2>&1
+exit /b 0
+'@
+[System.IO.File]::WriteAllText(
+    $SetupCompletePath,
+    $SetupCompleteContents + "`r`n",
+    [System.Text.Encoding]::ASCII
+)
+
 if (-not (Test-Path -LiteralPath $AgentSource -PathType Leaf)) {
-    Write-Warning 'lsw-agent.exe is not present on the LSW seed. Install it manually and rerun this script.'
+    Write-Warning 'lsw-agent.exe is not present on the LSW seed. Unattended setup will finish without terminal access.'
     exit 0
 }
 if (-not (Test-Path -LiteralPath $LicenseScriptSource -PathType Leaf)) {
     throw 'license-helper.ps1 is not present on the LSW seed.'
 }
 
-$InstallRoot = Join-Path $env:ProgramFiles 'LSW'
-$DataRoot = Join-Path $env:ProgramData 'LSW'
 $ServiceName = 'LSWAgent'
 $ServiceDisplayName = 'LSW Guest Agent'
 $ServiceAccount = 'NT SERVICE\LSWAgent'
@@ -580,6 +654,7 @@ if ($StartedService.Status -ne 'Running') {
         "__LSW_LICENSE_HELPER_PORT__",
         &LICENSE_HELPER_GUEST_PORT.to_string(),
     )
+    .replace("__LSW_SETUP_ACCOUNT__", SETUP_ACCOUNT_NAME)
 }
 
 fn profile_script(manifest: &InstanceManifest) -> Result<String> {
@@ -616,16 +691,66 @@ Get-AppxProvisionedPackage -Online | Where-Object {{ $RemoveNames -contains $_.D
 
 fn seed_readme(manifest: &InstanceManifest, options: &InstallSeedOptions) -> String {
     format!(
-        "LSW installation seed\r\n\r\nInstance: {}\r\nProfile: {}\r\nLocale: {}\r\n\r\nThis seed contains no Windows image, product key, or activation data.\r\nThe answer file records the user's prior license acceptance but does not hide OOBE, create an account, or bypass activation.\r\n{}\r\n",
+        "LSW installation seed\r\n\r\nInstance: {}\r\nProfile: {}\r\nLocale: {}\r\n\r\nThis seed contains no Windows image, product key, or activation data.\r\nThe answer file records the user's prior license acceptance and completes OOBE without automatic logon. A random one-shot local account is removed before setup is marked complete.\r\n{}\r\n",
         manifest.spec.name,
         manifest.spec.profile,
         options.locale,
         if options.agent_binary.is_some() {
-            "lsw-agent.exe is included and will be installed at first administrative logon."
+            "lsw-agent.exe is included and will be installed as a boot-time Windows service during specialize."
         } else {
             "lsw-agent.exe is not included. Copy a Windows x64 agent build to lsw\\lsw-agent.exe before installation."
         }
     )
+}
+
+fn generate_setup_account_password() -> Result<String> {
+    let mut random = [0_u8; 24];
+    getrandom::getrandom(&mut random).map_err(|error| {
+        LswError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("the operating system random source failed: {error}"),
+        ))
+    })?;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut password = String::with_capacity(53);
+    password.push_str("LsW!9");
+    for byte in random {
+        password.push(HEX[(byte >> 4) as usize] as char);
+        password.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(password)
+}
+
+fn unattend_password_value(password: &str) -> String {
+    let mut bytes = Vec::with_capacity((password.len() + "Password".len()) * 2);
+    for code_unit in password.encode_utf16().chain("Password".encode_utf16()) {
+        bytes.extend_from_slice(&code_unit.to_le_bytes());
+    }
+    base64_encode(&bytes)
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 fn validate_locale(locale: &str) -> Result<()> {
@@ -730,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn guided_seed_keeps_oobe_and_omits_product_keys() {
+    fn installation_seed_completes_oobe_without_logon_or_product_keys() {
         let (root, manifest) = fixture();
         let plan = InstallSeedBuilder::plan(
             &manifest,
@@ -749,7 +874,22 @@ mod tests {
         assert!(answer.contains("<AcceptEula>true</AcceptEula>"));
         assert!(!answer.contains("ProductKey"));
         assert!(!answer.contains("SkipMachineOOBE"));
-        assert!(!answer.contains("HideEULAPage"));
+        assert!(answer.contains("<HideEULAPage>true</HideEULAPage>"));
+        assert!(answer.contains("<HideOnlineAccountScreens>true</HideOnlineAccountScreens>"));
+        assert!(answer.contains("<ProtectYourPC>3</ProtectYourPC>"));
+        assert!(answer.contains("<Name>LSWSetup</Name>"));
+        assert!(answer.contains("<Group>Users</Group>"));
+        assert!(answer.contains("<PlainText>false</PlainText>"));
+        assert!(answer.contains(plan.setup_account_password_value()));
+        assert!(!answer.contains("AutoLogon"));
+        assert!(!answer.contains("FirstLogonCommands"));
+        let computer_name = answer
+            .find("<ComputerName>")
+            .expect("computer name should exist");
+        let oobe = answer
+            .find("<settings pass=\"oobeSystem\">")
+            .expect("OOBE pass should exist");
+        assert!(computer_name < oobe);
         assert!(!answer.contains("WillWipeDisk"));
 
         let installer = String::from_utf8(
@@ -811,6 +951,13 @@ mod tests {
         assert!(installer.contains("Remove-ItemProperty -Path $RunKey -Name 'LSWAgent'"));
         assert!(installer.contains("Remove-Item -LiteralPath $TokenSource -Force"));
         assert!(installer.contains("$SetupRootFullPath.StartsWith($DataRootFullPath"));
+        assert!(installer.contains("net.exe user \"LSWSetup\" /delete"));
+        assert!(installer.contains("/v AutoAdminLogon /t REG_SZ /d 0 /f"));
+        assert!(installer.contains("DefaultUserName DefaultDomainName DefaultPassword"));
+        assert!(installer.contains("setup-complete.marker"));
+        assert!(installer.contains("LSW-SETUP-COMPLETE"));
+        assert!(installer.contains("%WINDIR%\\Panther\\unattend.xml"));
+        assert!(installer.contains("del /f /q \"%~f0\""));
         assert!(!installer.contains("New-ItemProperty"));
         assert!(!installer.contains("Start-Process"));
         assert!(license_helper.contains("[Console]::In.ReadLine()"));
@@ -835,6 +982,14 @@ mod tests {
         assert!(terminate_stale_agent < remove_autorun);
         assert!(remove_autorun < replace_binary);
         fs::remove_dir_all(root).expect("fixture should be removed");
+    }
+
+    #[test]
+    fn unattend_password_encoding_matches_windows_sim() {
+        assert_eq!(
+            unattend_password_value("pw"),
+            "cAB3AFAAYQBzAHMAdwBvAHIAZAA="
+        );
     }
 
     #[test]

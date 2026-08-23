@@ -79,8 +79,8 @@ still pass the dedicated Windows/KVM gate.
 
 ## Gates requiring a real host and Windows guest
 
-Ordinary source and GitHub-hosted runners do not provide an attended Windows
-11/KVM desktop environment. The following workloads run only on a dedicated,
+Ordinary source and GitHub-hosted runners do not provide a real Windows 11/KVM
+environment. The following workloads run only on a dedicated,
 isolated Linux x86_64 self-hosted release runner. Beta.5 must not be described
 as hardware-attested until they succeed:
 
@@ -88,8 +88,9 @@ as hardware-attested until they succeed:
   operator-provisioned read-only ISO.
 - Real DISM execution for the network-disabled WinPE prepare/apply phases,
   completion markers, and transient workspace/seed cleanup.
-- KVM cold boot, Windows 11 OOBE and first login, the OOBE local user's password
-  and automatic-logon policy, and the automatic `LSWAgent` service's Name,
+- KVM cold boot, unattended Windows 11 OOBE, removal of the one-shot setup
+  account and cached answer/staging files, absence of a console login or
+  automatic-logon credential, and the automatic `LSWAgent` service's Name,
   StartMode, State, StartName, and `S-1-5-80-...` process SID. After a complete
   shutdown, bare `lsw` must restore an agent-backed ConPTY shell with the same
   service SID, no interactive console user, and no attached ISO or seed.
@@ -105,7 +106,7 @@ as hardware-attested until they succeed:
   behavior. QMP `stop`/`cont`/`quit` is covered against real QEMU, and the CI
   lifecycle gate checks `lswd` through a filesystem QMP socket.
 - ConPTY Unicode, Ctrl events, resize, disconnect, and long interactive use.
-- Private Unix-socket VNC viewer compatibility.
+- Optional private Unix-socket VNC viewer compatibility.
 - Executables, paths, firmware, daemon IPC, and complete lifecycle behavior on
   macOS HVF and Windows WHPX hosts.
 
@@ -131,7 +132,7 @@ as hardware-attested until they succeed:
 - Installation and recovery use private Unix-socket VNC. There is no RDP or TCP
   VNC listener.
 - Agent commands and ConPTY sessions run in Windows Session 0 as
-  `NT SERVICE\LSWAgent`; they do not impersonate the OOBE user. This provides a
+  `NT SERVICE\LSWAgent`; they do not impersonate a desktop user. This provides a
   CLI without login, but a service-launched GUI does not appear on the user's
   desktop. A user-session companion is not implemented.
 - Suspend/resume applies QMP `stop`/`cont` to a running QEMU process. There is
@@ -155,12 +156,13 @@ as hardware-attested until they succeed:
 2. Run `lsw install NAME --iso PATH --edition pro --profile slim`; verify both
    WinPE completion markers and removal of the workspace and seed before normal
    boot.
-3. Complete OOBE/first login. Confirm the console local user requires a
-   non-empty password and has no automatic login. Verify `LSWAgent` is
-   Auto/Running with StartName `NT SERVICE\LSWAgent`. Under the service identity,
+3. Let the headless install complete without console input. Confirm the
+   one-shot `LSWSetup` account, cached unattend, SetupComplete script, and setup
+   payload are gone, with no console user or automatic login. Verify `LSWAgent`
+   is Auto/Running with StartName `NT SERVICE\LSWAgent`. Under the service identity,
    test ConPTY Unicode, Ctrl, resize, stdin EOF, cancellation, disconnect and
    lease expiry; exit-code propagation; descendant cleanup; 1 GiB transfer; and
-   concurrent commands. After full shutdown and viewer close, use bare `lsw` to
+   concurrent commands. After full shutdown, use bare `lsw` to
    verify cold-boot recovery with no interactive console user, no ISO/seed, and
    an unchanged service SID.
 4. Run `lsw license status`; verify the helper is Manual/LocalSystem and returns

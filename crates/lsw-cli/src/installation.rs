@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use lsw_core::{
     HostCapabilities, InstallSeedBuilder, InstanceManifest, InstanceSpec, InstanceState,
     IsoDownloadEngine, IsoDownloader, LaunchPhase, LswError, MicrosoftIsoRequest,
-    MicrosoftIsoResolver, Provisioner, StateStore, WinPeDismBackend, WinPeDismVmPhase,
-    WindowsEdition, WindowsMediaInspector, WindowsProfile, WINPE_VM_TIMEOUT,
+    MicrosoftIsoResolver, Provisioner, SessionKind, StartRequest, StateStore, WinPeDismBackend,
+    WinPeDismVmPhase, WindowsEdition, WindowsMediaInspector, WindowsProfile, WINPE_VM_TIMEOUT,
 };
 
 use crate::agent_client::AgentClient;
@@ -122,9 +122,17 @@ pub(super) fn install_instance(
         }
         Err(error) => return Err(error.into()),
     }
+    let verify_agent = !parsed.without_agent && seed.join("lsw/lsw-agent.exe").is_file();
     start_named_instance(store, &name, LaunchPhase::Install)?;
     if !parsed.no_viewer {
         launch_installation_viewer(store, &name)?;
+    }
+    if verify_agent {
+        wait_for_unattended_setup(store, &name, Duration::from_secs(60 * 60))?;
+        show_activation_notice_once(store, &name);
+        println!("Environment verified. Run `lsw` to enter PowerShell.");
+    } else {
+        println!("Windows setup is running without a verifiable LSW agent.");
     }
     Ok(())
 }
@@ -212,6 +220,7 @@ fn install_new_instance(
         &edition,
         &seed_plan.destination,
         &options.locale,
+        seed_plan.setup_account_password_value(),
     ) {
         let mut failed = manifest.clone();
         failed.state = InstanceState::Failed;
@@ -232,7 +241,7 @@ fn install_new_instance(
         launch_installation_viewer(store, name)?;
     }
     if !parsed.without_agent {
-        wait_for_agent_probe(store, name, Duration::from_secs(10 * 60))?;
+        wait_for_unattended_setup(store, name, Duration::from_secs(15 * 60))?;
         show_activation_notice_once(store, name);
         println!("Environment verified. Run `lsw` to enter PowerShell.");
     } else {
@@ -305,6 +314,7 @@ fn run_winpe_preinstallation(
     edition: &WindowsEdition,
     install_seed: &Path,
     locale: &str,
+    setup_account_password_value: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Preparing {} with official WinPE DISM (network disabled)...",
@@ -316,6 +326,7 @@ fn run_winpe_preinstallation(
         instance_dir,
         install_seed,
         locale,
+        setup_account_password_value,
     )?;
     WinPeDismBackend::write_seed(&prepare)?;
     let prepare_vm = WinPeDismBackend::plan_vm(
@@ -413,20 +424,31 @@ fn remove_transient_path(
     Ok(())
 }
 
-fn wait_for_agent_probe(
+fn wait_for_unattended_setup(
     store: &StateStore,
     name: &str,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Waiting for the boot-time LSW agent to verify the environment...");
+    println!("Waiting for unattended Windows setup and the boot-time LSW agent...");
     let token = store.read_agent_token(name)?;
     let deadline = Instant::now() + timeout;
+    let marker_probe = StartRequest {
+        kind: SessionKind::Exec,
+        argv: vec![
+            "powershell.exe".to_owned(),
+            "-NoLogo".to_owned(),
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            r#"$Marker='C:\ProgramData\LSW\setup-complete.marker'; if (-not (Test-Path -LiteralPath $Marker -PathType Leaf)) { exit 23 }; if ([System.IO.File]::ReadAllText($Marker).Trim() -cne 'LSW-SETUP-COMPLETE') { exit 24 }; foreach ($Path in @('C:\Windows\Panther\unattend.xml', 'C:\Windows\Panther\Unattend\unattend.xml', 'C:\Windows\Setup\Scripts\SetupComplete.cmd', 'C:\ProgramData\LSW\setup')) { if (Test-Path -LiteralPath $Path) { exit 25 } }; if ($null -ne (Get-LocalUser -Name 'LSWSetup' -ErrorAction SilentlyContinue)) { exit 26 }; $Winlogon=Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'; if ([string]$Winlogon.AutoAdminLogon -eq '1') { exit 27 }; $StoredPassword=$Winlogon.PSObject.Properties['DefaultPassword']; if ($null -ne $StoredPassword -and -not [string]::IsNullOrEmpty([string]$StoredPassword.Value)) { exit 28 }"#.to_owned(),
+        ],
+        working_directory: None,
+    };
     loop {
         let manifest = store.load(name)?;
-        if AgentClient::connect(&manifest, &token)
-            .and_then(AgentClient::probe)
-            .is_ok()
-        {
+        let setup_complete = AgentClient::connect(&manifest, &token)
+            .and_then(|client| client.run_capture(&marker_probe, &[], 1024))
+            .is_ok_and(|process| process.exit_code == 0);
+        if setup_complete {
             return Ok(());
         }
         if manifest.state == InstanceState::Failed {
@@ -434,7 +456,7 @@ fn wait_for_agent_probe(
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "timed out waiting for the guest agent; inspect {} and reopen the display with `lsw view {name}`",
+                "timed out waiting for unattended Windows setup; inspect {} or open the display with `lsw view {name}`",
                 store.instance_dir(name)?.join("qemu.log").display()
             )
             .into());
@@ -468,7 +490,7 @@ fn ensure_install_dependencies(
     if !missing.is_empty() {
         println!("Missing host dependencies: {}", missing.join(", "));
         println!("Attempting the same package repair as `lsw doctor --fix`...");
-        fix_host_dependencies()?;
+        fix_host_dependencies(needs_viewer)?;
         capabilities = HostCapabilities::detect();
         let mut remaining = capabilities.missing_for_profile_launch(profile);
         remaining.extend(capabilities.missing_for_profile_preparation(profile));

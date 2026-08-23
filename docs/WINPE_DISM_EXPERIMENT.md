@@ -64,11 +64,12 @@ Unit tests cover stage construction, image-index validation, atomic/private seed
 writing, absence of product keys, the conservative stock path, exact DISM
 operations, separated disk topology, apply/CompactOS behavior, payload ACL
 staging, control-media topology, and mandatory completion markers. The backend
-is enabled in the beta.5 installer. A local Windows 11 25H2/KVM run completed
-both WinPE phases, specialize, SCM agent startup, activation status,
-suspend/resume, graceful shutdown, and a no-login cold restart. The protected
-exact-commit release-gate job remains mandatory before tagging beta.5; a local
-run does not replace that publication control.
+is enabled in the beta.5 installer. A real Windows 11 25H2/KVM run completed
+both WinPE phases, specialize, and SCM agent startup, then exposed a race where
+the first agent connection preceded the specialize-to-OOBE reboot. The headless
+installer now waits for a post-OOBE cleanup marker instead. The protected
+exact-commit release-gate job remains mandatory before tagging beta.5; partial
+or local runs do not replace that publication control.
 
 The command sequence follows Microsoft's documentation for
 [WinPE startup scripts](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/wpeinit-and-startnetcmd-using-winpe-startup-scripts?view=windows-11),

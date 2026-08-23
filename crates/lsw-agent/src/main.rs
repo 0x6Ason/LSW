@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+#[cfg(windows)]
+use std::sync::Weak;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -126,12 +128,22 @@ fn run_license_client(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn st
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_start_attempt = Instant::now() + Duration::from_secs(1);
     let mut stream = loop {
         match TcpStream::connect(("127.0.0.1", LICENSE_HELPER_PORT)) {
             Ok(stream) => break stream,
             Err(error) if Instant::now() < deadline => {
                 let _ = error;
+                if Instant::now() >= next_start_attempt {
+                    let _ = Command::new("sc.exe")
+                        .args(["start", LICENSE_HELPER_SERVICE])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    next_start_attempt = Instant::now() + Duration::from_secs(1);
+                }
                 thread::sleep(Duration::from_millis(100));
             }
             Err(error) => {
@@ -1142,7 +1154,7 @@ fn bridge_terminal(
     let input_thread = spawn_terminal_input_bridge(
         stream,
         input,
-        Arc::clone(&console),
+        Arc::downgrade(&console),
         session_mode,
         control_sender,
     );
@@ -1154,15 +1166,22 @@ fn bridge_terminal(
         session_end,
         SessionEnd::Disconnected | SessionEnd::LeaseExpired
     );
-    let _ = input_shutdown.shutdown(if session_end == SessionEnd::LeaseExpired {
-        Shutdown::Both
-    } else {
-        Shutdown::Read
-    });
-    join_terminal_input(input_thread)?;
     drop(console);
-    join_bridge(output_thread, peer_unavailable)?;
-    finish_session(&writer, session_end, code)
+    if peer_unavailable {
+        let _ = input_shutdown.shutdown(Shutdown::Both);
+    }
+    let result = (|| {
+        join_bridge(output_thread, peer_unavailable)?;
+        finish_session(&writer, session_end, code)
+    })();
+    // A Weak console reference lets normal output drain before EXIT while the
+    // socket remains writable. Close both directions only after the terminal
+    // completion frame so a blocking recv on a duplicated Winsock handle wakes
+    // reliably without truncating the protocol.
+    let _ = input_shutdown.shutdown(Shutdown::Both);
+    let input_result = join_terminal_input(input_thread);
+    result?;
+    input_result
 }
 
 fn wait_for_child(
@@ -1471,7 +1490,7 @@ fn spawn_input_bridge(
 fn spawn_terminal_input_bridge(
     mut stream: TcpStream,
     input: impl Write + Send + 'static,
-    console: Arc<windows_conpty::PseudoConsole>,
+    console: Weak<windows_conpty::PseudoConsole>,
     session_mode: SessionMode,
     control_sender: SyncSender<SessionControlEvent>,
 ) -> thread::JoinHandle<Result<(), String>> {
@@ -1507,6 +1526,9 @@ fn spawn_terminal_input_bridge(
                                 error.to_string(),
                             )
                         }
+                    };
+                    let Some(console) = console.upgrade() else {
+                        return Ok(());
                     };
                     if let Err(error) = console.resize(size) {
                         return terminal_bridge_failure(

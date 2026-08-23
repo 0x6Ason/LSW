@@ -46,6 +46,7 @@ const WINPE_SHELL: &[u8] = include_bytes!("../assets/winpeshl.ini");
 const MAX_SEED_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STATUS_LOG_BYTES: u64 = 1024 * 1024;
 const MIN_APPLIED_DISK_BYTES: u64 = 512 * 1024 * 1024;
+const SETUP_ACCOUNT_NAME: &str = "LSWSetup";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// One of the two isolated WinPE microVM phases.
@@ -430,16 +431,18 @@ impl WinPeDismBackend {
         instance_dir: &Path,
         install_seed: &Path,
         locale: &str,
+        setup_account_password_value: &str,
     ) -> Result<WinPeDismPlan> {
         manifest.spec.validate()?;
         require_real_directory(install_seed)?;
         validate_locale(locale)?;
+        validate_unattend_password_value(setup_account_password_value)?;
         let mut plan = Self::plan(manifest.spec.profile, edition_index, instance_dir)?;
         let customization = CustomizationPlan::for_profile(manifest.spec.profile)?;
 
         plan.generated.insert(
             PathBuf::from("lsw/offline-unattend.xml"),
-            offline_unattend(manifest, locale).into_bytes(),
+            offline_unattend(manifest, locale, setup_account_password_value).into_bytes(),
         );
         plan.includes_agent = copy_guest_setup_payload(&mut plan.generated, install_seed)?;
         plan.generated.insert(
@@ -1348,7 +1351,11 @@ exit /b 0
     )
 }
 
-fn offline_unattend(manifest: &InstanceManifest, locale: &str) -> String {
+fn offline_unattend(
+    manifest: &InstanceManifest,
+    locale: &str,
+    setup_account_password_value: &str,
+) -> String {
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -1361,20 +1368,60 @@ fn offline_unattend(manifest: &InstanceManifest, locale: &str) -> String {
         </RunSynchronousCommand>
       </RunSynchronous>
     </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>{computer_name}</ComputerName>
+    </component>
   </settings>
   <settings pass="oobeSystem">
     <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
       <InputLocale>{locale}</InputLocale><SystemLocale>{locale}</SystemLocale><UILanguage>{locale}</UILanguage><UserLocale>{locale}</UserLocale>
     </component>
     <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-      <ComputerName>{computer_name}</ComputerName>
+      <RegisteredOrganization>LSW</RegisteredOrganization>
+      <RegisteredOwner>LSW User</RegisteredOwner>
+      <TimeZone>UTC</TimeZone>
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Password><Value>{setup_account_password_value}</Value><PlainText>false</PlainText></Password>
+            <Description>Temporary account removed when unattended setup completes</Description>
+            <DisplayName>LSW Setup</DisplayName><Group>Users</Group><Name>{setup_account_name}</Name>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
     </component>
   </settings>
 </unattend>
 "#,
         locale = xml_escape(locale),
         computer_name = windows_computer_name(&manifest.spec.name),
+        setup_account_name = SETUP_ACCOUNT_NAME,
+        setup_account_password_value = xml_escape(setup_account_password_value),
     )
+}
+
+fn validate_unattend_password_value(value: &str) -> Result<()> {
+    let padding = value.bytes().rev().take_while(|byte| *byte == b'=').count();
+    if (16..=512).contains(&value.len())
+        && value.len() % 4 == 0
+        && padding <= 2
+        && value[..value.len() - padding]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    {
+        Ok(())
+    } else {
+        Err(LswError::InvalidValue {
+            field: "setup account password value",
+            reason: "must be a bounded base64 value produced by the install seed".to_owned(),
+        })
+    }
 }
 
 fn winpe_script(
@@ -1712,7 +1759,7 @@ mod tests {
         .expect("manifest should be valid")
     }
 
-    fn install_seed(root: &Path, manifest: &InstanceManifest) -> PathBuf {
+    fn install_seed(root: &Path, manifest: &InstanceManifest) -> (PathBuf, String) {
         let agent = root.join("lsw-agent.exe");
         fs::write(&agent, b"MZfixture agent").expect("agent fixture should be written");
         let options = InstallSeedOptions {
@@ -1722,8 +1769,9 @@ mod tests {
         };
         let plan = InstallSeedBuilder::plan(manifest, root, &"a".repeat(64), &options)
             .expect("install seed should be planned");
+        let setup_account_password_value = plan.setup_account_password_value().to_owned();
         InstallSeedBuilder::apply(&plan).expect("install seed should be written");
-        root.join("seed")
+        (root.join("seed"), setup_account_password_value)
     }
 
     fn vm_capabilities(root: &Path) -> HostCapabilities {
@@ -1822,10 +1870,16 @@ mod tests {
     fn prepare_plan_stages_guest_setup_inside_the_wim() {
         let root = fixture();
         let manifest = manifest(&root, WindowsProfile::Slim);
-        let install_seed = install_seed(&root, &manifest);
-        let plan =
-            WinPeDismBackend::plan_with_guest_setup(&manifest, 6, &root, &install_seed, "zh-HK")
-                .expect("prepare plan with guest setup should be generated");
+        let (install_seed, setup_account_password_value) = install_seed(&root, &manifest);
+        let plan = WinPeDismBackend::plan_with_guest_setup(
+            &manifest,
+            6,
+            &root,
+            &install_seed,
+            "zh-HK",
+            &setup_account_password_value,
+        )
+        .expect("prepare plan with guest setup should be generated");
         let script = plan.script();
 
         assert!(plan.includes_agent);
@@ -1852,6 +1906,21 @@ mod tests {
         assert!(unattend.contains("<RunSynchronous>"));
         assert!(unattend.contains("C:\\ProgramData\\LSW\\setup\\install-agent.ps1"));
         assert!(!unattend.contains("FirstLogonCommands"));
+        assert!(unattend.contains("<HideOnlineAccountScreens>true</HideOnlineAccountScreens>"));
+        assert!(unattend.contains("<ProtectYourPC>3</ProtectYourPC>"));
+        assert!(unattend.contains("<Name>LSWSetup</Name>"));
+        assert!(unattend.contains("<Group>Users</Group>"));
+        assert!(unattend.contains("<PlainText>false</PlainText>"));
+        assert!(unattend.contains(&setup_account_password_value));
+        assert!(!unattend.contains("AutoLogon"));
+        assert!(!unattend.contains("SkipMachineOOBE"));
+        let computer_name = unattend
+            .find("<ComputerName>")
+            .expect("computer name should exist");
+        let oobe = unattend
+            .find("<settings pass=\"oobeSystem\">")
+            .expect("OOBE pass should exist");
+        assert!(computer_name < oobe);
         assert!(!unattend.contains("ProductKey"));
         assert!(plan
             .generated

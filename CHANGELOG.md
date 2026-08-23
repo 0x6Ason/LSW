@@ -38,7 +38,11 @@
   `LSWAgent` Windows service, running under the virtual account
   `NT SERVICE\LSWAgent`. Agent commands intentionally execute in that service
   identity and do not require a stored user password or automatic logon. The
-  pre-applied flow installs it during `specialize`, before interactive login.
+  pre-applied flow installs it during `specialize`. Supported unattended OOBE
+  settings use a per-install random one-shot account without AutoLogon;
+  SetupComplete removes that account, cached answer files, its script, and the
+  staging payload before `lsw install` reports completion. Installation is
+  headless by default, with `--viewer` as an explicit diagnostic option.
 - Moved the guest agent and activation-helper listeners to ports 35040/35041
   after clean Windows 11 testing found TCP 5040 occupied by the Connected
   Devices Platform service. SCM sessions now restore blocking mode on accepted
@@ -58,10 +62,10 @@
   live runtime PID/socket/viewer markers.
 - Added cleanup of QEMU pid/viewer artifacts and stale runtime sockets after a
   stopped guest, plus a guarded real Windows/KVM operator workflow covering
-  Setup, OOBE user credential policy, Windows build/edition identity, the
+  headless Setup/OOBE cleanup, Windows build/edition identity, the
   automatic service's configuration and stable process SID, true ConPTY, guest
   exit codes, graceful shutdown, bare-`lsw` cold restart without install media
-  or an interactive login, and exact daemon/viewer/QEMU/socket/port cleanup.
+  or an interactive login, and exact daemon/QEMU/socket/port cleanup.
   The gate also requires Microsoft's current published ISO hash, both WinPE
   completion markers, transient cleanup, WMI license status and the activation
   helper boundary. New tagged releases fail closed unless that job passed for

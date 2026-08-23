@@ -173,16 +173,17 @@ also creates a GitHub Release with `GITHUB_TOKEN`; no repository secret is
 required. Tags containing a prerelease suffix such as `-beta.4` are published
 as prereleases.
 
-`.github/workflows/windows-kvm-e2e.yml` is the separate, attended beta release
+`.github/workflows/windows-kvm-e2e.yml` is the separate, headless beta release
 gate. It can run only by manual dispatch from an exact `master` commit on the
 explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. Windows media is
 pre-provisioned read-only on that runner. The workflow resolves Microsoft's
 current English x64 metadata and requires the provisioned file to match both
 the configured digest and Microsoft's published SHA-256; it never downloads or
 uploads the ISO payload. It requires both WinPE completion markers and removal
-of token-bearing transient media. The gate captures the local OOBE user only
-for password/automatic-logon policy checks; all agent commands run as
-`NT SERVICE\LSWAgent`. It also verifies WMI license status through the stopped,
+of token-bearing transient media. The gate requires unattended OOBE to remove
+the one-shot local account, cached answer files, SetupComplete script, and
+staging payload; it rejects a console login or automatic-logon credential. All
+agent commands run as `NT SERVICE\LSWAgent`. It also verifies WMI license status through the stopped,
 demand-start LocalSystem helper. After shutdown it requires a no-login cold
 boot, the same service SID, true ConPTY, detached installation media, and
 complete runtime cleanup. See

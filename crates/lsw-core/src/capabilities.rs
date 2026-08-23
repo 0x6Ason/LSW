@@ -148,9 +148,6 @@ impl HostCapabilities {
         if self.seven_zip.is_none() {
             missing.push("7z (UDF-capable ISO extractor)");
         }
-        if self.remote_viewer.is_none() {
-            missing.push("remote-viewer");
-        }
         missing.sort_unstable();
         missing.dedup();
         missing
@@ -237,5 +234,8 @@ mod tests {
         let capabilities = HostCapabilities::unavailable(HostPlatform::Linux);
         assert_eq!(capabilities.missing_for_launch().len(), 4);
         assert_eq!(capabilities.missing_for_preparation().len(), 2);
+        assert!(!capabilities
+            .missing_for_install_workflow()
+            .contains(&"remote-viewer"));
     }
 }

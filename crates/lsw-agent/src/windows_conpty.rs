@@ -23,6 +23,7 @@ type PseudoConsoleHandle = RawHandle;
 
 const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
 const CREATE_SUSPENDED: u32 = 0x0000_0004;
+const STARTF_USESTDHANDLES: u32 = 0x0000_0100;
 const INFINITE: u32 = u32::MAX;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 const WAIT_OBJECT_0: u32 = 0;
@@ -329,6 +330,7 @@ fn spawn_program(
     };
     startup.startup_info.cb = u32::try_from(size_of_val(&startup))
         .map_err(|_| io::Error::other("STARTUPINFOEXW is too large"))?;
+    startup.startup_info.flags = STARTF_USESTDHANDLES;
 
     let command_line = super::windows_command_line(program, arguments);
     let mut command_line = OsStr::new(&command_line)

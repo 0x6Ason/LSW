@@ -28,6 +28,7 @@ pub(super) struct InstallArguments {
     pub(super) seed: InstallSeedOptions,
     pub(super) without_agent: bool,
     pub(super) no_viewer: bool,
+    viewer_option_seen: bool,
     pub(super) seed_option_seen: bool,
     pub(super) create_option_seen: bool,
     pub(super) language_option_seen: bool,
@@ -49,7 +50,8 @@ impl InstallArguments {
             allow_unsupported_requirements: false,
             seed: InstallSeedOptions::default(),
             without_agent: false,
-            no_viewer: false,
+            no_viewer: true,
+            viewer_option_seen: false,
             seed_option_seen: false,
             create_option_seen: false,
             language_option_seen: false,
@@ -126,10 +128,18 @@ impl InstallArguments {
                     parsed.seed_option_seen = true;
                 }
                 "--no-viewer" => {
-                    if parsed.no_viewer {
-                        return Err("--no-viewer was supplied more than once".into());
+                    if parsed.viewer_option_seen {
+                        return Err("--viewer and --no-viewer may be supplied only once".into());
                     }
                     parsed.no_viewer = true;
+                    parsed.viewer_option_seen = true;
+                }
+                "--viewer" => {
+                    if parsed.viewer_option_seen {
+                        return Err("--viewer and --no-viewer may be supplied only once".into());
+                    }
+                    parsed.no_viewer = false;
+                    parsed.viewer_option_seen = true;
                 }
                 "--allow-unsupported-requirements" => {
                     parsed.allow_unsupported_requirements = true;

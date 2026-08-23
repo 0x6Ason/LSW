@@ -10,6 +10,8 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use lsw_core::{SessionKind, StartRequest, StateStore};
 
@@ -128,10 +130,23 @@ fn capture_guest_license_action(
 }
 
 pub(super) fn show_activation_notice_once(store: &StateStore, name: &str) {
-    let Ok(output) = capture_guest_license_action(store, name, "status", &[]) else {
+    let mut output = None;
+    for attempt in 0..3 {
+        match capture_guest_license_action(store, name, "status", &[]) {
+            Ok(captured) => {
+                output = Some(captured);
+                break;
+            }
+            Err(error) if attempt == 2 => {
+                eprintln!("warning: could not query Windows activation status: {error}");
+            }
+            Err(_) => thread::sleep(Duration::from_secs(1)),
+        }
+    }
+    let Some(output) = output else {
         return;
     };
-    if !output.lines().any(|line| line == "STATUS=unlicensed") {
+    if !license_status_is_unlicensed(&output) {
         return;
     }
     let Ok(instance_dir) = store.instance_dir(name) else {
@@ -151,6 +166,12 @@ pub(super) fn show_activation_notice_once(store: &StateStore, name: &str) {
     println!("  Activate now:          lsw license activate {name}");
     println!("  Open Windows Activation: lsw license open {name}");
     println!("  Later:                 continue with `lsw`");
+}
+
+fn license_status_is_unlicensed(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim_end_matches('\r') == "STATUS=unlicensed")
 }
 
 fn read_product_key(from_stdin: bool) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -226,5 +247,20 @@ impl TerminalEchoGuard {
 impl Drop for TerminalEchoGuard {
     fn drop(&mut self) {
         let _ = Command::new("stty").arg("echo").status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::license_status_is_unlicensed;
+
+    #[test]
+    fn activation_notice_accepts_windows_line_endings() {
+        assert!(license_status_is_unlicensed(
+            "STATUS=unlicensed\r\nLICENSE_STATUS=5\r\n"
+        ));
+        assert!(!license_status_is_unlicensed(
+            "STATUS=licensed\r\nLICENSE_STATUS=1\r\n"
+        ));
     }
 }
