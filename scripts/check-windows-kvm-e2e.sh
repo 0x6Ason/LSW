@@ -1258,9 +1258,10 @@ if [ "$signal_status" -ne 143 ]; then
 fi
 echo "SIGTERM propagation returned exact status 143."
 
-guest_detached_marker="C:\Windows\Temp\beta6-detached-$$.txt"
+guest_test_root="C:\ProgramData\LSW\e2e-$$"
 "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-    "if (Test-Path -LiteralPath '$guest_detached_marker') { Remove-Item -LiteralPath '$guest_detached_marker' -Force }"
+    "if (Test-Path -LiteralPath '$guest_test_root') { throw 'guest test root already exists' }; New-Item -ItemType Directory -Path '$guest_test_root' | Out-Null"
+guest_detached_marker="$guest_test_root\detached.txt"
 detached_output=$(
     "$lsw" run "$instance" --detach -- powershell.exe -NoLogo -NoProfile -Command \
         "Start-Sleep -Milliseconds 500; Set-Content -LiteralPath '$guest_detached_marker' -Value 'DETACHED_OK' -NoNewline"
@@ -1294,7 +1295,7 @@ echo "detached run completed after client disconnect."
 
 transfer_source="$e2e_root/transfer-source"
 transfer_pull="$e2e_root/transfer-pull"
-guest_transfer="C:\Windows\Temp\beta6-transfer-$$"
+guest_transfer="$guest_test_root\transfer"
 mkdir -p -- "$transfer_source/nested"
 printf 'root-file\n' >"$transfer_source/root.txt"
 printf 'nested-file\n' >"$transfer_source/nested/file with space.txt"
@@ -1310,7 +1311,7 @@ echo "recursive push and pull round-trip passed."
 
 sync_source="$e2e_root/sync-source"
 sync_log="$e2e_root/sync.log"
-guest_sync="C:\Windows\Temp\beta6-sync-$$"
+guest_sync="$guest_test_root\sync"
 mkdir -p -- "$sync_source"
 printf 'sync-one' >"$sync_source/value.txt"
 "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
@@ -1383,7 +1384,7 @@ echo "additive sync --watch passed."
 terminate_sync
 
 share_source="$e2e_root/share-source"
-guest_share="C:\Windows\Temp\beta7-share-$$"
+guest_share="$guest_test_root\share"
 mkdir -p -- "$share_source"
 printf 'host-to-guest' >"$share_source/host.txt"
 "$lsw" share add "$instance" source "$share_source" "$guest_share" --read-write
@@ -1469,19 +1470,16 @@ if [ "$hibernate_resume" != "$hibernate_resume_marker" ]; then
     exit 1
 fi
 resource_governor_verified=true
-# The read-only share test deliberately replaces the guest root DACL with a
-# protected allow-list. Restore inheritance on that test-only tree before the
-# final removal so PowerShell does not retain a protected directory after the
-# share declaration is gone.
-# PowerShell, not the host shell, expands the cleanup variables.
+# Keep all guest artifacts below the LSW data root, whose installer-managed
+# ACL grants the virtual service account Modify access across restarts. The
+# read-only share child separately grants that account FullControl, so removing
+# the single run-specific root also proves the protected share ACL is usable.
+# PowerShell, not the host shell, expands the cleanup variable.
 # shellcheck disable=SC2016
 if ! "$lsw" exec "$instance" \
-    --env "LSW_CLEANUP_DETACHED=$guest_detached_marker" \
-    --env "LSW_CLEANUP_TRANSFER=$guest_transfer" \
-    --env "LSW_CLEANUP_SYNC=$guest_sync" \
-    --env "LSW_CLEANUP_SHARE=$guest_share" \
+    --env "LSW_CLEANUP_ROOT=$guest_test_root" \
     -- powershell.exe -NoLogo -NoProfile -Command \
-    '$ErrorActionPreference="Stop"; $Share=$env:LSW_CLEANUP_SHARE; if (Test-Path -LiteralPath $Share -PathType Container) { $Agent=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; & "$env:SystemRoot\System32\icacls.exe" $Share /reset /T /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { throw ("could not reset the test share ACL at {0}; icacls exited {1}" -f $Share,$LASTEXITCODE) }; & "$env:SystemRoot\System32\icacls.exe" $Share /grant:r ("*{0}:(OI)(CI)F" -f $Agent) /T /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { throw ("could not grant cleanup access at {0}; icacls exited {1}" -f $Share,$LASTEXITCODE) } }; foreach ($Path in @($env:LSW_CLEANUP_DETACHED,$env:LSW_CLEANUP_TRANSFER,$env:LSW_CLEANUP_SYNC,$Share)) { for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }; break } catch { if ($Attempt -eq 39) { throw ("guest cleanup failed for {0}: {1}" -f $Path,$_.Exception.Message) }; Start-Sleep -Milliseconds 250 } } }'
+    '$ErrorActionPreference="Stop"; $Root=$env:LSW_CLEANUP_ROOT; for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Root) { Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop }; break } catch { if ($Attempt -eq 39) { throw ("guest cleanup failed for {0}: {1}" -f $Root,$_.Exception.Message) }; Start-Sleep -Milliseconds 250 } }; if (Test-Path -LiteralPath $Root) { throw ("guest cleanup left the test root at {0}" -f $Root) }'
 then
     echo "error: guest test artifact cleanup failed" >&2
     exit 1
