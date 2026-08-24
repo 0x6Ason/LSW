@@ -15,6 +15,7 @@ timeout_seconds=${LSW_E2E_TIMEOUT_SECONDS:-2700}
 agent_boot_timeout_seconds=660
 root_base=${LSW_E2E_ROOT_BASE:-/tmp}
 artifact_dir=${LSW_E2E_ARTIFACT_DIR:-}
+active_root_file=${LSW_E2E_ACTIVE_ROOT_FILE:-}
 keep_state=${LSW_E2E_KEEP_STATE:-0}
 expected_iso_sha256=${LSW_WINDOWS_ISO_SHA256:-}
 e2e_no_viewer=${LSW_E2E_NO_VIEWER:-1}
@@ -83,6 +84,24 @@ if [ -n "$artifact_dir" ]; then
     chmod 700 "$artifact_dir"
     artifact_dir=$(CDPATH='' cd -- "$artifact_dir" && pwd)
 fi
+if [ -n "$active_root_file" ]; then
+    case "$active_root_file" in
+        /*) ;;
+        *)
+            echo "error: LSW_E2E_ACTIVE_ROOT_FILE must be an absolute path" >&2
+            exit 1
+            ;;
+    esac
+    if [ -e "$active_root_file" ] || [ -L "$active_root_file" ]; then
+        echo "error: LSW_E2E_ACTIVE_ROOT_FILE already exists" >&2
+        exit 1
+    fi
+    active_root_parent=${active_root_file%/*}
+    if [ ! -d "$active_root_parent" ] || [ -L "$active_root_parent" ]; then
+        echo "error: LSW_E2E_ACTIVE_ROOT_FILE parent must be a real directory" >&2
+        exit 1
+    fi
+fi
 
 expected_iso_sha256=$(printf '%s' "$expected_iso_sha256" | tr 'A-F' 'a-f')
 if [ -n "$expected_iso_sha256" ]; then
@@ -123,6 +142,10 @@ case "$e2e_root" in
         exit 1
         ;;
 esac
+if [ -n "$active_root_file" ]; then
+    printf '%s\n' "$e2e_root" >"$active_root_file"
+    chmod 600 "$active_root_file"
+fi
 instance="windows-kvm-e2e-$$"
 export LSW_STATE_DIR="$e2e_root/state"
 export LSW_WINDOWS_AGENT="$agent"
@@ -592,6 +615,9 @@ cleanup_e2e() {
         echo "LSW Windows/KVM E2E state retained by explicit request at $e2e_root" >&2
     else
         rm -rf -- "$e2e_root"
+        if [ -n "$active_root_file" ]; then
+            rm -f -- "$active_root_file"
+        fi
     fi
     exit "$status"
 }

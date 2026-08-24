@@ -50,6 +50,9 @@
 - Expanded the exact Windows/KVM release gate with native account creation,
   linked-clone secret isolation, share boundary escapes, balloon/TRIM,
   hibernate/resume, offline compaction, and the existing no-login cold restart.
+  The release workflow now always deletes per-run VM state, records the exact
+  temporary root for a second bounded cleanup pass, rejects stale gate roots,
+  and requires 160 GiB free on both the E2E filesystem and the WSL host volume.
 - Decoupled reliable WinPE target apply from CompactOS after the exact gate
   reproduced a CPU-bound DISM stall at 63 percent. WinPE still performs bounded
   offline AppX servicing and an integrity-checked image apply; the `slim`

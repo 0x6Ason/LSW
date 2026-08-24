@@ -14,11 +14,6 @@ on:
         description: Type RUN-WINDOWS-KVM-E2E to use the dedicated runner
         required: true
         type: string
-      keep_state:
-        description: Retain local VM state on the runner only if the gate fails
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -77,7 +72,8 @@ jobs:
       LSW_WINDOWS_PROFILE: slim
       LSW_E2E_TIMEOUT_SECONDS: "2700"
       LSW_E2E_NO_VIEWER: "1"
-      LSW_E2E_KEEP_STATE: ${{ inputs.keep_state && '1' || '0' }}
+      LSW_E2E_KEEP_STATE: "0"
+      LSW_E2E_MIN_FREE_GIB: "160"
     steps:
       - name: Initialize isolated build paths
         shell: bash
@@ -120,7 +116,7 @@ jobs:
             exit 1
           fi
           for command in \
-            awk cargo findmnt git grep id python3 qemu-img \
+            awk cargo df find findmnt git grep id python3 qemu-img \
             qemu-system-x86_64 realpath rustc rustup \
             setsid sha256sum stat swtpm timeout tr \
             7z wimlib-imagex xorriso \
@@ -204,6 +200,35 @@ jobs:
             exit 1
           fi
 
+          stale_e2e_root=$(find "$canonical_e2e_root" -mindepth 1 -maxdepth 1 \
+            -type d -name 'lsw-e2e.??????' -print -quit)
+          if [[ -n "$stale_e2e_root" ]]; then
+            echo "error: stale Windows/KVM state must be removed before starting another gate: $stale_e2e_root" >&2
+            exit 1
+          fi
+
+          storage_roots=("$canonical_e2e_root")
+          if grep -qi microsoft /proc/sys/kernel/osrelease && [[ -d /mnt/c ]]; then
+            storage_roots+=(/mnt/c)
+          fi
+          minimum_free_kib=$((LSW_E2E_MIN_FREE_GIB * 1024 * 1024))
+          for storage_root in "${storage_roots[@]}"; do
+            if [[ ! -d "$storage_root" || -L "$storage_root" ]]; then
+              echo "error: E2E storage root must be an existing real directory: $storage_root" >&2
+              exit 1
+            fi
+            available_kib=$(df -Pk -- "$storage_root" | awk 'NR == 2 { print $4; exit }')
+            if [[ ! "$available_kib" =~ ^[0-9]+$ ]]; then
+              echo "error: could not measure free space for $storage_root" >&2
+              exit 1
+            fi
+            if (( available_kib < minimum_free_kib )); then
+              available_gib=$((available_kib / 1024 / 1024))
+              echo "error: $storage_root has ${available_gib} GiB free; the Windows/KVM gate requires at least ${LSW_E2E_MIN_FREE_GIB} GiB" >&2
+              exit 1
+            fi
+          done
+
           if [[ -z "${LSW_WINDOWS_ISO:-}" || -z "${LSW_WINDOWS_ISO_SHA256:-}" ]]; then
             echo "error: provision LSW_WINDOWS_ISO and LSW_WINDOWS_ISO_SHA256 on the runner" >&2
             exit 1
@@ -257,7 +282,45 @@ jobs:
           LSW_E2E_LSWD: ${{ env.CARGO_TARGET_DIR }}/release/lswd
           LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
           LSW_E2E_ARTIFACT_DIR: ${{ env.LSW_BUILD_ROOT }}/artifacts
+          LSW_E2E_ACTIVE_ROOT_FILE: ${{ env.LSW_BUILD_ROOT }}/active-e2e-root
         run: scripts/check-windows-kvm-e2e.sh
+
+      - name: Remove local E2E state
+        if: ${{ always() && env.LSW_BUILD_ROOT != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          active_root_file="$LSW_BUILD_ROOT/active-e2e-root"
+          if [[ ! -e "$active_root_file" ]]; then
+            exit 0
+          fi
+          if [[ -L "$active_root_file" || ! -f "$active_root_file" ]]; then
+            echo "error: refusing an invalid active E2E root record" >&2
+            exit 1
+          fi
+          mapfile -t recorded_roots <"$active_root_file"
+          if (( ${#recorded_roots[@]} != 1 )); then
+            echo "error: refusing an ambiguous active E2E root record" >&2
+            exit 1
+          fi
+          canonical_e2e_root=$(realpath -e -- "$LSW_E2E_ROOT_BASE")
+          recorded_root=${recorded_roots[0]}
+          recorded_parent=${recorded_root%/*}
+          recorded_name=${recorded_root##*/}
+          if [[ "$recorded_parent" != "$canonical_e2e_root" || \
+                ! "$recorded_name" =~ ^lsw-e2e\.[[:alnum:]]{6}$ ]]; then
+            echo "error: refusing cleanup of an unexpected E2E path: $recorded_root" >&2
+            exit 1
+          fi
+          if [[ -L "$recorded_root" || ( -e "$recorded_root" && ! -d "$recorded_root" ) ]]; then
+            echo "error: refusing cleanup of a non-directory E2E path: $recorded_root" >&2
+            exit 1
+          fi
+          if [[ -d "$recorded_root" ]]; then
+            chmod -R u+rwX -- "$recorded_root" || true
+            find "$recorded_root" -depth -delete
+          fi
+          rm -f -- "$active_root_file"
 
       - name: Upload redacted gate evidence
         if: ${{ always() && env.LSW_BUILD_ROOT != '' }}
@@ -280,13 +343,6 @@ jobs:
             echo
             echo "Only redacted gate evidence was uploaded; the ISO and VM state remained local."
           } >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Retain requested failed local diagnostic state
-        if: ${{ failure() && inputs.keep_state }}
-        shell: bash
-        run: |
-          echo "::warning::VM state was retained only below the dedicated runner's LSW_E2E_ROOT_BASE"
-          echo "No VM disk or Windows media was uploaded."
 
       - name: Remove local build output
         if: ${{ always() && env.LSW_BUILD_ROOT != '' }}

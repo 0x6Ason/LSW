@@ -60,9 +60,11 @@ network and filesystem from production systems.
 ## Host preparation
 
 Use a physical or nested-virtualization Linux x86_64 machine with at least 8
-GiB of host RAM and roughly 80 GiB of free SSD space for a disposable Windows
-11 installation. The runner account must have read/write access to `/dev/kvm`,
-normally through the `kvm` group.
+GiB of host RAM and at least 160 GiB of free SSD space for the release gate.
+The preflight checks the filesystem containing `LSW_E2E_ROOT_BASE`; under WSL it
+also checks the Windows volume mounted at `/mnt/c`, because that volume backs
+the dynamically growing WSL virtual disk. The runner account must have
+read/write access to `/dev/kvm`, normally through the `kvm` group.
 
 Install these dependencies before registering the runner:
 
@@ -147,8 +149,7 @@ firewall if a fully controlled network boundary is required.
 2. Open **Actions > Windows/KVM release gate > Run workflow**.
 3. Select `master`, enter the exact 40-character commit, and enter
    `RUN-WINDOWS-KVM-E2E` as the confirmation.
-4. Leave **keep_state** disabled for normal release validation.
-5. Approve the protected environment. No further operator action is required;
+4. Approve the protected environment. No further operator action is required;
    the job owns WinPE, unattended OOBE, agent verification, cold restart, and
    cleanup.
 
@@ -209,8 +210,9 @@ after the existing beta.1–beta.4 tags unless it finds the successful real-KVM
 job for that exact SHA. The workflow summary records the validated SHA so the
 beta release decision is auditable.
 
-By default, per-run build output and guest state are deleted after either
-success or failure. Enabling **keep_state** retains failed-run guest state only
-below `LSW_E2E_ROOT_BASE` for diagnosis; successful runs still prove removal
-and leave no state behind. Retained state is never uploaded; remove it manually
-when investigation is complete.
+Per-run build output and guest state are deleted after either success or
+failure. The harness records the exact temporary root so the workflow can make
+a second bounded cleanup attempt if the harness is interrupted. A new gate
+refuses to start when an older `lsw-e2e.*` directory exists, preventing stale
+VM state from silently consuming the runner's disk. Diagnostics use only the
+redacted uploaded evidence; the release workflow has no state-retention mode.
