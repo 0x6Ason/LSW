@@ -116,11 +116,6 @@ fn remove(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
     };
     let name = resolve_name(store, requested)?;
     let mut manifest = store.load(&name)?;
-    let removed = manifest
-        .folder_shares
-        .iter()
-        .find(|share| share.name == share_name)
-        .cloned();
     let previous = manifest.folder_shares.len();
     manifest
         .folder_shares
@@ -128,19 +123,9 @@ fn remove(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
     if manifest.folder_shares.len() == previous {
         return Err(format!("folder share {share_name:?} does not exist for {name:?}").into());
     }
-    if let Some(share) = removed.filter(|share| share.mode == FolderShareMode::ReadOnly) {
-        if let Err(error) =
-            transfer::set_guest_share_read_only(store, &name, &share.guest_path, false)
-        {
-            eprintln!(
-                "lsw share: could not remove the guest read-only ACL from {}: {error}",
-                share.guest_path
-            );
-        }
-    }
     store.update(&manifest)?;
     println!(
-        "Removed folder share {share_name:?} from {name:?}; existing files were preserved on both sides."
+        "Removed folder share {share_name:?} from {name:?}; existing files and guest ACLs were preserved."
     );
     Ok(())
 }
@@ -202,12 +187,9 @@ fn sync(
         return Ok(());
     }
     transfer::sync_host_to_guest(store, &name, &share.host_path, &share.guest_path, false)?;
-    transfer::set_guest_share_read_only(
-        store,
-        &name,
-        &share.guest_path,
-        share.mode == FolderShareMode::ReadOnly,
-    )?;
+    if share.mode == FolderShareMode::ReadOnly {
+        transfer::set_guest_share_read_only(store, &name, &share.guest_path)?;
+    }
     if watch {
         println!(
             "Periodic change detection is active; agent reconnects are retried and deletions are preserved."

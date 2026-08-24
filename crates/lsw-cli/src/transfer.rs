@@ -13,6 +13,57 @@ use super::{connect_agent, resolve_name};
 
 const REMOTE_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const WATCH_INTERVAL: Duration = Duration::from_millis(750);
+const READ_ONLY_SHARE_ACL_SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$Full=[IO.Path]::GetFullPath($env:LSW_PATH)
+$Drive=[IO.Path]::GetPathRoot($Full)
+$Current=$Drive
+foreach ($Part in $Full.Substring($Drive.Length).Split([char[]]'\/',[StringSplitOptions]::RemoveEmptyEntries)) {
+    $Current=[IO.Path]::Combine($Current,$Part)
+    $Item=Get-Item -LiteralPath $Current -Force
+    if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw ('share path crosses a reparse point: '+$Item.FullName)
+    }
+}
+$Root=Get-Item -LiteralPath $Full -Force
+if (-not $Root.PSIsContainer) { throw 'share root is not a directory' }
+$Agent=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$Inheritance=[Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+$Propagation=[Security.AccessControl.PropagationFlags]::None
+$Allow=[Security.AccessControl.AccessControlType]::Allow
+$FullControl=[Security.AccessControl.FileSystemRights]::FullControl
+$ReadOnly=[Security.AccessControl.FileSystemRights]::ReadAndExecute
+$Existing=Get-Acl -LiteralPath $Root.FullName
+$ExistingRules=@($Existing.Access)
+$FullSids=@('S-1-5-18','S-1-5-32-544',$Agent.Value)
+$ExistingFull=@($ExistingRules | Where-Object {
+    $FullSids -contains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -and
+    $_.AccessControlType -eq $Allow -and -not $_.IsInherited -and
+    $_.InheritanceFlags -eq $Inheritance -and $_.PropagationFlags -eq $Propagation -and
+    [int]($_.FileSystemRights) -eq [int]$FullControl
+})
+$ExistingUsers=@($ExistingRules | Where-Object {
+    $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-545' -and
+    $_.AccessControlType -eq $Allow -and -not $_.IsInherited -and
+    $_.InheritanceFlags -eq $Inheritance -and $_.PropagationFlags -eq $Propagation -and
+    [int]($_.FileSystemRights) -eq [int]([Security.AccessControl.FileSystemRights]'ReadAndExecute, Synchronize')
+})
+if ($Existing.AreAccessRulesProtected -and $ExistingRules.Count -eq 4 -and $ExistingFull.Count -eq 3 -and $ExistingUsers.Count -eq 1) {
+    return
+}
+$Acl=New-Object Security.AccessControl.DirectorySecurity
+$Acl.SetAccessRuleProtection($true,$false)
+foreach ($Entry in @(
+    @([Security.Principal.SecurityIdentifier]'S-1-5-18',$FullControl),
+    @([Security.Principal.SecurityIdentifier]'S-1-5-32-544',$FullControl),
+    @($Agent,$FullControl),
+    @([Security.Principal.SecurityIdentifier]'S-1-5-32-545',$ReadOnly)
+)) {
+    $Rule=New-Object Security.AccessControl.FileSystemAccessRule($Entry[0],$Entry[1],$Inheritance,$Propagation,$Allow)
+    $Acl.AddAccessRule($Rule) | Out-Null
+}
+Set-Acl -LiteralPath $Root.FullName -AclObject $Acl
+"#;
 
 pub(super) fn push(
     store: &StateStore,
@@ -549,19 +600,12 @@ pub(super) fn set_guest_share_read_only(
     store: &StateStore,
     name: &str,
     path: &str,
-    read_only: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     remote_powershell(
         store,
         name,
-        r#"$ErrorActionPreference='Stop'; $Full=[IO.Path]::GetFullPath($env:LSW_PATH); $Drive=[IO.Path]::GetPathRoot($Full); $Current=$Drive; foreach ($Part in $Full.Substring($Drive.Length).Split([char[]]'\/',[StringSplitOptions]::RemoveEmptyEntries)) { $Current=[IO.Path]::Combine($Current,$Part); $Item=Get-Item -LiteralPath $Current -Force; if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw ('share path crosses a reparse point: '+$Item.FullName) } }; $Root=Get-Item -LiteralPath $Full -Force; if (-not $Root.PSIsContainer) { throw 'share root is not a directory' }; $Acl=Get-Acl -LiteralPath $Root.FullName; $Sid=[Security.Principal.SecurityIdentifier]'S-1-5-32-545'; $Rights=[Security.AccessControl.FileSystemRights]'Write, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'; $Inheritance=[Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'; $Rule=New-Object Security.AccessControl.FileSystemAccessRule($Sid,$Rights,$Inheritance,[Security.AccessControl.PropagationFlags]::None,[Security.AccessControl.AccessControlType]::Deny); $Acl.RemoveAccessRuleSpecific($Rule); if ($env:LSW_READ_ONLY -eq '1') { $Acl.AddAccessRule($Rule) | Out-Null }; Set-Acl -LiteralPath $Root.FullName -AclObject $Acl"#,
-        vec![
-            ("LSW_PATH".to_owned(), path.to_owned()),
-            (
-                "LSW_READ_ONLY".to_owned(),
-                if read_only { "1" } else { "0" }.to_owned(),
-            ),
-        ],
+        READ_ONLY_SHARE_ACL_SCRIPT,
+        vec![("LSW_PATH".to_owned(), path.to_owned())],
     )
     .map(|_| ())
 }
@@ -733,6 +777,17 @@ fn local_snapshot(root: &Path) -> Result<LocalSnapshot, Box<dyn std::error::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_share_acl_keeps_the_agent_as_an_explicit_writer() {
+        assert!(READ_ONLY_SHARE_ACL_SCRIPT.contains("SetAccessRuleProtection($true,$false)"));
+        assert!(READ_ONLY_SHARE_ACL_SCRIPT.contains("WindowsIdentity]::GetCurrent().User"));
+        assert!(READ_ONLY_SHARE_ACL_SCRIPT.contains("S-1-5-18"));
+        assert!(READ_ONLY_SHARE_ACL_SCRIPT.contains("S-1-5-32-544"));
+        assert!(READ_ONLY_SHARE_ACL_SCRIPT.contains("S-1-5-32-545"));
+        assert!(READ_ONLY_SHARE_ACL_SCRIPT.contains("ReadAndExecute"));
+        assert!(!READ_ONLY_SHARE_ACL_SCRIPT.contains("AccessControlType]::Deny"));
+    }
 
     #[test]
     fn remote_tree_parser_is_binary_safe_and_rejects_traversal() {

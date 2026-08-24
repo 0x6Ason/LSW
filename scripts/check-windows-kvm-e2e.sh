@@ -1264,14 +1264,12 @@ read_only_acl=$(
     # shellcheck disable=SC2016
     "$lsw" exec "$instance" --env "LSW_SHARE_ROOT=$guest_share" -- \
         powershell.exe -NoLogo -NoProfile -Command \
-        '$Rules=(Get-Acl -LiteralPath $env:LSW_SHARE_ROOT).Access | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq "S-1-5-32-545" -and $_.AccessControlType -eq "Deny" -and $_.IsInherited -eq $false }; [Console]::Out.Write(@($Rules).Count)'
+        '$Acl=Get-Acl -LiteralPath $env:LSW_SHARE_ROOT; $Agent=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $Rules=@($Acl.Access); $Inheritance=[Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"; $Propagation=[Security.AccessControl.PropagationFlags]::None; $FullSids=@("S-1-5-18","S-1-5-32-544",$Agent); $FullRules=@($Rules | Where-Object { $FullSids -contains $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -and $_.AccessControlType -eq "Allow" -and $_.IsInherited -eq $false -and $_.InheritanceFlags -eq $Inheritance -and $_.PropagationFlags -eq $Propagation -and [int]($_.FileSystemRights) -eq [int]([Security.AccessControl.FileSystemRights]::FullControl) }); $Users=@($Rules | Where-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq "S-1-5-32-545" -and $_.AccessControlType -eq "Allow" -and $_.IsInherited -eq $false -and $_.InheritanceFlags -eq $Inheritance -and $_.PropagationFlags -eq $Propagation -and [int]($_.FileSystemRights) -eq [int]([Security.AccessControl.FileSystemRights]"ReadAndExecute, Synchronize") }); if (-not $Acl.AreAccessRulesProtected -or $Rules.Count -ne 4 -or $FullRules.Count -ne 3 -or $Users.Count -ne 1) { exit 41 }; [Console]::Out.Write("LSW_RO_ACL_OK")'
 )
-case "$read_only_acl" in
-    ''|0|*[!0-9]*)
-        echo "error: read-only share did not install its explicit guest ACL" >&2
-        exit 1
-        ;;
-esac
+if [ "$read_only_acl" != LSW_RO_ACL_OK ]; then
+    echo "error: read-only share did not install its protected guest ACL" >&2
+    exit 1
+fi
 "$lsw" share remove "$instance" source
 folder_share_boundaries=true
 

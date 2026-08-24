@@ -28,10 +28,11 @@
   is active, while optional systemd socket activation remains reversible via
   `lsw daemon enable|disable|status|diagnose`.
 - Added declarative per-instance synchronized folders with explicit RO/RW
-  roots, additive host watch, explicit RW guest-to-host merge, built-in Users
-  deny-write ACLs for RO views, reconnect retries, and host-symlink plus Windows
-  reparse-point escape rejection. No share is enabled implicitly and deletions
-  are preserved on both sides.
+  roots, additive host watch, explicit RW guest-to-host merge, protected
+  allow-list ACLs for RO views, reconnect retries, and host-symlink plus Windows
+  reparse-point escape rejection. SYSTEM, Administrators, and the LSW service
+  retain update access while built-in Users receive ReadAndExecute. No share is
+  enabled implicitly, and deletions plus guest ACLs are preserved on removal.
 - Added WSL-style permanent Windows-user registration after interactive
   installation and `lsw user setup` for deferred/recovery use. Passwords use
   masked input or stdin, travel only through the authenticated protocol, are

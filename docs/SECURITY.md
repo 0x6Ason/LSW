@@ -128,9 +128,10 @@ Folder shares are synchronized mirrors rather than QEMU mounts. Each manifest
 entry names one canonical host directory, one absolute guest drive path, and an
 explicit RO/RW mode. Existing components on both sides are checked during every
 walk: host symbolic links and Windows reparse points fail the operation. RO
-roots receive an inheritable deny-write ACL for well-known BUILTIN Users while
-SYSTEM/service access remains available for synchronization. RW guest imports
-are explicit, and no background operation propagates deletion.
+roots receive a protected allow-list ACL: SYSTEM, Administrators, and the exact
+SCM service SID have inheritable FullControl, while well-known BUILTIN Users
+have only ReadAndExecute. RW guest imports are explicit, no background operation
+propagates deletion, and removing a share does not silently loosen its guest ACL.
 
 Sealed bases are mode 0400 and content-addressed. Sealing rejects an instance
 that already contains a registered permanent user. Clones do not inherit host

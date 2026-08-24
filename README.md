@@ -189,9 +189,12 @@ lsw share watch win-dev source              # additive host -> guest updates
 lsw share sync win-dev source --from-guest  # explicit RW guest -> host merge
 ```
 
-Read-only shares install a deny-write ACL for the built-in Users SID while the
-service retains update access. Both sides reject symlinks/reparse points and
-parent traversal. Neither direction propagates deletions.
+Read-only shares replace the guest root ACL with a protected allow-list:
+SYSTEM, Administrators, and the LSW service retain inheritable FullControl,
+while built-in Users receive only ReadAndExecute. Removing a share preserves
+its guest files and ACL instead of silently loosening access. Both sides reject
+symlinks/reparse points and parent traversal. Neither direction propagates
+deletions.
 
 Create a pristine reusable base before registering a permanent desktop user:
 

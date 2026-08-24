@@ -170,10 +170,12 @@ UTF-8 fields so whitespace cannot change framing. Watch sync uploads a unique
 temporary peer and renames it into place, which keeps each observed file update
 atomic without defining destructive mirror semantics.
 Manifest-bound folder shares reuse this channel. RO and RW are explicit; RO
-roots receive a built-in Users deny-write ACL while the SCM identity retains
-update access. Guest-to-host RW import is explicit, and neither direction
-propagates deletions. Every existing host component rejects symlinks and every
-existing guest component rejects Windows reparse points.
+roots receive a protected allow-list ACL. SYSTEM, Administrators, and the SCM
+identity retain inheritable FullControl while built-in Users receive only
+ReadAndExecute. Guest-to-host RW import is explicit, and neither direction
+propagates deletions. Removing a share preserves its guest ACL. Every existing
+host component rejects symlinks and every existing guest component rejects
+Windows reparse points.
 
 On Unix the child enters a new process group in the pre-`exec` path. LSW signals
 that group after a normal leader exit and on cancellation, disconnect, protocol
