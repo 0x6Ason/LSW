@@ -210,8 +210,9 @@ The sealed qcow2 is read-only; each clone receives a
 linked overlay, fresh host token/control port, and a private boot identity
 volume. The SCM agent rotates the embedded credential before listening or
 atomically switches its live authenticator if Windows mounts the volume late.
-It enumerates removable volume GUID paths as well as drive letters, so Windows
-automount timing does not decide whether a clone can authenticate.
+The identity disk uses the Windows inbox IDE path, and the agent enumerates all
+volume GUID paths as well as drive letters, so first-boot USB driver timing and
+automount do not decide whether a clone can authenticate.
 
 Path conversion is explicit and syntactic; it does not make the independent
 guest disk a host mount:

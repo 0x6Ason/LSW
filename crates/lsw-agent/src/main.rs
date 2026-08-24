@@ -560,8 +560,7 @@ fn apply_clone_identity(token_file: &Path) -> Result<bool, Box<dyn std::error::E
         windows_path::volume_roots()
             .unwrap_or_default()
             .into_iter()
-            .filter(|(_, drive_type)| *drive_type == windows_path::DRIVE_REMOVABLE)
-            .map(|(root, _)| root.join("lsw")),
+            .map(|root| root.join("lsw")),
     )?;
     let identity = match identity {
         Some(identity) => Some(identity),

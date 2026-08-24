@@ -288,13 +288,9 @@ impl QemuPlanner {
                         qemu_path(&identity_seed)
                     ),
                 );
-                push_pair(
-                    &mut arguments,
-                    "-device",
-                    "usb-storage,drive=lsw-identity,removable=on",
-                );
+                push_pair(&mut arguments, "-device", "ide-hd,drive=lsw-identity");
                 notes.push(
-                    "the boot identity is attached read-only and consumed by the guest agent"
+                    "the boot identity uses an inbox IDE path, is attached read-only, and is consumed by the guest agent"
                         .to_owned(),
                 );
             }
@@ -536,6 +532,27 @@ mod tests {
         assert_eq!(plan.backend, backend);
         assert!(plan.display_command().contains("-enable-kvm -cpu host"));
         assert!(!plan.display_command().contains("-accel tcg"));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn run_identity_uses_the_windows_inbox_ide_path() {
+        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be valid")
+            .as_nanos();
+        let instance_dir = std::env::temp_dir().join(format!("lsw-qemu-identity-{nonce}"));
+        fs::create_dir_all(instance_dir.join("identity-seed"))
+            .expect("identity directory should be created");
+        let plan = QemuPlanner::new(headless_capabilities())
+            .plan(&manifest, &instance_dir, LaunchPhase::Run)
+            .expect("plan should be built");
+        let command = plan.display_command();
+        assert!(command.contains("id=lsw-identity,snapshot=on"));
+        assert!(command.contains("-device ide-hd,drive=lsw-identity"));
+        assert!(!command.contains("usb-storage,drive=lsw-identity"));
+        fs::remove_dir_all(instance_dir).expect("temporary instance should be removable");
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 

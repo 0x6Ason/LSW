@@ -166,7 +166,7 @@ fn windows_late_identity_volume_updates_the_live_authenticator() {
 fn windows_volume_guid_enumeration_reaches_the_system_volume() {
     let roots = windows_path::volume_roots().expect("Windows volumes should enumerate");
     assert!(
-        roots.iter().any(|(root, _)| root.join("Windows").is_dir()),
+        roots.iter().any(|root| root.join("Windows").is_dir()),
         "a volume GUID path should reach the running Windows installation"
     );
 }

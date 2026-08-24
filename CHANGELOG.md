@@ -10,9 +10,10 @@
   tokens, ports, and a private boot-time identity volume. The SCM agent now
   reconciles identity media that Windows mounts after automatic services start,
   avoiding a boot-time token race without delaying ordinary boots. Discovery
-  includes removable volume GUID paths even when Windows assigns no drive
-  letter, remains available across delayed Plug and Play mounting, and backs a
-  bounded ten-minute host wait with live agent-start progress.
+  covers every volume GUID path even when Windows assigns no drive letter. The
+  private identity disk uses the inbox IDE path instead of first-boot USB mass
+  storage, remains discoverable across delayed mounting, and backs a bounded
+  ten-minute host wait with live agent-start progress.
 - Added manifest v5 and the opt-in resource governor: minimum memory, QMP
   balloon control, host-pressure reclaim, running-to-pause-to-Windows-hibernate
   policy, automatic resume, guest TRIM, qcow2 discard/detect-zeroes, and safe

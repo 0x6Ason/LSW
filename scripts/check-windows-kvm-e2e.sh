@@ -10,6 +10,9 @@ edition=${LSW_WINDOWS_EDITION:-pro}
 profile=${LSW_WINDOWS_PROFILE:-slim}
 agent=${LSW_WINDOWS_AGENT:-"$workspace_root/target/x86_64-pc-windows-gnu/release/lsw-agent.exe"}
 timeout_seconds=${LSW_E2E_TIMEOUT_SECONDS:-2700}
+# Cold Windows boots use a bounded ten-minute agent wait. Give the external
+# command guard one additional minute so it never preempts the product timeout.
+agent_boot_timeout_seconds=660
 root_base=${LSW_E2E_ROOT_BASE:-/tmp}
 artifact_dir=${LSW_E2E_ARTIFACT_DIR:-}
 keep_state=${LSW_E2E_KEEP_STATE:-0}
@@ -910,7 +913,7 @@ if [ -z "$clone_backing" ] \
     exit 1
 fi
 clone_identity=$(
-    timeout 180s "$lsw" exec "$clone_instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    timeout "${agent_boot_timeout_seconds}s" "$lsw" exec "$clone_instance" -- powershell.exe -NoLogo -NoProfile -Command \
         '[Console]::Out.Write([IO.File]::ReadAllText("C:\ProgramData\LSW\instance.name").Trim())'
 )
 if [ "$clone_identity" != "$clone_instance" ]; then
@@ -929,7 +932,7 @@ if [ -e "$LSW_STATE_DIR/instances/$clone_instance" ]; then
     exit 1
 fi
 resume_marker=LSW_CLONE_SOURCE_RESUME_OK
-resume_output=$(timeout 180s "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile \
+resume_output=$(timeout "${agent_boot_timeout_seconds}s" "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile \
     -Command "[Console]::Out.Write('$resume_marker')")
 if [ "$resume_output" != "$resume_marker" ]; then
     echo "error: sealed source did not resume after linked-clone validation" >&2
@@ -1296,7 +1299,7 @@ if kill -0 "$hibernate_pid" 2>/dev/null; then
 fi
 hibernate_resume_marker=LSW_HIBERNATE_RESUME_OK
 hibernate_resume=$(
-    timeout 180s "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    timeout "${agent_boot_timeout_seconds}s" "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
         "[Console]::Out.Write('$hibernate_resume_marker')"
 )
 if [ "$hibernate_resume" != "$hibernate_resume_marker" ]; then
