@@ -80,7 +80,7 @@ pub(super) fn push(
         if !parsed.recursive {
             return Err("pushing a directory requires --recursive".into());
         }
-        push_tree(store, &name, &source, &parsed.destination, false)?;
+        push_tree(store, &name, &source, &parsed.destination, false, true)?;
     } else if metadata.is_file() {
         let bytes = connect_agent(store, &name)?.put_file(&source, &parsed.destination)?;
         println!(
@@ -114,6 +114,95 @@ pub(super) fn pull(
     }
 }
 
+pub(super) fn copy(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (source, destination) = match arguments {
+        [source, destination] => (
+            source.to_str().ok_or("copy source must be valid UTF-8")?,
+            destination
+                .to_str()
+                .ok_or("copy destination must be valid UTF-8")?,
+        ),
+        _ => return Err("usage: lsw cp SOURCE DESTINATION".into()),
+    };
+    let source_is_windows = is_absolute_windows_path(source);
+    let destination_is_windows = is_absolute_windows_path(destination);
+    if source_is_windows == destination_is_windows {
+        return Err(
+            "lsw cp requires exactly one absolute Windows path (for example C:\\work\\file)".into(),
+        );
+    }
+    let name = resolve_name(store, None)?;
+    if destination_is_windows {
+        let source = PathBuf::from(source);
+        let metadata = fs::symlink_metadata(&source)?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{} must not be a symbolic link", source.display()).into());
+        }
+        if metadata.is_dir() {
+            push_tree(store, &name, &source, destination, false, true)?;
+        } else if metadata.is_file() {
+            let bytes = connect_agent(store, &name)?.put_file(&source, destination)?;
+            println!(
+                "Transferred {bytes} bytes from {} to {name}:{destination}",
+                source.display()
+            );
+        } else {
+            return Err("copy source must be a regular file or directory".into());
+        }
+        return Ok(());
+    }
+
+    let destination = PathBuf::from(destination);
+    match remote_entry_kind(store, &name, source)? {
+        LocalEntryKind::Directory => pull_tree(store, &name, source, &destination),
+        LocalEntryKind::File => {
+            let bytes = connect_agent(store, &name)?.get_file(source, &destination)?;
+            println!(
+                "Transferred {bytes} bytes from {name}:{source} to {}",
+                destination.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn is_absolute_windows_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+        || value.starts_with("\\\\")
+}
+
+fn remote_entry_kind(
+    store: &StateStore,
+    name: &str,
+    path: &str,
+) -> Result<LocalEntryKind, Box<dyn std::error::Error>> {
+    let script = r#"
+$ErrorActionPreference='Stop'
+$Item=Get-Item -LiteralPath $env:LSW_PATH -Force
+if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'copy source is a reparse point' }
+if ($Item.PSIsContainer) { [Console]::Out.Write('directory') } else { [Console]::Out.Write('file') }
+"#;
+    match remote_powershell(
+        store,
+        name,
+        script,
+        vec![("LSW_PATH".to_owned(), path.to_owned())],
+    )?
+    .as_slice()
+    {
+        b"directory" => Ok(LocalEntryKind::Directory),
+        b"file" => Ok(LocalEntryKind::File),
+        _ => Err("guest returned an invalid copy source type".into()),
+    }
+}
+
 pub(super) fn sync(
     store: &StateStore,
     arguments: &[OsString],
@@ -133,7 +222,7 @@ pub(super) fn sync_host_to_guest(
     destination: &str,
     watch: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    push_tree(store, name, source, destination, true)?;
+    push_tree(store, name, source, destination, true, true)?;
     if !watch {
         return Ok(());
     }
@@ -182,6 +271,15 @@ pub(super) fn sync_host_to_guest(
         }
         previous = next;
     }
+}
+
+pub(super) fn sync_host_to_guest_silent(
+    store: &StateStore,
+    name: &str,
+    source: &Path,
+    destination: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    push_tree(store, name, source, destination, true, false)
 }
 
 pub(super) fn sync_guest_to_host(
@@ -291,6 +389,7 @@ fn push_tree(
     source: &Path,
     destination: &str,
     replace: bool,
+    report: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     require_real_directory(source)?;
     remote_create_directory(store, name, destination)?;
@@ -312,10 +411,12 @@ fn push_tree(
             }
         }
     }
-    println!(
-        "Transferred {files} files ({bytes} bytes) from {} to {name}:{destination}",
-        source.display()
-    );
+    if report {
+        println!(
+            "Transferred {files} files ({bytes} bytes) from {} to {name}:{destination}",
+            source.display()
+        );
+    }
     Ok(())
 }
 
@@ -838,5 +939,15 @@ mod tests {
         assert_eq!(parsed.requested.as_deref(), Some("win-dev"));
         assert!(parsed.recursive);
         assert_eq!(parsed.source, "src");
+    }
+
+    #[test]
+    fn copy_direction_requires_exactly_one_absolute_windows_path() {
+        assert!(is_absolute_windows_path("C:\\work\\file.txt"));
+        assert!(is_absolute_windows_path("d:/work/file.txt"));
+        assert!(is_absolute_windows_path("\\\\server\\share\\file.txt"));
+        assert!(!is_absolute_windows_path("C:file.txt"));
+        assert!(!is_absolute_windows_path("./C:\\file.txt"));
+        assert!(!is_absolute_windows_path("/home/user/file.txt"));
     }
 }

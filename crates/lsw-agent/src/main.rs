@@ -20,20 +20,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     encode_process_id, read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame,
-    FrameKind, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
-    SessionOptions, SessionSignal, StartRequest, TerminalStartRequest, UserCreateRequest,
-    UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_GUEST_PORT,
-    AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
-    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
-    SESSION_CANCEL_EXIT_CODE,
+    FrameKind, LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello,
+    SessionKind, SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
+    TerminalStartRequest, UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest,
+    WindowsSudoStatus, AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1,
+    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
+    CAPABILITY_SESSION_SIGNAL_V1, SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
 use lsw_core::{
-    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
-    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
-    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
-    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
-    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_LIVE_SHARE_V1,
+    CAPABILITY_MAINTENANCE_HIBERNATE_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
+    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
+    CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1, CLONE_IDENTITY_MARKER_FILE,
+    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT,
+    MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -491,6 +492,7 @@ fn handle_maintenance_helper_connection(
             CAPABILITY_MAINTENANCE_TRIM_V1.to_owned(),
             CAPABILITY_MAINTENANCE_HIBERNATE_V1.to_owned(),
             CAPABILITY_WINDOWS_SUDO_V1.to_owned(),
+            CAPABILITY_LIVE_SHARE_V1.to_owned(),
         ],
     };
     write_frame(
@@ -503,6 +505,7 @@ fn handle_maintenance_helper_connection(
         FrameKind::MaintenanceTrim
         | FrameKind::MaintenanceHibernate
         | FrameKind::WindowsSudoQuery
+        | FrameKind::LiveShareQuery
             if !frame.payload.is_empty() =>
         {
             frame.payload.fill(0);
@@ -544,15 +547,119 @@ fn handle_maintenance_helper_connection(
                 Err(error) => send_error(stream, &error.to_string())?,
             }
         }
+        FrameKind::LiveShareQuery => match query_windows_live_share() {
+            Ok(status) => write_frame(
+                stream,
+                &Frame::new(FrameKind::LiveShareStatus, status.encode()),
+            )?,
+            Err(error) => send_error(stream, &error.to_string())?,
+        },
+        FrameKind::LiveShareConfigure => {
+            let request = match LiveShareConfigureRequest::decode(&frame.payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    frame.payload.fill(0);
+                    send_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            };
+            frame.payload.fill(0);
+            match configure_windows_live_share(request.enable) {
+                Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+                Err(error) => send_error(stream, &error.to_string())?,
+            }
+        }
         _ => {
             frame.payload.fill(0);
             send_error(
                 stream,
-                "maintenance helper accepts only fixed maintenance and Windows sudo requests",
+                "maintenance helper accepts only fixed maintenance, Windows sudo, and live-share requests",
             )?;
         }
     }
     Ok(true)
+}
+
+#[cfg(windows)]
+fn query_windows_live_share() -> Result<LiveShareStatus, Box<dyn std::error::Error>> {
+    let script = r#"$ErrorActionPreference='Stop'
+$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+if ($null -eq $Mapping) { exit 3 }
+if ($Mapping.RemotePath -ne '\\10.0.2.4\qemu') { exit 4 }
+exit 0
+"#;
+    let status = run_fixed_powershell(script)?;
+    match status {
+        0 => Ok(LiveShareStatus { mapped: true }),
+        3 => Ok(LiveShareStatus { mapped: false }),
+        4 => Err("Windows drive L: is already mapped to a different location".into()),
+        code => {
+            Err(format!("Windows could not query the global L: mapping (exit code {code})").into())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn configure_windows_live_share(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let script = if enable {
+        r#"$ErrorActionPreference='Stop'
+$Remote='\\10.0.2.4\qemu'
+$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+if ($null -ne $Mapping -and $Mapping.RemotePath -ne $Remote) {
+    throw 'Windows drive L: is already mapped to a different location'
+}
+if ($null -eq $Mapping) {
+    $Password=ConvertTo-SecureString 'lsw-private-qemu' -AsPlainText -Force
+    $Credential=New-Object Management.Automation.PSCredential('lsw-qemu',$Password)
+    New-SmbGlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -Persistent $true | Out-Null
+}
+$Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L\DefaultLabel'
+New-Item -Path $Label -Force | Out-Null
+Set-Item -Path $Label -Value 'Linux'
+"#
+    } else {
+        r#"$ErrorActionPreference='Stop'
+$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+if ($null -ne $Mapping) {
+    if ($Mapping.RemotePath -ne '\\10.0.2.4\qemu') {
+        throw 'Windows drive L: is mapped to a location not owned by LSW'
+    }
+    Remove-SmbGlobalMapping -LocalPath 'L:' -Force
+}
+$Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
+Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue
+"#
+    };
+    let code = run_fixed_powershell(script)?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(format!("Windows could not update the global L: mapping (exit code {code})").into())
+    }
+}
+
+#[cfg(windows)]
+fn run_fixed_powershell(script: &str) -> Result<i32, Box<dyn std::error::Error>> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.stderr.len() > 64 * 1024 {
+        return Err("Windows live-share operation returned an oversized error".into());
+    }
+    if !output.status.success() && !matches!(output.status.code(), Some(3 | 4)) {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("Windows live-share operation failed: {}", detail.trim()).into());
+    }
+    Ok(output.status.code().unwrap_or(-1))
 }
 
 #[cfg(windows)]
@@ -1269,6 +1376,12 @@ fn handle_connection(
         FrameKind::WindowsSudoConfigure => {
             windows_sudo_configure(stream, &request_frame.payload, expected_token)
         }
+        FrameKind::LiveShareQuery => {
+            live_share_query(stream, &request_frame.payload, expected_token)
+        }
+        FrameKind::LiveShareConfigure => {
+            live_share_configure(stream, &request_frame.payload, expected_token)
+        }
         _ => {
             send_error(&mut stream, "unsupported request after HELLO")?;
             Err("client sent an unsupported request after authentication".into())
@@ -1298,6 +1411,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_USER_ACCOUNT_ROLE_V1.to_owned());
         capabilities.push(CAPABILITY_MAINTENANCE_TRIM_V1.to_owned());
         capabilities.push(CAPABILITY_WINDOWS_SUDO_V1.to_owned());
+        capabilities.push(CAPABILITY_LIVE_SHARE_V1.to_owned());
         capabilities
     };
     capabilities
@@ -1509,6 +1623,62 @@ fn windows_sudo_configure(
     Ok(())
 }
 
+fn live_share_query(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !payload.is_empty() {
+        send_error(&mut stream, "LIVE_SHARE_QUERY payload must be empty")?;
+        return Err("client sent an invalid live-share query".into());
+    }
+    #[cfg(windows)]
+    let result = forward_live_share_query(expected_token);
+    #[cfg(not(windows))]
+    let result: Result<LiveShareStatus, Box<dyn std::error::Error>> = {
+        let _ = expected_token;
+        Err("Windows live-share mapping is unavailable on this platform".into())
+    };
+    match result {
+        Ok(status) => write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::LiveShareStatus, status.encode()),
+        )?,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn live_share_configure(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match LiveShareConfigureRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_live_share_configure(expected_token, request);
+    #[cfg(not(windows))]
+    let result: Result<(), Box<dyn std::error::Error>> = {
+        let _ = (expected_token, request);
+        Err("Windows live-share mapping is unavailable on this platform".into())
+    };
+    if let Err(error) = result {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::error::Error>> {
     forward_maintenance_operation(
@@ -1565,6 +1735,40 @@ fn forward_windows_sudo_configure(
     write_frame(
         &mut stream,
         &Frame::new(FrameKind::WindowsSudoConfigure, request.encode()),
+    )?;
+    read_maintenance_fixed_response(&mut stream)
+}
+
+#[cfg(windows)]
+fn forward_live_share_query(
+    expected_token: &str,
+) -> Result<LiveShareStatus, Box<dyn std::error::Error>> {
+    let mut stream = connect_maintenance_helper(expected_token, CAPABILITY_LIVE_SHARE_V1)?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::LiveShareQuery, Vec::new()),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::LiveShareStatus => Ok(LiveShareStatus::decode(&response.payload)?),
+        FrameKind::Error => Err(format!(
+            "Windows maintenance helper refused the live-share query: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows maintenance helper returned an invalid live-share status".into()),
+    }
+}
+
+#[cfg(windows)]
+fn forward_live_share_configure(
+    expected_token: &str,
+    request: LiveShareConfigureRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_maintenance_helper(expected_token, CAPABILITY_LIVE_SHARE_V1)?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::LiveShareConfigure, request.encode()),
     )?;
     read_maintenance_fixed_response(&mut stream)
 }

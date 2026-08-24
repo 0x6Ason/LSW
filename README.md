@@ -95,6 +95,9 @@ The one-shot installer performs the following steps:
    and UAC. Automation must explicitly defer this step and may later use
    `lsw user setup --username USER --password-stdin` with an optional
    `--administrator`.
+8. Separately offers the recommended `~/LSW` integration, showing the exact
+   read-write host root before consent. If accepted, it performs one normal
+   guest restart and maps only that directory as `Linux (L:)`.
 
 The terminal UI renders byte-accurate bars for native ISO transfer,
 range assembly, SHA-256 verification, and DISM percentages. WinPE boot,
@@ -203,7 +206,28 @@ changed/new files are atomically replaced, while deletion on the host does not
 delete the guest copy. `--watch` polls a bounded local snapshot every 750 ms and
 retries failed changes.
 
-Declare a per-instance synchronization boundary instead of repeating paths:
+The common file workflow uses the default instance and infers direction from
+the absolute Windows path:
+
+```bash
+lsw share ~/LSW                    # live read-write Linux (L:)
+lsw share                          # list configured shares
+lsw cp ./build.zip 'C:\work\build.zip'
+lsw cp 'C:\work\result.txt' .
+lsw unshare linux                  # unmount; host files are preserved
+```
+
+The live folder is a real host-backed view over the VM's private QEMU
+user-network SMB path; changes are visible in both directions without a sync
+step. It requires the host Samba server executable but no Windows filesystem
+driver, public SMB listener, RDP, WebDAV, or whole-home export. The first add
+and final remove restart the guest normally because QEMU fixes the exported
+root when the VM starts. Windows keeps a system-wide `L:` mapping so Explorer,
+file dialogs, Session 0 tools, and the later desktop companion see the same
+path. LSW refuses to replace a pre-existing unrelated `L:` mapping.
+
+The authenticated agent mirror remains available for offline hosts, staging,
+recovery, explicit read-only ACLs, and automation:
 
 ```bash
 lsw share add win-dev source ./project 'C:\Users\dev\source' --read-write
@@ -218,6 +242,13 @@ while built-in Users receive only ReadAndExecute. Removing a share preserves
 its guest files and ACL instead of silently loosening access. Both sides reject
 symlinks/reparse points and parent traversal. Neither direction propagates
 deletions.
+
+`lsw bench files [NAME] --json` compares the live SMB and guest-local paths
+using a 1 GiB sequential file, 4,096 small files, a metadata walk, optional
+`git status`, and a deterministic hash-based build simulation. It also records
+the equivalent agent-mirror dataset sync. `--size-mib` and `--small-files`
+provide bounded CI dimensions; temporary host and guest data are removed even
+after a failed run.
 
 Create a pristine reusable base before registering a permanent desktop user:
 
@@ -543,9 +574,10 @@ targets, Zig, or operating-system media.
 - Signed VirtIO drivers are not bundled or silently installed. The balloon
   device and governor are available, but useful guest reclaim depends on a
   compatible signed Windows driver; the inbox NVMe/e1000e path remains valid.
-- Folder shares are explicit synchronized mirrors, not kernel mounts. Host to
-  guest watch is additive; RW guest-to-host synchronization is explicit and
-  conflicts/deletions are never resolved destructively in the background.
+- One driverless live read-write root can be mapped as `Linux (L:)` per
+  instance. Additional declared shares remain synchronized agent mirrors;
+  host-to-guest watch is additive and conflicts/deletions are never resolved
+  destructively in the background. Signed Virtio-fs is not required or enabled.
 - Agent authentication is not encrypted and is limited to LSW's local
   loopback/QEMU user-network path.
 - QEMU does not yet run inside an LSW-specific seccomp/namespace/service-account

@@ -7,7 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    HostCapabilities, InstanceManifest, NetworkMode, QemuBackend, Result, AGENT_GUEST_PORT,
+    FolderShareTransport, HostCapabilities, InstanceManifest, NetworkMode, QemuBackend, Result,
+    AGENT_GUEST_PORT,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -192,6 +193,24 @@ impl QemuPlanner {
             network.push_str(&format!(
                 ",hostfwd=tcp:127.0.0.1:{}-:{}",
                 forward.host_port, forward.guest_port
+            ));
+        }
+        let live_share = if phase == LaunchPhase::Run {
+            manifest
+                .folder_shares
+                .iter()
+                .find(|share| share.transport == FolderShareTransport::LiveSmb)
+        } else {
+            None
+        };
+        if let Some(share) = live_share {
+            let root = canonical_live_share_root(&share.host_path)?;
+            network.push_str(",smb=");
+            network.push_str(&qemu_option_value(&root));
+            notes.push(format!(
+                "live folder {:?}: private QEMU SMB exports {} read-write at \\\\10.0.2.4\\qemu",
+                share.name,
+                root.display()
             ));
         }
         push_pair(&mut arguments, "-netdev", network);
@@ -390,6 +409,9 @@ impl QemuPlanner {
         let mut missing_capabilities = self
             .capabilities
             .missing_for_profile_launch(manifest.spec.profile);
+        if live_share.is_some() && self.capabilities.smbd.is_none() {
+            missing_capabilities.push("smbd (Samba user-mode server)");
+        }
         if !instance_dir.join("disk.qcow2").is_file() {
             missing_capabilities.push("prepared system disk");
         }
@@ -421,6 +443,34 @@ impl QemuPlanner {
             missing_capabilities,
         })
     }
+}
+
+fn canonical_live_share_root(path: &Path) -> Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(crate::LswError::InvalidValue {
+                    field: "live folder share root",
+                    reason: format!("{} crosses a symbolic link", path.display()),
+                })
+            }
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let canonical = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(&canonical)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(crate::LswError::InvalidValue {
+            field: "live folder share root",
+            reason: format!("{} must be a real directory", path.display()),
+        });
+    }
+    Ok(canonical)
+}
+
+fn qemu_option_value(path: &Path) -> String {
+    qemu_path(path)
 }
 
 fn display_command(program: &OsStr, arguments: &[OsString]) -> String {
@@ -460,7 +510,10 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{InstanceSpec, NetworkMode, WindowsProfile};
+    use crate::{
+        FolderShare, FolderShareMode, FolderShareTransport, InstanceSpec, NetworkMode,
+        WindowsProfile,
+    };
 
     use super::*;
 
@@ -596,6 +649,43 @@ mod tests {
             .notes
             .iter()
             .any(|note| note.contains("127.0.0.1:8080")));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn live_share_uses_only_the_approved_qemu_smb_root() {
+        let (mut manifest, iso) = test_manifest(WindowsProfile::Vanilla);
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must be valid")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("lsw-live-share-{nonce},root"));
+        fs::create_dir(&root).expect("share root should be created");
+        manifest.folder_shares.push(FolderShare {
+            name: "linux".to_owned(),
+            host_path: root.clone(),
+            guest_path: "L:\\".to_owned(),
+            mode: FolderShareMode::ReadWrite,
+            transport: FolderShareTransport::LiveSmb,
+        });
+        let mut capabilities = headless_capabilities();
+        capabilities.smbd = Some(PathBuf::from("/usr/sbin/smbd"));
+        let plan = QemuPlanner::new(capabilities)
+            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
+            .expect("live-share plan should be built");
+        let command = plan.display_command();
+        assert!(command.contains("smb="));
+        assert!(command.contains("root"));
+        assert!(!plan
+            .missing_capabilities
+            .contains(&"smbd (Samba user-mode server)"));
+        let blocked = QemuPlanner::new(headless_capabilities())
+            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
+            .expect("missing smbd should be reported in the plan");
+        assert!(blocked
+            .missing_capabilities
+            .contains(&"smbd (Samba user-mode server)"));
+        fs::remove_dir(root).expect("share root should be removable");
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 }

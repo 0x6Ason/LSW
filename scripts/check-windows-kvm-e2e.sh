@@ -182,6 +182,7 @@ windows_sudo_policy=unknown
 windows_uac_enabled=unknown
 clone_identity_isolated=unknown
 folder_share_boundaries=unknown
+live_folder_verified=unknown
 resource_governor_verified=unknown
 ovmf_code_sha256=unknown
 exec_context_verified=unknown
@@ -340,6 +341,7 @@ collect_e2e_artifacts() {
         printf 'windows_uac_enabled=%s\n' "$windows_uac_enabled"
         printf 'clone_identity_isolated=%s\n' "$clone_identity_isolated"
         printf 'folder_share_boundaries=%s\n' "$folder_share_boundaries"
+        printf 'live_folder_verified=%s\n' "$live_folder_verified"
         printf 'resource_governor_verified=%s\n' "$resource_governor_verified"
         printf 'exec_context_verified=%s\n' "$exec_context_verified"
         printf 'signal_status=%s\n' "$signal_status"
@@ -1437,6 +1439,76 @@ if [ "$read_only_acl" != LSW_RO_ACL_OK ]; then
 fi
 "$lsw" share remove "$instance" source
 folder_share_boundaries=true
+
+live_source="$e2e_root/live-source"
+mkdir -p -- "$live_source"
+printf 'live-host-one' >"$live_source/host.txt"
+"$lsw" share "$live_source"
+live_mapping=$(
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        'if ((Get-SmbGlobalMapping -LocalPath "L:").RemotePath -eq "\\10.0.2.4\qemu" -and (Test-Path -LiteralPath "L:\host.txt")) { [Console]::Out.Write("LSW_LIVE_OK") }'
+)
+if [ "$live_mapping" != LSW_LIVE_OK ]; then
+    echo "error: the private QEMU SMB root was not mounted as Linux (L:)" >&2
+    exit 1
+fi
+printf 'live-host-two' >"$live_source/host.txt"
+live_value=$(
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        "Get-Content -LiteralPath 'L:\host.txt' -Raw"
+)
+if [ "$(printf '%s' "$live_value" | tr -d '\r')" != live-host-two ]; then
+    echo "error: live folder did not expose a host update without synchronization" >&2
+    exit 1
+fi
+"$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    "Set-Content -LiteralPath 'L:\guest.txt' -Value 'live-guest' -NoNewline"
+if [ "$(cat "$live_source/guest.txt")" != live-guest ]; then
+    echo "error: live folder did not expose a guest update without synchronization" >&2
+    exit 1
+fi
+
+printf 'cp-host' >"$e2e_root/cp-host.txt"
+"$lsw" cp "$e2e_root/cp-host.txt" "$guest_test_root\cp-host.txt"
+"$lsw" cp "$guest_test_root\cp-host.txt" "$e2e_root/cp-return.txt"
+if [ "$(cat "$e2e_root/cp-return.txt")" != cp-host ]; then
+    echo "error: lsw cp did not infer both transfer directions" >&2
+    exit 1
+fi
+
+files_bench_json=$("$lsw" bench files "$instance" --json --size-mib 16 --small-files 128)
+python3 - "$files_bench_json" <<'PY'
+import json
+import sys
+
+result = json.loads(sys.argv[1])
+if result.get("schema") != 1:
+    raise SystemExit("error: file benchmark schema is not version 1")
+if result.get("dataset") != {"sequential_mib": 16, "small_files": 128}:
+    raise SystemExit("error: file benchmark dimensions were not retained")
+if not result.get("guest_local", {}).get("available"):
+    raise SystemExit("error: guest-local file benchmark was unavailable")
+if not result.get("live_smb", {}).get("available"):
+    raise SystemExit("error: live SMB file benchmark was unavailable")
+if not result.get("agent_mirror", {}).get("available"):
+    raise SystemExit("error: agent-mirror file benchmark was unavailable")
+PY
+
+"$lsw" unshare linux
+if [ ! -f "$live_source/host.txt" ] || [ ! -f "$live_source/guest.txt" ]; then
+    echo "error: unshare removed host files" >&2
+    exit 1
+fi
+if "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+    'if (Get-SmbGlobalMapping -LocalPath "L:" -ErrorAction SilentlyContinue) { exit 1 }' >/dev/null
+then
+    :
+else
+    echo "error: unshare left Linux (L:) globally mapped" >&2
+    exit 1
+fi
+live_folder_verified=true
+echo "driverless live folder, inferred copy, and file benchmark passed."
 
 "$lsw" memory reclaim "$instance"
 if [ "$(cat "$LSW_STATE_DIR/instances/$instance/run/balloon.target")" != 2048 ]; then

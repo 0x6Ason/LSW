@@ -14,6 +14,7 @@ pub struct HostCapabilities {
     pub setsid: Option<PathBuf>,
     pub aria2c: Option<PathBuf>,
     pub swtpm: Option<PathBuf>,
+    pub smbd: Option<PathBuf>,
     pub wimlib_imagex: Option<PathBuf>,
     pub xorriso: Option<PathBuf>,
     pub seven_zip: Option<PathBuf>,
@@ -45,6 +46,12 @@ impl HostCapabilities {
             setsid: command_in_path("setsid"),
             aria2c: command_in_path("aria2c"),
             swtpm: command_in_path("swtpm"),
+            smbd: command_in_path("smbd").or_else(|| {
+                ["/usr/sbin/smbd", "/usr/local/sbin/smbd"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.is_file())
+            }),
             wimlib_imagex: command_in_path("wimlib-imagex"),
             xorriso: command_in_path("xorriso"),
             seven_zip: command_in_path("7zz").or_else(|| command_in_path("7z")),
@@ -97,6 +104,7 @@ impl HostCapabilities {
             setsid: None,
             aria2c: None,
             swtpm: None,
+            smbd: None,
             wimlib_imagex: None,
             xorriso: None,
             seven_zip: None,
@@ -147,6 +155,9 @@ impl HostCapabilities {
         }
         if self.seven_zip.is_none() {
             missing.push("7z (UDF-capable ISO extractor)");
+        }
+        if self.smbd.is_none() {
+            missing.push("smbd (Samba user-mode server)");
         }
         missing.sort_unstable();
         missing.dedup();

@@ -125,6 +125,13 @@ headless workflows working.
 - Treat signed Windows Virtio-fs plus WinFsp as a later opt-in accelerator after
   its signing, update, reconnect, locking, Unicode, and deletion behavior passes
   the same tests. It cannot be required for correct default sharing.
+- Slice 2 is implemented on the beta.8 development line: nameless first install,
+  short share/unshare/copy commands, separate recommended-integration consent,
+  a single fail-closed driverless QEMU SMB root mounted globally as `Linux
+  (L:)`, manifest migration, the retained agent-mirror interfaces, and
+  machine-readable guest-local/live/mirror file benchmarks are covered by the
+  exact Windows/KVM gate. The default benchmark uses 1 GiB and 4,096 small
+  files; CI may select smaller bounded dimensions while retaining the schema.
 
 ### Slice 3: user-session companion and GUI launch
 

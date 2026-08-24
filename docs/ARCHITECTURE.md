@@ -29,6 +29,7 @@ validation claims in the beta.7 release.
 | Image manager | Implemented | Content-addressed sealed qcow2 bases, linked overlays, and post-clone credential rotation |
 | Resource governor | Implemented; opt-in | QMP balloon targets, host-pressure response, pause, Windows hibernate, resume, TRIM, and compaction |
 | Folder-share mirror | Implemented; opt-in | Manifest-bound RO/RW roots over authenticated bulk transfer with additive change watch |
+| Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and globally mapped as Windows `L:` without a guest filesystem driver |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
 | Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
@@ -44,7 +45,9 @@ validation claims in the beta.7 release.
    with at most four connections, and verifies Microsoft's published SHA-256.
    `--iso` retains a local offline path. Version 1 and 2 manifests migrate with
    no published ports; version 3 manifests receive the default idle-timeout;
-   version 4 migrates with all beta.7 policies and shares disabled.
+   version 4 migrates with all beta.7 policies and shares disabled; version 5
+   adds users and mirrors; version 6 adds explicit account roles; version 7
+   keeps every older share on the mirror transport.
 2. The installer selects Windows 11 Pro by WIM metadata unless the user chooses
    another edition. A network-disabled WinPE microVM uses the official media's
    DISM to export and service a profile-specific WIM in a private workspace,
@@ -189,6 +192,15 @@ ReadAndExecute. Guest-to-host RW import is explicit, and neither direction
 propagates deletions. Removing a share preserves its guest ACL. Every existing
 host component rejects symlinks and every existing guest component rejects
 Windows reparse points.
+
+Manifest version 7 distinguishes the existing `mirror` transport from one
+`live-smb` root. Older manifests migrate every share to `mirror`. On a normal
+run, the planner re-canonicalizes the live root, rejects symlinks, and adds it
+only to that instance's QEMU user-network backend. The Windows agent forwards a
+fixed mapping request to the existing one-shot LocalSystem maintenance helper;
+the resulting global `Linux (L:)` drive is available to service and interactive
+sessions. Adding or removing the root performs a graceful restart because the
+QEMU SMB root is immutable after launch.
 
 On Unix the child enters a new process group in the pre-`exec` path. LSW signals
 that group after a normal leader exit and on cancellation, disconnect, protocol

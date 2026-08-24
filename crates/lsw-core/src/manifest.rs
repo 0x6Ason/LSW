@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{LswError, Result, WindowsProfile};
 
-const MANIFEST_VERSION: u32 = 6;
+const MANIFEST_VERSION: u32 = 7;
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 pub const DEFAULT_HIBERNATE_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const AGENT_CONTROL_PORT_START: u16 = 42_000;
@@ -86,6 +86,36 @@ pub enum FolderShareMode {
     ReadWrite,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FolderShareTransport {
+    Mirror,
+    LiveSmb,
+}
+
+impl fmt::Display for FolderShareTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Mirror => "mirror",
+            Self::LiveSmb => "live-smb",
+        })
+    }
+}
+
+impl FromStr for FolderShareTransport {
+    type Err = LswError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "mirror" => Ok(Self::Mirror),
+            "live-smb" => Ok(Self::LiveSmb),
+            _ => Err(LswError::InvalidValue {
+                field: "folder share transport",
+                reason: format!("unknown transport {value:?}; expected mirror or live-smb"),
+            }),
+        }
+    }
+}
+
 impl fmt::Display for FolderShareMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -116,6 +146,7 @@ pub struct FolderShare {
     pub host_path: PathBuf,
     pub guest_path: String,
     pub mode: FolderShareMode,
+    pub transport: FolderShareTransport,
 }
 
 impl FolderShare {
@@ -128,7 +159,16 @@ impl FolderShare {
                 reason: "must be an absolute directory below the filesystem root".to_owned(),
             });
         }
-        validate_windows_absolute_path(&self.guest_path)?;
+        if self.transport == FolderShareTransport::LiveSmb {
+            if self.mode != FolderShareMode::ReadWrite || self.guest_path != "L:\\" {
+                return Err(LswError::InvalidValue {
+                    field: "live folder share",
+                    reason: "must be read-write and mounted at L:\\".to_owned(),
+                });
+            }
+        } else {
+            validate_windows_absolute_path(&self.guest_path)?;
+        }
         Ok(())
     }
 }
@@ -445,11 +485,12 @@ impl InstanceManifest {
         let mut shares = String::new();
         for (index, share) in self.folder_shares.iter().enumerate() {
             shares.push_str(&format!(
-                "share.{index}.name={}\nshare.{index}.host={}\nshare.{index}.guest={}\nshare.{index}.mode={}\n",
+                "share.{index}.name={}\nshare.{index}.host={}\nshare.{index}.guest={}\nshare.{index}.mode={}\nshare.{index}.transport={}\n",
                 share.name,
                 share.host_path.display(),
                 share.guest_path,
-                share.mode
+                share.mode,
+                share.transport
             ));
         }
 
@@ -608,7 +649,7 @@ impl InstanceManifest {
             default_user.as_ref().map(|_| WindowsUserRole::Standard)
         };
         let folder_shares = if version >= 5 {
-            parse_folder_shares(&fields)?
+            parse_folder_shares(&fields, version)?
         } else {
             Vec::new()
         };
@@ -666,8 +707,17 @@ fn validate_runtime_fields(manifest: &InstanceManifest) -> Result<()> {
         });
     }
     let mut names = BTreeSet::new();
+    let mut live_share_seen = false;
     for (index, share) in manifest.folder_shares.iter().enumerate() {
         share.validate()?;
+        if share.transport == FolderShareTransport::LiveSmb
+            && std::mem::replace(&mut live_share_seen, true)
+        {
+            return Err(LswError::InvalidValue {
+                field: "live folder shares",
+                reason: "only one private QEMU SMB root can be mounted per instance".to_owned(),
+            });
+        }
         if !names.insert(&share.name) {
             return Err(LswError::InvalidValue {
                 field: "folder shares",
@@ -692,7 +742,10 @@ fn validate_runtime_fields(manifest: &InstanceManifest) -> Result<()> {
     Ok(())
 }
 
-fn parse_folder_shares(fields: &BTreeMap<&str, &str>) -> Result<Vec<FolderShare>> {
+fn parse_folder_shares(
+    fields: &BTreeMap<&str, &str>,
+    manifest_version: u32,
+) -> Result<Vec<FolderShare>> {
     let count = parse_field::<usize>(fields, "share_count")?;
     if count > 64 {
         return Err(LswError::InvalidManifest(
@@ -706,6 +759,11 @@ fn parse_folder_shares(fields: &BTreeMap<&str, &str>) -> Result<Vec<FolderShare>
                 host_path: PathBuf::from(required_field(fields, &format!("share.{index}.host"))?),
                 guest_path: required_field(fields, &format!("share.{index}.guest"))?.to_owned(),
                 mode: required_field(fields, &format!("share.{index}.mode"))?.parse()?,
+                transport: if manifest_version >= 7 {
+                    required_field(fields, &format!("share.{index}.transport"))?.parse()?
+                } else {
+                    FolderShareTransport::Mirror
+                },
             };
             share.validate()?;
             Ok(share)
@@ -999,6 +1057,7 @@ mod tests {
             host_path: PathBuf::from("/srv/source"),
             guest_path: "C:\\Users\\desktop-user\\source".to_owned(),
             mode: FolderShareMode::ReadWrite,
+            transport: FolderShareTransport::Mirror,
         });
 
         let encoded = manifest.encode().expect("manifest should encode");
@@ -1032,6 +1091,7 @@ mod tests {
             host_path: PathBuf::from(host_source),
             guest_path: "C:\\src".to_owned(),
             mode: FolderShareMode::ReadWrite,
+            transport: FolderShareTransport::Mirror,
         };
         valid.validate().expect("ordinary roots should be valid");
         for invalid_guest in ["C:\\", "C:\\src\\", "C:\\src:stream", "C:\\CON"] {
@@ -1063,12 +1123,34 @@ mod tests {
             host_path: PathBuf::from(host_other),
             guest_path: "c:/SRC/nested".to_owned(),
             mode: FolderShareMode::ReadOnly,
+            transport: FolderShareTransport::Mirror,
         });
         assert!(validate_runtime_fields(&manifest).is_err());
         manifest.folder_shares[1].guest_path = "D:\\other".to_owned();
         manifest.folder_shares[1].host_path = PathBuf::from(host_nested);
         assert!(validate_runtime_fields(&manifest).is_err());
         fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn live_folder_share_has_one_fixed_driverless_mount_boundary() {
+        let mut live = FolderShare {
+            name: "linux".to_owned(),
+            host_path: PathBuf::from(if cfg!(windows) {
+                "C:\\Users\\developer\\LSW"
+            } else {
+                "/home/developer/LSW"
+            }),
+            guest_path: "L:\\".to_owned(),
+            mode: FolderShareMode::ReadWrite,
+            transport: FolderShareTransport::LiveSmb,
+        };
+        live.validate().expect("fixed live mount should validate");
+        live.mode = FolderShareMode::ReadOnly;
+        assert!(live.validate().is_err());
+        live.mode = FolderShareMode::ReadWrite;
+        live.guest_path = "M:\\".to_owned();
+        assert!(live.validate().is_err());
     }
 
     #[test]
@@ -1221,15 +1303,59 @@ mod tests {
             .encode()
             .expect("manifest should encode")
             .lines()
-            .filter(|line| !line.starts_with("default_user_role="))
+            .filter(|line| !line.starts_with("default_user_role=") && !line.contains(".transport="))
             .map(str::to_owned)
             .collect::<Vec<_>>()
             .join("\n")
-            .replacen("version=6", "version=5", 1);
+            .replacen("version=7", "version=5", 1);
 
         let migrated = InstanceManifest::decode(&legacy).expect("v5 manifest should migrate");
         assert_eq!(migrated.default_user.as_deref(), Some("desktop-user"));
         assert_eq!(migrated.default_user_role, Some(WindowsUserRole::Standard));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn version_six_folder_shares_migrate_to_the_mirror_transport() {
+        let iso = temporary_iso();
+        let mut manifest = InstanceManifest::new(InstanceSpec {
+            name: "version-six".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Slim,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("fixture manifest should be valid");
+        manifest.folder_shares.push(FolderShare {
+            name: "source".to_owned(),
+            host_path: PathBuf::from(if cfg!(windows) {
+                "C:\\srv\\source"
+            } else {
+                "/srv/source"
+            }),
+            guest_path: "C:\\source".to_owned(),
+            mode: FolderShareMode::ReadWrite,
+            transport: FolderShareTransport::Mirror,
+        });
+        let legacy = manifest
+            .encode()
+            .expect("manifest should encode")
+            .lines()
+            .filter(|line| !line.contains(".transport="))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replacen("version=7", "version=6", 1);
+        let migrated = InstanceManifest::decode(&legacy).expect("v6 manifest should migrate");
+        assert_eq!(
+            migrated.folder_shares[0].transport,
+            FolderShareTransport::Mirror
+        );
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 

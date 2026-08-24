@@ -120,6 +120,10 @@ demand-start account helper, linked-clone
 identity isolation, folder-share escape rejection, balloon/TRIM, fixed-helper
 Windows hibernate/resume, offline compaction, and zero QEMU RSS after
 stop/hibernate.
+beta.8 Slice 2 additionally requires an exact-root private QEMU SMB export,
+global `Linux (L:)` mapping, immediate host/guest visibility, inferred `lsw cp`,
+machine-readable file benchmarks, unshare preservation, and complete teardown
+of the restarted VM and Samba helper.
 
 ## Release bundle
 

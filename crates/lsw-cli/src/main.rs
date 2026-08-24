@@ -9,6 +9,7 @@ mod agent_client;
 mod arguments;
 mod completion;
 mod daemon_client;
+mod file_bench;
 mod installation;
 mod license;
 mod path_translation;
@@ -124,6 +125,7 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "user" => user_command(&store, remaining)?,
         "sudo" => windows_sudo::command(&store, remaining)?,
         "share" => shares::command(&store, remaining)?,
+        "unshare" => shares::unshare(&store, remaining)?,
         "start" => start_instance(&store, remaining, LaunchPhase::Run)?,
         "status" => status(&store, remaining)?,
         "suspend" => suspend(&store, remaining)?,
@@ -138,6 +140,7 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "run" => return guest_command(&store, remaining, SessionKind::Run),
         "push" => transfer::push(&store, remaining)?,
         "pull" => transfer::pull(&store, remaining)?,
+        "cp" => transfer::copy(&store, remaining)?,
         "sync" => transfer::sync(&store, remaining)?,
         unknown => {
             return Err(format!("unknown command {unknown:?}; run `lsw help`").into());
@@ -407,6 +410,7 @@ fn print_host_report(store: &StateStore, capabilities: &HostCapabilities) {
     );
     println!("  setsid:      {}", display_optional(&capabilities.setsid));
     println!("  swtpm:       {}", display_optional(&capabilities.swtpm));
+    println!("  smbd:        {}", display_optional(&capabilities.smbd));
     println!("  aria2c:      {}", display_optional(&capabilities.aria2c));
     println!(
         "  wimlib:      {}",
@@ -491,6 +495,7 @@ fn fix_host_dependencies(needs_viewer: bool) -> Result<(), Box<dyn std::error::E
             "util-linux",
             "ovmf",
             "swtpm",
+            "samba",
             "aria2",
             "wimtools",
             "xorriso",
@@ -509,6 +514,7 @@ fn fix_host_dependencies(needs_viewer: bool) -> Result<(), Box<dyn std::error::E
             "util-linux",
             "edk2-ovmf",
             "swtpm",
+            "samba",
             "aria2",
             "wimlib-utils",
             "xorriso",
@@ -528,6 +534,7 @@ fn fix_host_dependencies(needs_viewer: bool) -> Result<(), Box<dyn std::error::E
             "util-linux",
             "edk2-ovmf",
             "swtpm",
+            "samba",
             "aria2",
             "wimlib",
             "xorriso",
@@ -546,6 +553,7 @@ fn fix_host_dependencies(needs_viewer: bool) -> Result<(), Box<dyn std::error::E
             "util-linux",
             "qemu-ovmf-x86_64",
             "swtpm",
+            "samba",
             "aria2",
             "wimlib",
             "xorriso",
@@ -557,7 +565,7 @@ fn fix_host_dependencies(needs_viewer: bool) -> Result<(), Box<dyn std::error::E
         run_package_command(&elevated, "zypper", &packages)?;
     } else {
         return Err(format!(
-            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, util-linux, aria2, wimlib-imagex, xorriso, and 7z manually{}",
+            "automatic dependency repair does not support distribution {distribution:?}; install QEMU, qemu-img, OVMF, swtpm, Samba (smbd), util-linux, aria2, wimlib-imagex, xorriso, and 7z manually{}",
             if needs_viewer { ", plus remote-viewer" } else { "" }
         )
         .into());
@@ -2045,7 +2053,7 @@ fn diagnostic_host_text(_store: &StateStore, capabilities: &HostCapabilities) ->
     format!(
         concat!(
             "lsw_version={}\nstate_root={}\nplatform={}\naccelerator={}\n",
-            "kvm={}\nqemu={}\nqemu_img={}\nsetsid={}\nswtpm={}\naria2c={}\nwimlib={}\nxorriso={}\nseven_zip={}\nviewer={}\n"
+            "kvm={}\nqemu={}\nqemu_img={}\nsetsid={}\nswtpm={}\nsmbd={}\naria2c={}\nwimlib={}\nxorriso={}\nseven_zip={}\nviewer={}\n"
         ),
         env!("CARGO_PKG_VERSION"),
         "<redacted>",
@@ -2056,6 +2064,7 @@ fn diagnostic_host_text(_store: &StateStore, capabilities: &HostCapabilities) ->
         display_optional(&capabilities.qemu_img),
         display_optional(&capabilities.setsid),
         display_optional(&capabilities.swtpm),
+        display_optional(&capabilities.smbd),
         display_optional(&capabilities.aria2c),
         display_optional(&capabilities.wimlib_imagex),
         display_optional(&capabilities.xorriso),
@@ -2091,6 +2100,12 @@ fn copy_diagnostic_tail(
 }
 
 fn bench(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "files")
+    {
+        return file_bench::command(store, &arguments[1..]);
+    }
     let mut json = false;
     let mut requested = None;
     for argument in arguments {
@@ -2429,9 +2444,12 @@ fn print_help() {
         "  lsw shell [NAME]\n",
         "  lsw exec [NAME] [--cwd PATH] [-e KEY=VALUE] -- COMMAND [ARG ...]\n",
         "  lsw run [NAME] [--cwd PATH] [-e KEY=VALUE] [--detach] -- PROGRAM [ARG ...]\n",
+        "  lsw cp SOURCE DESTINATION\n",
         "  lsw push [NAME] [--recursive] HOST_PATH WINDOWS_PATH\n",
         "  lsw pull [NAME] [--recursive] WINDOWS_PATH HOST_PATH\n",
         "  lsw sync [NAME] [--watch] HOST_DIRECTORY WINDOWS_DIRECTORY\n",
+        "  lsw share [PATH]\n",
+        "  lsw unshare SHARE\n",
         "  lsw share add [NAME] SHARE HOST_PATH GUEST_PATH (--read-only|--read-write)\n",
         "  lsw share <list|remove|sync|watch> [NAME] [SHARE]\n",
         "  lsw image <list|seal NAME|verify KEY>\n",

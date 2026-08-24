@@ -27,7 +27,8 @@ pub(super) fn command(
         parsed.user_name,
         parsed.password_stdin,
         parsed.administrator,
-    )
+    )?;
+    super::shares::offer_recommended_integration(store, &name)
 }
 
 pub(super) fn add(
@@ -54,7 +55,7 @@ pub(super) fn after_install(
     let manifest = store.load(name)?;
     if let Some(user) = manifest.default_user {
         println!("Windows desktop user {user:?} is already registered.");
-        return Ok(());
+        return super::shares::offer_recommended_integration(store, name);
     }
     if deferred {
         println!("Windows user registration deferred. Run `lsw user setup {name}` later.");
@@ -72,6 +73,7 @@ pub(super) fn after_install(
     if administrator {
         super::windows_sudo::offer_after_install(store, name)?;
     }
+    super::shares::offer_recommended_integration(store, name)?;
     Ok(())
 }
 

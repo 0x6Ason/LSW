@@ -75,6 +75,9 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
 - Declarative RO/RW folder synchronization, additive change watch, explicit RW
   guest merge, guest ACL enforcement, and host-symlink/guest-reparse boundary
   rejection. Shares and background watch are never enabled implicitly.
+- Explicit driverless live-folder consent for one canonical host root, private
+  QEMU user-network SMB, fixed global `Linux (L:)` mapping, short
+  `share`/`unshare`/`cp` commands, and machine-readable file benchmarks.
 - Interactive post-install permanent-user registration and deferred
   `lsw user setup`. A demand-start authenticated LocalSystem helper calls native
   NetAPI once and exits; the normal agent remains an unprivileged virtual
@@ -194,8 +197,9 @@ The broader hardware and soak matrix still includes:
   CLI without login, but a service-launched GUI does not appear on the user's
   desktop. A user-session companion is not implemented.
 - Suspend/resume applies QMP `stop`/`cont`; hibernate uses Windows' hiberfile
-  and powers QEMU off. There is no cross-host live migration, kernel-mounted
-  host folder, USB passthrough, or portable image export.
+  and powers QEMU off. There is no cross-host live migration, kernel Virtio-fs
+  mount, USB passthrough, or portable image export. The live folder uses
+  driverless SMB and is limited to one approved read-write root.
 - The balloon device is present, but useful Windows reclaim requires a
   compatible signed VirtIO driver. LSW does not bundle unsigned/test-signed
   drivers and retains the inbox NVMe/e1000e recovery path.

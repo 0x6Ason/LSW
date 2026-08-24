@@ -5,7 +5,8 @@
 The Linux user account, QEMU process, guest OS, installation media, Windows
 agent, and future display bridge are separate trust domains. A local LSW user is
 trusted to control their own instances. Windows media and guest workloads are
-untrusted inputs and receive no host filesystem share or display-server socket.
+untrusted inputs and receive no host filesystem access unless the user approves
+one exact live root; they receive no display-server socket.
 
 LSW beta does not yet launch QEMU under a separate service account, seccomp
 profile, or namespace sandbox. Use current distribution security updates and do
@@ -139,14 +140,32 @@ reparse points, and unsafe relative components. Explicit `sync` updates use a
 unique guest temporary file plus atomic rename; the operation is additive and
 never turns a host deletion into a guest deletion.
 
-Folder shares are synchronized mirrors rather than QEMU mounts. Each manifest
-entry names one canonical host directory, one absolute guest drive path, and an
-explicit RO/RW mode. Existing components on both sides are checked during every
-walk: host symbolic links and Windows reparse points fail the operation. RO
-roots receive a protected allow-list ACL: SYSTEM, Administrators, and the exact
-SCM service SID have inheritable FullControl, while well-known BUILTIN Users
-have only ReadAndExecute. RW guest imports are explicit, no background operation
-propagates deletion, and removing a share does not silently loosen its guest ACL.
+Advanced folder shares remain synchronized mirrors. Each mirror names one
+canonical host directory, one absolute guest drive path, and an explicit RO/RW
+mode. Existing components on both sides are checked during every walk: host
+symbolic links and Windows reparse points fail the operation. RO roots receive a
+protected allow-list ACL: SYSTEM, Administrators, and the exact SCM service SID
+have inheritable FullControl, while well-known BUILTIN Users have only
+ReadAndExecute. RW guest imports are explicit, no background mirror operation
+propagates deletion, and removing a mirror does not silently loosen its guest
+ACL.
+
+One explicitly approved live root may instead use QEMU's user-network SMB
+helper. The CLI canonicalizes it and rejects every symlink ancestor; QEMU
+repeats that check at every launch so replacing the root cannot silently widen
+access. The generated Samba endpoint is reachable only inside that VM's private
+user network, not through a host TCP listener, and separate instances have
+separate network stacks. LSW never substitutes the Linux home or filesystem
+root. The share is deliberately read-write: the Windows guest is therefore
+trusted to modify or delete content below the approved root.
+
+A capability-gated request is forwarded over authenticated guest loopback to
+the demand-start LocalSystem maintenance helper. That helper can only add,
+query, or remove the fixed `L:` to `\\10.0.2.4\qemu` global mapping and its
+`Linux` label. It refuses an unrelated existing `L:` mapping. The ordinary
+agent remains unprivileged, and no username, password, path, drive letter, or
+command text is accepted by this operation. Removing the share unmaps the drive
+and restarts QEMU without the host export; host files are preserved.
 
 Sealed bases are mode 0400 and content-addressed. Sealing rejects an instance
 that already contains a registered permanent user. Clones do not inherit host
@@ -166,10 +185,11 @@ another instance, ports already bound by another local process at creation
 time, and all publishing in `offline` mode.
 
 `offline` sets QEMU `restrict=on`, blocking normal guest egress while retaining
-the host-only agent forward. Neither mode exposes a host directory. Loopback is
-an exposure boundary, not application authentication: treat a published guest
-service as untrusted, and do not re-export it to a LAN or the Internet without a
-separately reviewed security design.
+the host-only agent forward. Neither mode exposes a host directory by itself;
+only an explicitly configured live root adds the private SMB endpoint. Loopback
+is an exposure boundary, not application authentication: treat a published
+guest service as untrusted, and do not re-export it to a LAN or the Internet
+without a separately reviewed security design.
 
 ## Untrusted PE inspection
 

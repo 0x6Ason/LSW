@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 
-const COMMANDS: &str = "bench clone compact completion config create daemon diagnose doctor exec help hibernate image inspect install license list logs media memory path plan prepare profile pull push remove resume run seed share shell show shutdown start status stop sudo suspend sync trim use user version view";
+const COMMANDS: &str = "bench clone compact completion config cp create daemon diagnose doctor exec help hibernate image inspect install license list logs media memory path plan prepare profile pull push remove resume run seed share shell show shutdown start status stop sudo suspend sync trim unshare use user version view";
 
 pub(super) fn command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let [shell] = arguments else {

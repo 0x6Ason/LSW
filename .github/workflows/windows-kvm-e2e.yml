@@ -118,7 +118,7 @@ jobs:
           for command in \
             awk cargo df find findmnt git grep id python3 qemu-img \
             qemu-system-x86_64 realpath rustc rustup \
-            setsid sha256sum stat swtpm timeout tr \
+            setsid sha256sum smbd stat swtpm timeout tr \
             7z wimlib-imagex xorriso \
             x86_64-w64-mingw32-gcc; do
             if ! command -v "$command" >/dev/null 2>&1; then

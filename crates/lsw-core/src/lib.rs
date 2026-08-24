@@ -36,8 +36,8 @@ pub use iso_download::{
 };
 pub use manifest::{
     control_port_for_instance, validate_windows_user_name, FolderShare, FolderShareMode,
-    IdlePolicy, InstanceManifest, InstanceSpec, InstanceState, NetworkMode, PortForward,
-    WindowsUserRole, AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START,
+    FolderShareTransport, IdlePolicy, InstanceManifest, InstanceSpec, InstanceState, NetworkMode,
+    PortForward, WindowsUserRole, AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START,
     DEFAULT_HIBERNATE_TIMEOUT_SECONDS,
 };
 pub use pe::{
@@ -72,15 +72,16 @@ pub const MANIFEST_FILE: &str = "instance.lsw";
 pub use agent_protocol::{
     constant_time_token_eq, decode_exit, decode_file_length, decode_process_id, decode_resize,
     encode_exit, encode_file_length, encode_process_id, encode_resize, read_frame, write_frame,
-    ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, ProcessEnvironment, ServerHello,
-    SessionKind, SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
-    TerminalSize, TerminalStartRequest, UserCreateRequest, UserSetRoleRequest,
-    WindowsSudoConfigureRequest, WindowsSudoMode, WindowsSudoStatus, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
-    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1,
-    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
-    CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
-    CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1, DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS,
-    MAX_FRAME_BYTES, MAX_SESSION_LEASE_TIMEOUT_MILLIS, MAX_TERMINAL_DIMENSION,
-    MIN_SESSION_LEASE_TIMEOUT_MILLIS, SESSION_CANCEL_EXIT_CODE,
+    ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, LiveShareConfigureRequest,
+    LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
+    SessionOptions, SessionSignal, StartRequest, TerminalSize, TerminalStartRequest,
+    UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoMode,
+    WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1,
+    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
+    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
+    CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1,
+    CAPABILITY_WINDOWS_SUDO_V1, DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS, MAX_FRAME_BYTES,
+    MAX_SESSION_LEASE_TIMEOUT_MILLIS, MAX_TERMINAL_DIMENSION, MIN_SESSION_LEASE_TIMEOUT_MILLIS,
+    SESSION_CANCEL_EXIT_CODE,
 };

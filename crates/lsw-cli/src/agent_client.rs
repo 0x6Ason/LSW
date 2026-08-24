@@ -15,10 +15,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lsw_core::{
     decode_exit, decode_file_length, decode_process_id, encode_file_length, read_frame,
     write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest,
-    ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions, SessionSignal,
-    StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest, UserSetRoleRequest,
-    WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
-    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
+    SessionLease, SessionOptions, SessionSignal, StartRequest, TerminalSize, TerminalStartRequest,
+    UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoStatus,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1,
+    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
     CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
     CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1,
     CAPABILITY_WINDOWS_SUDO_V1,
@@ -167,6 +168,35 @@ impl AgentClient {
             FrameKind::Pong if response.payload.is_empty() => Ok(()),
             FrameKind::Error => Err(agent_error(&response.payload).into()),
             _ => Err("agent returned an invalid Windows sudo configuration response".into()),
+        }
+    }
+
+    pub fn live_share_status(mut self) -> Result<LiveShareStatus, Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_LIVE_SHARE_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::LiveShareQuery, Vec::new()),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::LiveShareStatus => Ok(LiveShareStatus::decode(&response.payload)?),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid live-share status response".into()),
+        }
+    }
+
+    pub fn configure_live_share(mut self, enable: bool) -> Result<(), Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_LIVE_SHARE_V1)?;
+        let request = LiveShareConfigureRequest { enable };
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::LiveShareConfigure, request.encode()),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::Pong if response.payload.is_empty() => Ok(()),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid live-share configuration response".into()),
         }
     }
 
@@ -988,6 +1018,35 @@ mod tests {
             .expect("sudo configuration should succeed");
             server.join().expect("fixture should not panic");
         }
+    }
+
+    #[test]
+    fn live_share_mapping_is_capability_gated_and_explicit() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let query = read_frame(&mut stream).expect("live-share query should arrive");
+            assert_eq!(query.kind, FrameKind::LiveShareQuery);
+            assert!(query.payload.is_empty());
+            write_frame(
+                &mut stream,
+                &Frame::new(
+                    FrameKind::LiveShareStatus,
+                    LiveShareStatus { mapped: true }.encode(),
+                ),
+            )
+            .expect("live-share status should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let status = AgentClient {
+            stream,
+            capabilities: vec![CAPABILITY_LIVE_SHARE_V1.to_owned()],
+        }
+        .live_share_status()
+        .expect("live-share query should succeed");
+        assert!(status.mapped);
+        server.join().expect("fixture should not panic");
     }
 
     #[test]

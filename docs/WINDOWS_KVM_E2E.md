@@ -14,7 +14,9 @@ QEMU/daemon cleanup, socket cleanup, and host-port release. The release job
 exercises the `slim` profile, creates a permanent standard user through the
 authenticated one-shot NetAPI helper, verifies explicit promotion, demotion,
 and final administrator membership, seals and boots a linked clone with an
-isolated secret, checks RO/RW share escape boundaries,
+isolated secret, checks RO/RW mirror escape boundaries, mounts a driverless
+live root as `Linux (L:)`, proves immediate bidirectional visibility, inferred
+`lsw cp`, benchmark JSON, and unshare preservation,
 balloon/TRIM/hibernate/compaction, and cold-starts the installed guest
 through a bare `lsw`, proves ConPTY and service-backed agent execution return at
 the Windows sign-in screen, requires the same service SID, and verifies that

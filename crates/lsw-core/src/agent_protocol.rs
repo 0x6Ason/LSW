@@ -20,6 +20,7 @@ pub const CAPABILITY_USER_ACCOUNT_ROLE_V1: &str = "user-account-role-v1";
 pub const CAPABILITY_MAINTENANCE_TRIM_V1: &str = "maintenance-trim-v1";
 pub const CAPABILITY_MAINTENANCE_HIBERNATE_V1: &str = "maintenance-hibernate-v1";
 pub const CAPABILITY_WINDOWS_SUDO_V1: &str = "windows-sudo-v1";
+pub const CAPABILITY_LIVE_SHARE_V1: &str = "live-share-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -65,6 +66,9 @@ pub enum FrameKind {
     WindowsSudoQuery = 35,
     WindowsSudoConfigure = 36,
     WindowsSudoStatus = 37,
+    LiveShareQuery = 38,
+    LiveShareConfigure = 39,
+    LiveShareStatus = 40,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -105,7 +109,52 @@ impl TryFrom<u8> for FrameKind {
             35 => Ok(Self::WindowsSudoQuery),
             36 => Ok(Self::WindowsSudoConfigure),
             37 => Ok(Self::WindowsSudoStatus),
+            38 => Ok(Self::LiveShareQuery),
+            39 => Ok(Self::LiveShareConfigure),
+            40 => Ok(Self::LiveShareStatus),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveShareConfigureRequest {
+    pub enable: bool,
+}
+
+impl LiveShareConfigureRequest {
+    pub fn encode(self) -> Vec<u8> {
+        vec![u8::from(self.enable)]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        match payload {
+            [0] => Ok(Self { enable: false }),
+            [1] => Ok(Self { enable: true }),
+            _ => Err(LswError::Protocol(
+                "live-share configuration must be exactly zero or one".to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveShareStatus {
+    pub mapped: bool,
+}
+
+impl LiveShareStatus {
+    pub fn encode(self) -> Vec<u8> {
+        vec![u8::from(self.mapped)]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        match payload {
+            [0] => Ok(Self { mapped: false }),
+            [1] => Ok(Self { mapped: true }),
+            _ => Err(LswError::Protocol(
+                "live-share status must be exactly zero or one".to_owned(),
+            )),
         }
     }
 }
@@ -1255,6 +1304,34 @@ mod tests {
         assert!(WindowsSudoStatus::decode(&[2, 0, u8::MAX]).is_err());
         assert!(WindowsSudoStatus::decode(&[1, 4, u8::MAX]).is_err());
         assert!(WindowsSudoStatus::decode(&[1, 0, 4]).is_err());
+    }
+
+    #[test]
+    fn live_share_protocol_is_append_only_and_strict() {
+        assert_eq!(FrameKind::LiveShareQuery as u8, 38);
+        assert_eq!(FrameKind::LiveShareConfigure as u8, 39);
+        assert_eq!(FrameKind::LiveShareStatus as u8, 40);
+        assert_eq!(
+            FrameKind::try_from(40).expect("live-share status kind should decode"),
+            FrameKind::LiveShareStatus
+        );
+        for enable in [false, true] {
+            let request = LiveShareConfigureRequest { enable };
+            assert_eq!(
+                LiveShareConfigureRequest::decode(&request.encode())
+                    .expect("live-share request should decode"),
+                request
+            );
+            let status = LiveShareStatus { mapped: enable };
+            assert_eq!(
+                LiveShareStatus::decode(&status.encode()).expect("live-share status should decode"),
+                status
+            );
+        }
+        assert!(LiveShareConfigureRequest::decode(&[]).is_err());
+        assert!(LiveShareConfigureRequest::decode(&[2]).is_err());
+        assert!(LiveShareStatus::decode(&[]).is_err());
+        assert!(LiveShareStatus::decode(&[2]).is_err());
     }
 
     #[test]

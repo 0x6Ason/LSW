@@ -35,7 +35,16 @@ pub(super) fn install_instance(
     store: &StateStore,
     arguments: &[OsString],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = InstallArguments::parse(arguments)?;
+    let mut parsed = InstallArguments::parse(arguments)?;
+    if should_use_safe_install_name(
+        parsed.requested.as_deref(),
+        env::var_os("LSW_DEFAULT_INSTANCE").is_some(),
+        store.default_name()?.is_some(),
+        store.list()?.is_empty(),
+    ) {
+        parsed.requested = Some("windows".to_owned());
+        println!("No instance name was supplied; using the safe default \"windows\".");
+    }
     if parsed.without_agent && parsed.seed.agent_binary.is_some() {
         return Err("--agent and --without-agent cannot be used together".into());
     }
@@ -177,6 +186,15 @@ pub(super) fn install_instance(
         println!("Windows setup is running without a verifiable LSW agent.");
     }
     Ok(())
+}
+
+fn should_use_safe_install_name(
+    requested: Option<&str>,
+    has_environment_default: bool,
+    has_saved_default: bool,
+    instance_store_is_empty: bool,
+) -> bool {
+    requested.is_none() && !has_environment_default && !has_saved_default && instance_store_is_empty
 }
 
 fn resume_winpe_installation(
@@ -909,6 +927,20 @@ mod tests {
     use lsw_core::NetworkMode;
 
     use super::*;
+
+    #[test]
+    fn safe_install_name_is_used_only_for_an_empty_unconfigured_store() {
+        assert!(should_use_safe_install_name(None, false, false, true));
+        assert!(!should_use_safe_install_name(
+            Some("work"),
+            false,
+            false,
+            true
+        ));
+        assert!(!should_use_safe_install_name(None, true, false, true));
+        assert!(!should_use_safe_install_name(None, false, true, true));
+        assert!(!should_use_safe_install_name(None, false, false, false));
+    }
 
     #[test]
     fn setup_and_winpe_stages_are_presented_without_invented_progress() {
