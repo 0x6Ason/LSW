@@ -76,11 +76,13 @@ soaks, and a cold-restart Windows/KVM gate.
 This release makes a Windows GUI application launched by LSW behave like a
 native Linux desktop application rather than exposing a remote Windows desktop.
 
-- Add a stable CLI and desktop-launcher path for `.exe` applications, including
-  icon discovery, `.desktop` entries, file arguments, working directories, and
-  environment values. The intended CLI shape is `lsw run --gui ...`; the final
-  spelling will be fixed before the feature is declared stable.
-- Make the Windows account role part of the desktop setup UX. For a personal
+beta.8 is delivered as eight bounded slices. The slices are internal acceptance
+boundaries, not additional version tags; each must keep existing terminal and
+headless workflows working.
+
+### Slice 1: desktop identity and consent foundation
+
+- Make the Windows account role part of desktop setup. For a personal
   development VM, recommend adding the confirmed desktop user to the local
   Administrators group so normal processes still use a filtered token and UAC
   remains the elevation boundary. Keep a standard-user choice, support explicit
@@ -90,9 +92,80 @@ native Linux desktop application rather than exposing a remote Windows desktop.
 - Detect the native Windows 11 `sudo.exe` capability and offer explicit opt-in
   enablement using its safer new-window mode. Do not bundle a third-party sudo
   replacement, disable UAC, or treat sudo as a way to bypass Windows consent.
-- Map every eligible top-level Windows HWND to an independent Wayland window,
-  with an X11 fallback, correct parent/modal relationships, focus, pointer,
-  keyboard, resize, minimize/maximize, and per-monitor DPI behavior.
+- The manifest role, native membership reconciliation, install prompt, and
+  explicit promote/demote commands are already implemented on the beta.8
+  development line. Native-sudo detection remains in this slice.
+
+### Slice 2: zero-configuration UX and live Linux folders
+
+- Make the common path short: `lsw install` may choose a safe default instance
+  name, bare `lsw share` lists shares, `lsw share PATH` immediately adds and
+  mounts a persistent read-write share for the default instance, and
+  `lsw unshare SHARE` removes it. Add `lsw cp SOURCE DESTINATION` with direction
+  inferred from the Windows path. Preserve `share add/sync/watch`, `push`, and
+  `pull` as stable advanced and automation interfaces.
+- After desktop-user setup, offer one recommended-integration dialog with an
+  explicit `[Y/n]` choice. Show the exact host root and access mode before
+  enabling it. Recommend a dedicated `~/LSW` read-write directory, map it in
+  Windows as `Linux (L:)`, and never expose the whole Linux home directory
+  implicitly. License acceptance and administrator selection remain separate
+  consent steps.
+- Prototype a driverless live share over the VM's private QEMU user-network SMB
+  path so Explorer, file dialogs, and Windows applications see current host
+  contents without copying. Keep the authenticated agent mirror for offline
+  synchronization, recovery, staging, and hosts without the SMB helper. WebDAV
+  is not the primary filesystem transport.
+- Before changing the default, benchmark sequential 1 GiB I/O, large trees of
+  small files, metadata walks, `git status`, and representative builds against
+  the existing agent mirror and guest-local storage. Add a machine-readable
+  `lsw bench files` result and publish the tested boundary.
+- Treat signed Windows Virtio-fs plus WinFsp as a later opt-in accelerator after
+  its signing, update, reconnect, locking, Unicode, and deletion behavior passes
+  the same tests. It cannot be required for correct default sharing.
+
+### Slice 3: user-session companion and GUI launch
+
+- Add an authenticated companion in the registered Windows user's interactive
+  session without enabling AutoLogon. Start it on demand and let it exit when no
+  GUI application, live share, clipboard, or integration client needs it.
+- Map the approved live share in that user session and recover it after guest or
+  desktop-session restart without exposing it to unrelated instances.
+- Add a stable CLI and desktop-launcher path for `.exe` applications, including
+  icon discovery, `.desktop` entries, file arguments, working directories, and
+  environment values. The intended CLI shape is `lsw run --gui ...`; the final
+  spelling will be fixed before the feature is declared stable.
+
+### Slice 4: first seamless application window
+
+- Launch one ordinary application in the desktop user's session, capture it
+  through documented Windows Graphics Capture, and present a damage-aware
+  Wayland window with an X11 fallback.
+- Implement lifecycle ownership, focus, keyboard, pointer, resize, close, and
+  crash recovery for that first window without requiring RDP or public VNC.
+  Shared-memory or GPU acceleration may improve performance later but cannot be
+  required for correctness.
+
+### Slice 5: complete HWND and display behavior
+
+- Map every eligible top-level Windows HWND to an independent Linux window with
+  correct owner, parent, modal, transient, minimize/maximize, and task-switching
+  relationships.
+- Add per-monitor DPI, mixed-scale movement, resize negotiation, single-window
+  full screen, input-method behavior, and desktop-session restart recovery.
+
+### Slice 6: clipboard, file dialogs, and drag-and-drop
+
+- Synchronize the text clipboard. When a GUI window has focus, Ctrl+C and Ctrl+V
+  must reach that application and produce ordinary Linux clipboard behavior;
+  terminal SIGINT semantics remain unchanged.
+- Translate files already inside an approved live share directly to their
+  `L:` paths. For paths outside configured roots, use an authenticated staging
+  transfer with a visible progress bar, cancellation, resume, collision
+  handling, and no implicit overwrite. Apply the same boundary to guest-to-host
+  drag-and-drop and file-dialog results.
+
+### Slice 7: UAC, elevation, and native sudo
+
 - Preserve the Windows secure desktop for UAC. When an elevation prompt is
   active, freeze ordinary seamless input and open a trusted Linux modal that
   displays the real guest secure-desktop framebuffer through the private QEMU
@@ -104,23 +177,23 @@ native Linux desktop application rather than exposing a remote Windows desktop.
   capture broker when available. If Windows integrity boundaries prevent safe
   capture or input, report the boundary and retain the trusted viewer fallback
   instead of weakening UIPI or secure-desktop policy.
-- Synchronize the text clipboard. When a GUI window has focus, Ctrl+C and
-  Ctrl+V must reach that application and produce ordinary Linux clipboard
-  behavior; terminal SIGINT semantics remain unchanged.
-- Support native host-to-guest and guest-to-host file drag-and-drop through the
-  folder-sharing/staging boundary, with visible progress, cancellation, resume,
-  collision handling, and no implicit overwrite.
-- Add audio, notifications, and single-window full-screen mode without requiring
-  RDP or a public VNC listener.
-- Start with documented Windows Graphics Capture and damage-aware transport.
-  Shared-memory or GPU acceleration may improve performance later but cannot be
-  required for correctness.
+
+### Slice 8: media integration and release hardening
+
+- Add audio, notifications, launcher refresh, reconnect UX, diagnostics, and
+  recovery from host sleep, guest restart, and Linux desktop-session restart.
+- Measure idle companion memory, frame latency, input latency, live-share
+  throughput, drag-and-drop resume, and audio stability. Finish the Wayland and
+  X11 application matrix and the exact-commit Windows/KVM release gate.
 
 Acceptance requires common development applications, administrator and standard
 account flows, native-sudo detection, real UAC consent and credential prompts,
 secure-desktop spoof boundaries, file dialogs, elevated window boundaries,
 clipboard focus, large-file drag-and-drop, DPI transitions, full-screen recovery,
-and desktop-session restart testing on Wayland and X11.
+desktop-session restart testing on Wayland and X11, driverless live-share escape
+tests, simple-command compatibility tests, and published file-performance
+results. The existing synchronized mirror remains supported even after live
+sharing becomes the recommended interactive path.
 
 ## beta.9: seamless desktop polish and shell-light mode
 
@@ -161,5 +234,7 @@ Windows ARM64 path.
 - Patching Microsoft binaries or redistributing modified Windows media.
 - Requiring unsigned or test-signed guest drivers.
 - Enabling host folders, clipboard, drag-and-drop, or background services
-  without explicit user configuration.
+  without explicit user configuration. An interactive recommended-integration
+  answer counts as consent only for the exact roots and modes displayed in that
+  dialog.
 - Claiming a platform based only on argument planning or emulation smoke tests.
