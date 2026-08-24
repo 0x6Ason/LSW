@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Demand-start SCM adapter for privileged storage maintenance.
+//! Demand-start SCM adapter for fixed privileged maintenance operations.
 //!
 //! The service accepts no stop control and exits after one authenticated,
 //! fixed-operation loopback request, keeping LocalSystem code out of the

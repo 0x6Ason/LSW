@@ -540,6 +540,9 @@ fn windows_agent_advertises_native_os_operations() {
     ] {
         assert!(capabilities.iter().any(|capability| capability == expected));
     }
+    assert!(!capabilities
+        .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_HIBERNATE_V1));
 }
 
 fn controlled_test_connection(
@@ -587,6 +590,26 @@ fn controlled_test_connection(
         .iter()
         .any(|capability| capability == CAPABILITY_SESSION_LEASE_V1));
     (stream, done_receiver, active_sessions)
+}
+
+#[test]
+fn network_agent_rejects_the_helper_only_hibernate_frame() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("9".repeat(64));
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::MaintenanceHibernate, Vec::new()),
+    )
+    .expect("helper-only frame should be sent");
+    let response = read_frame(&mut stream).expect("protocol rejection should arrive");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("unsupported"));
+    drop(stream);
+    assert!(done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server session should finish")
+        .expect_err("helper-only frame should fail")
+        .contains("unsupported"));
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
 }
 
 #[cfg(windows)]

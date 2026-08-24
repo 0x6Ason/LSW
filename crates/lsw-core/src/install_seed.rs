@@ -641,7 +641,7 @@ Invoke-Sc @(
     'obj=', 'LocalSystem'
 )
 Invoke-Sc @('sidtype', $MaintenanceServiceName, 'unrestricted')
-Invoke-Sc @('description', $MaintenanceServiceName, 'Performs one authenticated, fixed Windows storage maintenance operation for LSW and exits.')
+Invoke-Sc @('description', $MaintenanceServiceName, 'Performs one authenticated, fixed Windows maintenance operation for LSW and exits.')
 $MaintenanceServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;{0})' -f $ServiceIdentity.Value
 Invoke-Sc @('sdset', $MaintenanceServiceName, $MaintenanceServiceSddl)
 

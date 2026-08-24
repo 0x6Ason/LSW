@@ -117,8 +117,9 @@ SIGTERM status, detached completion, recursive tree round-trip, and live
 additive `sync --watch` against that service-backed guest.
 beta.7 additionally requires native standard-user creation through a stopped
 demand-start account helper, linked-clone
-identity isolation, folder-share escape rejection, balloon/TRIM, Windows
-hibernate/resume, offline compaction, and zero QEMU RSS after stop/hibernate.
+identity isolation, folder-share escape rejection, balloon/TRIM, fixed-helper
+Windows hibernate/resume, offline compaction, and zero QEMU RSS after
+stop/hibernate.
 
 ## Release bundle
 

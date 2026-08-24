@@ -181,8 +181,9 @@ its narrow service ACL and that it exits after one authenticated native account
 operation. The password is supplied only in the bounded binary protocol.
 
 `LSWMaintenanceHelper` must likewise be Manual/demand-start under LocalSystem.
-The TRIM check proves that the restricted agent can request the single fixed
-retrim operation without gaining an arbitrary privileged command channel.
+The TRIM and hibernate checks prove that the restricted agent can request only
+those two fixed operations without gaining an arbitrary privileged command
+channel.
 
 Before the first shutdown, the harness resolves both the service process owner
 and the command process identity, requires both to equal the translated

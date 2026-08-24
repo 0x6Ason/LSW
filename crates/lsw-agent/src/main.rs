@@ -28,10 +28,11 @@ use lsw_core::{
 };
 #[cfg(windows)]
 use lsw_core::{
-    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
-    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1,
-    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
-    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
+    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    CAPABILITY_USER_ACCOUNT_V1, CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE,
+    CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT,
+    USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -462,7 +463,10 @@ fn handle_maintenance_helper_connection(
     }
     let server_hello = ServerHello {
         version: AGENT_PROTOCOL_VERSION,
-        capabilities: vec![CAPABILITY_MAINTENANCE_TRIM_V1.to_owned()],
+        capabilities: vec![
+            CAPABILITY_MAINTENANCE_TRIM_V1.to_owned(),
+            CAPABILITY_MAINTENANCE_HIBERNATE_V1.to_owned(),
+        ],
     };
     write_frame(
         stream,
@@ -470,17 +474,31 @@ fn handle_maintenance_helper_connection(
     )?;
 
     let mut frame = read_frame(stream)?;
-    if frame.kind != FrameKind::MaintenanceTrim || !frame.payload.is_empty() {
+    if !matches!(
+        frame.kind,
+        FrameKind::MaintenanceTrim | FrameKind::MaintenanceHibernate
+    ) || !frame.payload.is_empty()
+    {
         frame.payload.fill(0);
         send_error(
             stream,
-            "maintenance helper accepts only empty MAINTENANCE_TRIM",
+            "maintenance helper accepts only empty fixed-operation requests",
         )?;
         return Ok(true);
     }
-    match perform_windows_trim() {
-        Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
-        Err(error) => send_error(stream, &error.to_string())?,
+    match frame.kind {
+        FrameKind::MaintenanceTrim => match perform_windows_trim() {
+            Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+            Err(error) => send_error(stream, &error.to_string())?,
+        },
+        FrameKind::MaintenanceHibernate => match enable_windows_hibernation() {
+            Ok(()) => {
+                write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+                request_windows_hibernation()?;
+            }
+            Err(error) => send_error(stream, &error.to_string())?,
+        },
+        _ => unreachable!("maintenance request kind was validated"),
     }
     Ok(true)
 }
@@ -507,6 +525,36 @@ fn perform_windows_trim() -> Result<(), Box<dyn std::error::Error>> {
     }
     let detail = String::from_utf8_lossy(&output.stderr);
     Err(format!("Windows TRIM failed: {}", detail.trim()).into())
+}
+
+#[cfg(windows)]
+fn enable_windows_hibernation() -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new("powercfg.exe")
+        .args(["/hibernate", "on"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Windows could not enable hibernation (powercfg exit code {})",
+            status.code().unwrap_or(-1)
+        )
+        .into())
+    }
+}
+
+#[cfg(windows)]
+fn request_windows_hibernation() -> Result<(), Box<dyn std::error::Error>> {
+    Command::new("shutdown.exe")
+        .arg("/h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -1155,7 +1203,9 @@ fn handle_connection(
         }
         FrameKind::FilePut => receive_file(stream, &request_frame.payload),
         FrameKind::FileGet => send_file(stream, &request_frame.payload),
-        FrameKind::PowerHibernate => hibernate_guest(stream, &request_frame.payload),
+        FrameKind::PowerHibernate => {
+            hibernate_guest(stream, &request_frame.payload, expected_token)
+        }
         FrameKind::UserCreate => create_user(stream, &mut request_frame.payload, expected_token),
         FrameKind::MaintenanceTrim => {
             maintenance_trim(stream, &request_frame.payload, expected_token)
@@ -1290,6 +1340,25 @@ fn maintenance_trim(
 
 #[cfg(windows)]
 fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    forward_maintenance_operation(
+        expected_token,
+        FrameKind::MaintenanceTrim,
+        CAPABILITY_MAINTENANCE_TRIM_V1,
+    )
+}
+
+#[cfg(windows)]
+fn forward_maintenance_operation(
+    expected_token: &str,
+    request_kind: FrameKind,
+    required_capability: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(
+        request_kind,
+        FrameKind::MaintenanceTrim | FrameKind::MaintenanceHibernate
+    ) {
+        return Err("invalid fixed maintenance operation".into());
+    }
     let mut stream = connect_windows_helper(
         MAINTENANCE_HELPER_SERVICE,
         MAINTENANCE_HELPER_PORT,
@@ -1311,14 +1380,11 @@ fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::err
         || !hello
             .capabilities
             .iter()
-            .any(|capability| capability == CAPABILITY_MAINTENANCE_TRIM_V1)
+            .any(|capability| capability == required_capability)
     {
         return Err("Windows maintenance helper returned incompatible capabilities".into());
     }
-    write_frame(
-        &mut stream,
-        &Frame::new(FrameKind::MaintenanceTrim, Vec::new()),
-    )?;
+    write_frame(&mut stream, &Frame::new(request_kind, Vec::new()))?;
     let response = read_frame(&mut stream)?;
     match response.kind {
         FrameKind::Pong if response.payload.is_empty() => Ok(()),
@@ -1335,28 +1401,21 @@ fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::err
 fn hibernate_guest(
     mut stream: TcpStream,
     payload: &[u8],
+    expected_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !payload.is_empty() {
         send_error(&mut stream, "POWER_HIBERNATE payload must be empty")?;
         return Err("client sent an invalid hibernate request".into());
     }
-    let powercfg = Command::new("powercfg.exe")
-        .args(["/hibernate", "on"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if !powercfg.success() {
-        send_error(&mut stream, "Windows could not enable hibernation")?;
-        return Err("powercfg could not enable hibernation".into());
+    if let Err(error) = forward_maintenance_operation(
+        expected_token,
+        FrameKind::MaintenanceHibernate,
+        CAPABILITY_MAINTENANCE_HIBERNATE_V1,
+    ) {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
     }
     write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
-    Command::new("shutdown.exe")
-        .arg("/h")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
     Ok(())
 }
 
@@ -1364,6 +1423,7 @@ fn hibernate_guest(
 fn hibernate_guest(
     mut stream: TcpStream,
     payload: &[u8],
+    _expected_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !payload.is_empty() {
         send_error(&mut stream, "POWER_HIBERNATE payload must be empty")?;

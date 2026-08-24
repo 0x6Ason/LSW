@@ -26,9 +26,10 @@
   policy, automatic resume, guest TRIM, qcow2 discard/detect-zeroes, and safe
   stopped/hibernated compaction. `lswd` exits after 30 idle seconds when no VM
   is active, while optional systemd socket activation remains reversible via
-  `lsw daemon enable|disable|status|diagnose`. Guest TRIM uses an authenticated,
-  demand-start LocalSystem helper that accepts only the fixed retrim operation;
-  the network-facing agent remains a restricted virtual service account.
+  `lsw daemon enable|disable|status|diagnose`. Guest TRIM and the Windows
+  hibernation transition use an authenticated, demand-start LocalSystem helper
+  that accepts only empty fixed-operation request kinds; the network-facing
+  agent remains a restricted virtual service account.
 - Added declarative per-instance synchronized folders with explicit RO/RW
   roots, additive host watch, explicit RW guest-to-host merge, protected
   allow-list ACLs for RO views, reconnect retries, and host-symlink plus Windows

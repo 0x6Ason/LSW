@@ -77,9 +77,9 @@ validation claims in the beta.7 release.
    Visible desktop GUI work still requires the beta.8 user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
-   Storage retrim follows the same boundary through `LSWMaintenanceHelper`,
-   which accepts only an empty fixed-operation frame and exits after running the
-   Windows retrim API as LocalSystem.
+   Storage retrim and Windows hibernation follow the same boundary through
+   `LSWMaintenanceHelper`, which accepts only empty fixed-operation frames and
+   exits after one LocalSystem operation.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
    ConPTY and host stdin is a terminal, the host enters raw mode and forwards
@@ -91,9 +91,10 @@ validation claims in the beta.7 release.
    live. Older peers retain the version-one half-close behavior.
 7. `lsw suspend` sends QMP `stop`; `lsw resume` sends `cont` for a live paused
    process. `lsw hibernate` briefly resumes a paused guest when necessary,
-   authenticates a Windows hibernate request, and records `hibernated` only
-   after QEMU exits. Resume then performs a normal boot from the Windows
-   hiberfile. The opt-in idle policy balloons, pauses, and later hibernates.
+   authenticates a Windows hibernate request, forwards only that fixed request
+   to the demand-start helper, and records `hibernated` only after QEMU exits.
+   Resume then performs a normal boot from the Windows hiberfile. The opt-in
+   idle policy balloons, pauses, and later hibernates.
 8. A pristine stopped/hibernated instance can be sealed. A clone uses a qcow2
    backing overlay and read-only FAT identity volume; the SCM agent rotates the
    embedded token before binding its listener or atomically updates its live

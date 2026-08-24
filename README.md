@@ -252,9 +252,10 @@ lsw diagnose win-dev --bundle
 lsw remove win-dev
 ```
 
-`lsw trim` crosses the Windows privilege boundary through the authenticated,
-demand-start `LSWMaintenanceHelper`. That LocalSystem service accepts only one
-fixed retrim request and exits; ordinary commands still run as the restricted
+`lsw trim` and the fixed Windows hibernation transition cross the privilege
+boundary through the authenticated, demand-start `LSWMaintenanceHelper`. That
+LocalSystem service accepts only empty retrim or hibernate request kinds and
+exits after one operation; ordinary commands still run as the restricted
 `NT SERVICE\LSWAgent` identity.
 
 ## Windows activation

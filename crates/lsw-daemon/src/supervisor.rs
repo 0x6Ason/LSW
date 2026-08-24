@@ -6,7 +6,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -86,22 +86,32 @@ impl Supervisor {
             });
             if helper_exited {
                 let shutdown_requested = shutdown_was_requested(&self.store, &name);
+                let hibernate_requested = hibernate_was_requested(&self.store, &name);
                 if let Some(mut managed) = self.processes.remove(&name) {
-                    let _ = managed.qemu.kill();
-                    let _ = managed.qemu.wait();
+                    let natural_qemu_exit = if hibernate_requested {
+                        wait_for_child_exit(&mut managed.qemu, FORCE_STOP_TIMEOUT)
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    if natural_qemu_exit.is_none() {
+                        let _ = managed.qemu.kill();
+                        let _ = managed.qemu.wait();
+                    }
                     stop_helpers(&mut managed.helpers);
-                }
-                remove_shutdown_marker(&self.store, &name);
-                remove_hibernate_marker(&self.store, &name);
-                cleanup_stopped_runtime_artifacts(&self.store, &name);
-                self.remove_ephemeral_overlay(&name);
-                let next = if shutdown_requested {
-                    InstanceState::Stopped
-                } else {
-                    InstanceState::Failed
-                };
-                if let Err(error) = self.set_state(&name, next) {
-                    eprintln!("lswd: could not update {name:?} after helper exit: {error}");
+                    remove_shutdown_marker(&self.store, &name);
+                    remove_hibernate_marker(&self.store, &name);
+                    cleanup_stopped_runtime_artifacts(&self.store, &name);
+                    self.remove_ephemeral_overlay(&name);
+                    let next = state_after_qemu_exit(
+                        shutdown_requested,
+                        hibernate_requested && natural_qemu_exit.is_some(),
+                        natural_qemu_exit.is_some_and(|status| status.success()),
+                    );
+                    if let Err(error) = self.set_state(&name, next) {
+                        eprintln!("lswd: could not update {name:?} after helper exit: {error}");
+                    }
                 }
             }
         }
@@ -921,16 +931,23 @@ fn cleanup_runtime_sockets(instance_dir: &Path) -> Result<(), Box<dyn std::error
 }
 
 fn wait_or_kill(child: &mut Child, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
+    if wait_for_child_exit(child, timeout)?.is_some() {
+        return Ok(());
     }
     child.kill()?;
     child.wait()?;
     Ok(())
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(None)
 }
 
 fn wait_for_qmp_disconnect(

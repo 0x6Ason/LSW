@@ -218,13 +218,14 @@ or shell receives the password.
 
 ## Windows maintenance helper
 
-Guest TRIM does not grant storage-administration rights to the network-facing
-agent. `LSWMaintenanceHelper` is Manual/demand-start under LocalSystem, binds
-guest loopback port 35043, authenticates the per-instance token, and accepts
-only one empty `MAINTENANCE_TRIM` frame. It runs a fixed `Optimize-Volume C
--ReTrim` operation and exits. Its service ACL gives `NT SERVICE\LSWAgent`
-query/start rights only; callers cannot supply a command, path, drive, or
-PowerShell fragment.
+Guest TRIM and Windows hibernation do not grant administrative rights to the
+network-facing agent. `LSWMaintenanceHelper` is Manual/demand-start under
+LocalSystem, binds guest loopback port 35043, authenticates the per-instance
+token, and accepts exactly one empty `MAINTENANCE_TRIM` or
+`MAINTENANCE_HIBERNATE` frame. It runs either fixed `Optimize-Volume C -ReTrim`
+or `powercfg /hibernate on` plus `shutdown /h`, then exits. Its service ACL
+gives `NT SERVICE\LSWAgent` query/start rights only; callers cannot supply a
+command, path, drive, option, or PowerShell fragment.
 
 ## Remaining security work
 
