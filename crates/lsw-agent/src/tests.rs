@@ -106,9 +106,16 @@ fn windows_late_identity_volume_updates_the_live_authenticator() {
     .expect("new token should be written");
 
     let live_token = Arc::new(Mutex::new(old_token));
-    watch_for_clone_identity(token_file.clone(), Arc::downgrade(&live_token))
-        .expect("identity watcher should start");
-    thread::sleep(IDENTITY_DISCOVERY_INTERVAL + Duration::from_millis(100));
+    watch_for_clone_identity_with_timing(
+        token_file.clone(),
+        Arc::downgrade(&live_token),
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+        Duration::from_millis(25),
+        Duration::from_millis(100),
+    )
+    .expect("identity watcher should start");
+    thread::sleep(Duration::from_millis(350));
     let mounted = Command::new("subst.exe")
         .arg(&drive_name)
         .arg(&identity)
@@ -152,6 +159,16 @@ fn windows_late_identity_volume_updates_the_live_authenticator() {
         "late-identity"
     );
     assert!(unmounted, "identity fixture drive should unmount");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_volume_guid_enumeration_reaches_the_system_volume() {
+    let roots = windows_path::volume_roots().expect("Windows volumes should enumerate");
+    assert!(
+        roots.iter().any(|(root, _)| root.join("Windows").is_dir()),
+        "a volume GUID path should reach the running Windows installation"
+    );
 }
 
 #[test]

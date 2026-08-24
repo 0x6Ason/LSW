@@ -94,8 +94,11 @@ validation claims in the beta.7 release.
 8. A pristine stopped/hibernated instance can be sealed. A clone uses a qcow2
    backing overlay and read-only FAT identity volume; the SCM agent rotates the
    embedded token before binding its listener or atomically updates its live
-   authenticator if Windows mounts the volume after SCM startup. Permanent
-   users, shares, and published ports are never copied into a clone manifest.
+   authenticator if Windows mounts the volume after SCM startup. Removable
+   volume GUID enumeration covers media that has no drive letter, and bounded
+   slow polling covers delayed Plug and Play arrival without delaying ordinary
+   boots. Permanent users, shares, and published ports are never copied into a
+   clone manifest.
 
 Instance state is stored under `$LSW_STATE_DIR` or, by default,
 `$HOME/.local/share/lsw`:

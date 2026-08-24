@@ -44,9 +44,9 @@ use lsw_core::{
 };
 use progress::{ProgressEvent, ProgressRenderer};
 
-// A freshly installed Windows guest can spend more than two minutes servicing
-// its first cold boot before the automatic SCM agent accepts connections.
-const AGENT_START_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+// Windows can spend several minutes servicing a cold boot, and removable
+// identity media can arrive after the automatic SCM agent starts.
+const AGENT_START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {

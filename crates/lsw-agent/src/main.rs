@@ -39,9 +39,13 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_SESSIONS: usize = 32;
 #[cfg(windows)]
-const IDENTITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+const IDENTITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+#[cfg(windows)]
+const IDENTITY_DISCOVERY_FAST_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const IDENTITY_DISCOVERY_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const IDENTITY_DISCOVERY_SLOW_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const LICENSE_HELPER_PORT: u16 = LICENSE_HELPER_GUEST_PORT;
 #[cfg(windows)]
@@ -552,18 +556,21 @@ fn run_agent(
 
 #[cfg(windows)]
 fn apply_clone_identity(token_file: &Path) -> Result<bool, Box<dyn std::error::Error>> {
-    let mut identity = None;
-    for letter in b'D'..=b'Z' {
-        let root = PathBuf::from(format!("{}:\\lsw", char::from(letter)));
-        let marker = root.join(CLONE_IDENTITY_MARKER_FILE);
-        if fs::read_to_string(&marker)
-            .map(|value| value.trim() == "LSW-CLONE-IDENTITY")
-            .unwrap_or(false)
-            && identity.replace(root).is_some()
-        {
-            return Err("more than one LSW clone identity volume is attached".into());
-        }
-    }
+    let identity = find_clone_identity(
+        windows_path::volume_roots()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, drive_type)| *drive_type == windows_path::DRIVE_REMOVABLE)
+            .map(|(root, _)| root.join("lsw")),
+    )?;
+    let identity = match identity {
+        Some(identity) => Some(identity),
+        None => find_clone_identity(
+            (b'D'..=b'Z')
+                .map(char::from)
+                .map(|letter| PathBuf::from(format!("{letter}:\\lsw"))),
+        )?,
+    };
     let Some(identity) = identity else {
         return Ok(false);
     };
@@ -604,14 +611,53 @@ fn apply_clone_identity(token_file: &Path) -> Result<bool, Box<dyn std::error::E
 }
 
 #[cfg(windows)]
+fn find_clone_identity(
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let mut identity = None;
+    for root in roots {
+        let marker = root.join(CLONE_IDENTITY_MARKER_FILE);
+        if fs::read_to_string(&marker)
+            .map(|value| value.trim() == "LSW-CLONE-IDENTITY")
+            .unwrap_or(false)
+            && identity.replace(root).is_some()
+        {
+            return Err("more than one LSW clone identity volume is attached".into());
+        }
+    }
+    Ok(identity)
+}
+
+#[cfg(windows)]
 fn watch_for_clone_identity(
     token_file: PathBuf,
     token: Weak<Mutex<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    watch_for_clone_identity_with_timing(
+        token_file,
+        token,
+        IDENTITY_DISCOVERY_TIMEOUT,
+        IDENTITY_DISCOVERY_FAST_TIMEOUT,
+        IDENTITY_DISCOVERY_INTERVAL,
+        IDENTITY_DISCOVERY_SLOW_INTERVAL,
+    )
+}
+
+#[cfg(windows)]
+fn watch_for_clone_identity_with_timing(
+    token_file: PathBuf,
+    token: Weak<Mutex<String>>,
+    discovery_timeout: Duration,
+    fast_timeout: Duration,
+    fast_interval: Duration,
+    slow_interval: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
     thread::Builder::new()
         .name("lsw-identity-watch".to_owned())
         .spawn(move || {
-            let deadline = Instant::now() + IDENTITY_DISCOVERY_TIMEOUT;
+            let started = Instant::now();
+            let deadline = started + discovery_timeout;
+            let fast_deadline = started + fast_timeout.min(discovery_timeout);
             while Instant::now() < deadline {
                 let Some(token) = token.upgrade() else {
                     return;
@@ -637,7 +683,13 @@ fn watch_for_clone_identity(
                     },
                     Ok(false) => {
                         drop(token);
-                        thread::sleep(IDENTITY_DISCOVERY_INTERVAL);
+                        let now = Instant::now();
+                        let interval = if now < fast_deadline {
+                            fast_interval
+                        } else {
+                            slow_interval
+                        };
+                        thread::sleep(interval.min(deadline.saturating_duration_since(now)));
                         continue;
                     }
                     Err(error) => write_stderr(format_args!(

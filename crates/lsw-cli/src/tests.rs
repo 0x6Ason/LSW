@@ -7,7 +7,7 @@ use lsw_core::PortForward;
 
 #[test]
 fn agent_wait_covers_slow_first_windows_cold_boots() {
-    assert!(AGENT_START_TIMEOUT >= Duration::from_secs(3 * 60));
+    assert!(AGENT_START_TIMEOUT >= Duration::from_secs(8 * 60));
 }
 
 #[test]
