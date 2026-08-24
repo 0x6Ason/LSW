@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     CustomizationPlan, InstanceManifest, LswError, Result, AGENT_GUEST_PORT,
-    LICENSE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
@@ -435,6 +435,8 @@ $LicenseServiceName = 'LSWLicenseHelper'
 $LicenseServiceDisplayName = 'LSW Windows Activation Helper'
 $UserServiceName = 'LSWUserHelper'
 $UserServiceDisplayName = 'LSW Windows Account Helper'
+$MaintenanceServiceName = 'LSWMaintenanceHelper'
+$MaintenanceServiceDisplayName = 'LSW Windows Storage Maintenance Helper'
 $ScExe = Join-Path $env:SystemRoot 'System32\sc.exe'
 
 function ConvertTo-ScBinaryPathArgument {
@@ -468,7 +470,7 @@ $LicenseScriptTarget = Join-Path $InstallRoot 'license-helper.ps1'
 $TokenTarget = Join-Path $DataRoot 'agent.token'
 $LogTarget = Join-Path $DataRoot 'agent.log'
 $ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-foreach ($ServiceToStop in @($ServiceName, $LicenseServiceName, $UserServiceName)) {
+foreach ($ServiceToStop in @($ServiceName, $LicenseServiceName, $UserServiceName, $MaintenanceServiceName)) {
     $ExistingServiceToStop = Get-Service -Name $ServiceToStop -ErrorAction SilentlyContinue
     if ($null -ne $ExistingServiceToStop -and $ExistingServiceToStop.Status -ne 'Stopped') {
         if ($ExistingServiceToStop.Status -ne 'StopPending') {
@@ -619,6 +621,30 @@ Invoke-Sc @('description', $UserServiceName, 'Performs one authenticated local-a
 $UserServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;{0})' -f $ServiceIdentity.Value
 Invoke-Sc @('sdset', $UserServiceName, $UserServiceSddl)
 
+$MaintenanceCommand = ('"{0}" --maintenance-helper --token-file "{1}" --listen 127.0.0.1:__LSW_MAINTENANCE_HELPER_PORT__' -f $AgentTarget, $TokenTarget)
+$ScMaintenanceCommand = ConvertTo-ScBinaryPathArgument -Command $MaintenanceCommand
+$ExistingMaintenanceService = Get-Service -Name $MaintenanceServiceName -ErrorAction SilentlyContinue
+if ($null -eq $ExistingMaintenanceService) {
+    Invoke-Sc @(
+        'create', $MaintenanceServiceName,
+        'binPath=', $ScMaintenanceCommand,
+        'DisplayName=', $MaintenanceServiceDisplayName,
+        'start=', 'demand',
+        'obj=', 'LocalSystem'
+    )
+}
+Invoke-Sc @(
+    'config', $MaintenanceServiceName,
+    'binPath=', $ScMaintenanceCommand,
+    'DisplayName=', $MaintenanceServiceDisplayName,
+    'start=', 'demand',
+    'obj=', 'LocalSystem'
+)
+Invoke-Sc @('sidtype', $MaintenanceServiceName, 'unrestricted')
+Invoke-Sc @('description', $MaintenanceServiceName, 'Performs one authenticated, fixed Windows storage maintenance operation for LSW and exits.')
+$MaintenanceServiceSddl = 'D:(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPLOCRRC;;;{0})' -f $ServiceIdentity.Value
+Invoke-Sc @('sdset', $MaintenanceServiceName, $MaintenanceServiceSddl)
+
 $DirectoryAcl = New-Object System.Security.AccessControl.DirectorySecurity
 $DirectoryAcl.SetAccessRuleProtection($true, $false)
 $DirectoryAcl.SetOwner($Administrators)
@@ -709,6 +735,10 @@ Set-LswSetupStage 'waiting-for-oobe'
     .replace(
         "__LSW_USER_HELPER_PORT__",
         &USER_HELPER_GUEST_PORT.to_string(),
+    )
+    .replace(
+        "__LSW_MAINTENANCE_HELPER_PORT__",
+        &MAINTENANCE_HELPER_GUEST_PORT.to_string(),
     )
     .replace("__LSW_SETUP_ACCOUNT__", SETUP_ACCOUNT_NAME)
 }
@@ -984,7 +1014,9 @@ mod tests {
         assert!(installer.contains("$ServiceIdentity, $Modify, $Allow"));
         assert!(installer.contains("$LicenseServiceName = 'LSWLicenseHelper'"));
         assert!(installer.contains("$UserServiceName = 'LSWUserHelper'"));
+        assert!(installer.contains("$MaintenanceServiceName = 'LSWMaintenanceHelper'"));
         assert!(installer.contains("--license-helper --token-file"));
+        assert!(installer.contains("--maintenance-helper --token-file"));
         assert!(installer.contains("$LicenseScriptSource"));
         assert!(installer.contains("$LicenseScriptTarget"));
         assert!(installer.contains(
@@ -992,12 +1024,17 @@ mod tests {
         ));
         assert!(installer.contains(&format!("--listen 127.0.0.1:{LICENSE_HELPER_GUEST_PORT}")));
         assert!(installer.contains(&format!("--listen 127.0.0.1:{USER_HELPER_GUEST_PORT}")));
+        assert!(installer.contains(&format!(
+            "--listen 127.0.0.1:{MAINTENANCE_HELPER_GUEST_PORT}"
+        )));
+        assert!(!installer.contains("__LSW_MAINTENANCE_HELPER_PORT__"));
         assert!(installer.contains(&format!("-LocalPort {AGENT_GUEST_PORT}")));
         assert!(installer.contains("$LogTarget = Join-Path $DataRoot 'agent.log'"));
         assert!(installer.contains("Set-Acl -LiteralPath $LogTarget"));
         assert!(installer.contains("'start=', 'demand'"));
         assert!(installer.contains("'obj=', 'LocalSystem'"));
         assert!(installer.contains("$LicenseServiceSddl"));
+        assert!(installer.contains("$MaintenanceServiceSddl"));
         assert!(installer.contains("$ServiceIdentity.Value"));
         assert!(!installer.contains("ProductKey"));
         assert!(installer.contains("$StartedService.WaitForStatus"));

@@ -263,6 +263,30 @@ fn user_helper_is_loopback_only_and_uses_a_distinct_service_mode() {
 }
 
 #[test]
+fn maintenance_helper_is_loopback_only_and_uses_a_distinct_service_mode() {
+    let configuration = Configuration::parse(&[
+        "--maintenance-helper".into(),
+        "--token-file".into(),
+        "agent.token".into(),
+        "--listen".into(),
+        "127.0.0.1:5043".into(),
+    ])
+    .expect("maintenance helper configuration should parse");
+    assert!(configuration.service);
+    assert_eq!(configuration.service_kind, ServiceKind::MaintenanceHelper);
+    assert!(configuration.listen.ip().is_loopback());
+
+    assert!(Configuration::parse(&[
+        "--maintenance-helper".into(),
+        "--token-file".into(),
+        "agent.token".into(),
+        "--listen".into(),
+        "0.0.0.0:5043".into(),
+    ])
+    .is_err());
+}
+
+#[test]
 fn product_key_shape_is_strict_without_recording_a_real_key() {
     assert!(valid_product_key(b"AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"));
     assert!(!valid_product_key(b"AAAAA-BBBBB-CCCCC-DDDDD"));
@@ -492,6 +516,9 @@ fn non_windows_agent_does_not_advertise_conpty() {
     assert!(!capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_POWER_HIBERNATE_V1));
+    assert!(!capabilities
+        .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1));
     assert!(capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_SESSION_CONTROL_V1));
@@ -509,6 +536,7 @@ fn windows_agent_advertises_native_os_operations() {
         lsw_core::CAPABILITY_TERMINAL_RESIZE_V1,
         lsw_core::CAPABILITY_POWER_HIBERNATE_V1,
         lsw_core::CAPABILITY_USER_ACCOUNT_V1,
+        lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1,
     ] {
         assert!(capabilities.iter().any(|capability| capability == expected));
     }

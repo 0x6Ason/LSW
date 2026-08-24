@@ -1154,29 +1154,7 @@ fn trim_instance(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let requested = optional_name(arguments, "trim")?;
     let name = resolve_name(store, requested)?;
-    let request = StartRequest {
-        kind: SessionKind::Exec,
-        argv: vec![
-            "powershell.exe".to_owned(),
-            "-NoLogo".to_owned(),
-            "-NoProfile".to_owned(),
-            "-NonInteractive".to_owned(),
-            "-Command".to_owned(),
-            "$ErrorActionPreference='Stop'; Optimize-Volume -DriveLetter C -ReTrim -Verbose"
-                .to_owned(),
-        ],
-        working_directory: None,
-    };
-    let result = connect_agent(store, &name)?.run_capture(&request, &[], 1024 * 1024)?;
-    if result.exit_code != 0 {
-        return Err(format!(
-            "Windows TRIM failed with exit code {}: {}",
-            result.exit_code,
-            String::from_utf8_lossy(&result.stderr).trim()
-        )
-        .into());
-    }
-    print!("{}", String::from_utf8_lossy(&result.stdout));
+    connect_agent(store, &name)?.trim()?;
     println!("Guest TRIM completed for {name:?}.");
     Ok(())
 }

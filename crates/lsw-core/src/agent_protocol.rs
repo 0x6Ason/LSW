@@ -16,6 +16,7 @@ pub const CAPABILITY_SESSION_SIGNAL_V1: &str = "session-signal-v1";
 pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
 pub const CAPABILITY_POWER_HIBERNATE_V1: &str = "power-hibernate-v1";
 pub const CAPABILITY_USER_ACCOUNT_V1: &str = "user-account-v1";
+pub const CAPABILITY_MAINTENANCE_TRIM_V1: &str = "maintenance-trim-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -55,6 +56,7 @@ pub enum FrameKind {
     SessionSignal = 29,
     PowerHibernate = 30,
     UserCreate = 31,
+    MaintenanceTrim = 32,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -89,6 +91,7 @@ impl TryFrom<u8> for FrameKind {
             29 => Ok(Self::SessionSignal),
             30 => Ok(Self::PowerHibernate),
             31 => Ok(Self::UserCreate),
+            32 => Ok(Self::MaintenanceTrim),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -1020,6 +1023,15 @@ mod tests {
         }
         .encode()
         .is_err());
+    }
+
+    #[test]
+    fn maintenance_trim_has_an_append_only_empty_request_kind() {
+        assert_eq!(
+            FrameKind::try_from(32).expect("maintenance-trim kind should decode"),
+            FrameKind::MaintenanceTrim
+        );
+        assert_eq!(FrameKind::MaintenanceTrim as u8, 32);
     }
 
     #[test]

@@ -17,9 +17,9 @@ use lsw_core::{
     write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest,
     ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions, SessionSignal,
     StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
-    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
-    CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1,
+    CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
+    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
+    CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
@@ -102,6 +102,20 @@ impl AgentClient {
             FrameKind::Pong if response.payload.is_empty() => Ok(()),
             FrameKind::Error => Err(agent_error(&response.payload).into()),
             _ => Err("agent returned an invalid user-creation response".into()),
+        }
+    }
+
+    pub fn trim(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_MAINTENANCE_TRIM_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::MaintenanceTrim, Vec::new()),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::Pong if response.payload.is_empty() => Ok(()),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid maintenance response".into()),
         }
     }
 
@@ -841,6 +855,28 @@ mod tests {
         assert_eq!(state.update(changed), Some(changed));
         assert_eq!(state.update(changed), None);
         assert_eq!(state.last, changed);
+    }
+
+    #[test]
+    fn maintenance_trim_sends_only_the_empty_fixed_operation() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let request = read_frame(&mut stream).expect("trim request should arrive");
+            assert_eq!(request.kind, FrameKind::MaintenanceTrim);
+            assert!(request.payload.is_empty());
+            write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))
+                .expect("trim response should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        AgentClient {
+            stream,
+            capabilities: vec![CAPABILITY_MAINTENANCE_TRIM_V1.to_owned()],
+        }
+        .trim()
+        .expect("trim should succeed");
+        server.join().expect("fixture should not panic");
     }
 
     #[test]

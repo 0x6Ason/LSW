@@ -216,6 +216,16 @@ Its service ACL gives `NT SERVICE\LSWAgent` query/start rights only. Password
 buffers are cleared at every mutable protocol/native boundary; no child process
 or shell receives the password.
 
+## Windows maintenance helper
+
+Guest TRIM does not grant storage-administration rights to the network-facing
+agent. `LSWMaintenanceHelper` is Manual/demand-start under LocalSystem, binds
+guest loopback port 35043, authenticates the per-instance token, and accepts
+only one empty `MAINTENANCE_TRIM` frame. It runs a fixed `Optimize-Volume C
+-ReTrim` operation and exits. Its service ACL gives `NT SERVICE\LSWAgent`
+query/start rights only; callers cannot supply a command, path, drive, or
+PowerShell fragment.
+
 ## Remaining security work
 
 - Run QEMU/swtpm with a reduced host privilege and platform sandbox policy.

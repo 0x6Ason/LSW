@@ -168,6 +168,8 @@ license_helper_start_mode=unknown
 license_helper_start_name=unknown
 user_helper_start_mode=unknown
 user_helper_start_name=unknown
+maintenance_helper_start_mode=unknown
+maintenance_helper_start_name=unknown
 
 python3 - "$LSW_STATE_DIR/instances/$instance/run/recovery-vnc.sock" <<'PY'
 import os
@@ -318,6 +320,8 @@ collect_e2e_artifacts() {
         printf 'license_helper_start_name=%s\n' "$license_helper_start_name"
         printf 'user_helper_start_mode=%s\n' "$user_helper_start_mode"
         printf 'user_helper_start_name=%s\n' "$user_helper_start_name"
+        printf 'maintenance_helper_start_mode=%s\n' "$maintenance_helper_start_mode"
+        printf 'maintenance_helper_start_name=%s\n' "$maintenance_helper_start_name"
         printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
         printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
         printf 'agent_sha256=%s\n' "$(sha256sum "$agent" | awk '{ print $1 }')"
@@ -976,6 +980,19 @@ user_helper_start_mode=$(printf '%s\n' "$user_helper_output" | awk -F'|' '{ prin
 user_helper_start_name=$(printf '%s\n' "$user_helper_output" | awk -F'|' '{ print $2 }')
 if [ "$user_helper_start_mode" != Manual ] || [ "$user_helper_start_name" != LocalSystem ]; then
     echo "error: account helper is not a stopped demand-start LocalSystem service" >&2
+    exit 1
+fi
+maintenance_helper_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$Deadline=[DateTime]::UtcNow.AddSeconds(30); do { $Service=Get-CimInstance -ClassName Win32_Service -Filter "Name = '\''LSWMaintenanceHelper'\''"; if ($null -ne $Service -and $Service.State -eq "Stopped") { break }; Start-Sleep -Milliseconds 100 } while ([DateTime]::UtcNow -lt $Deadline); if ($null -eq $Service) { exit 78 }; if ($Service.State -ne "Stopped") { exit 79 }; if ($Service.StartMode -ne "Manual") { exit 80 }; if ($Service.StartName -ine "LocalSystem") { exit 81 }; if ($Service.PathName -notlike "*--maintenance-helper*") { exit 82 }; [Console]::Out.Write("$($Service.StartMode)|$($Service.StartName)")'
+)
+maintenance_helper_start_mode=$(printf '%s\n' "$maintenance_helper_output" | awk -F'|' '{ print $1 }')
+maintenance_helper_start_name=$(printf '%s\n' "$maintenance_helper_output" | awk -F'|' '{ print $2 }')
+if [ "$maintenance_helper_start_mode" != Manual ] \
+    || [ "$maintenance_helper_start_name" != LocalSystem ]; then
+    echo "error: maintenance helper is not a stopped demand-start LocalSystem service" >&2
     exit 1
 fi
 if grep -R -F --exclude='*.qcow2' --exclude='OVMF_VARS.fd' \

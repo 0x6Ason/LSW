@@ -77,6 +77,9 @@ validation claims in the beta.7 release.
    Visible desktop GUI work still requires the beta.8 user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
+   Storage retrim follows the same boundary through `LSWMaintenanceHelper`,
+   which accepts only an empty fixed-operation frame and exits after running the
+   Windows retrim API as LocalSystem.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
    ConPTY and host stdin is a terminal, the host enters raw mode and forwards

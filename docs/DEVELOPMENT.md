@@ -105,10 +105,10 @@ The beta.7 pre-applied unattend installs the agent during `specialize` as the
 automatic Windows service `LSWAgent` under the virtual account
 `NT SERVICE\LSWAgent`; it must not restore the old per-user `HKCU` startup
 entry. It also registers the narrow, demand-start `LSWLicenseHelper` and
-`LSWUserHelper` services as LocalSystem. Cross-build and executable-load checks
-cannot prove SCM registration, Session 0 ConPTY, boot-time startup, or those
-helpers' access boundaries. The real Windows/KVM gate therefore queries all
-three services, proves a
+`LSWUserHelper` and `LSWMaintenanceHelper` services as LocalSystem. Cross-build
+and executable-load checks cannot prove SCM registration, Session 0 ConPTY,
+boot-time startup, or those helpers' access boundaries. The real Windows/KVM
+gate therefore queries all four services, proves a
 license-status request returns the helper to `Stopped`, verifies that the agent
 service process and command identities resolve to the same `S-1-5-80-...` SID,
 and requires that SID to remain stable across a full shutdown and bare-`lsw`

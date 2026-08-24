@@ -28,10 +28,10 @@ use lsw_core::{
 };
 #[cfg(windows)]
 use lsw_core::{
-    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_POWER_HIBERNATE_V1,
-    CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1, CLONE_IDENTITY_MARKER_FILE,
-    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT,
-    USER_HELPER_GUEST_PORT,
+    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
+    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_V1,
+    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
+    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,6 +54,10 @@ const LICENSE_HELPER_SERVICE: &str = "LSWLicenseHelper";
 const USER_HELPER_PORT: u16 = USER_HELPER_GUEST_PORT;
 #[cfg(windows)]
 const USER_HELPER_SERVICE: &str = "LSWUserHelper";
+#[cfg(windows)]
+const MAINTENANCE_HELPER_PORT: u16 = MAINTENANCE_HELPER_GUEST_PORT;
+#[cfg(windows)]
+const MAINTENANCE_HELPER_SERVICE: &str = "LSWMaintenanceHelper";
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -396,6 +400,115 @@ fn handle_user_helper_connection(
     Ok(true)
 }
 
+#[cfg(windows)]
+fn run_maintenance_helper(
+    configuration: Configuration,
+    ready: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let token = read_token(&configuration.token_file)?;
+    let listener = TcpListener::bind(configuration.listen)?;
+    listener.set_nonblocking(true)?;
+    ready()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match listener.accept() {
+            Ok((mut stream, peer)) if peer.ip().is_loopback() => {
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+                if handle_maintenance_helper_connection(&mut stream, &token)? {
+                    return Ok(());
+                }
+            }
+            Ok((_, _)) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "Windows maintenance helper timed out without an authenticated request"
+                            .into(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_maintenance_helper_connection(
+    stream: &mut TcpStream,
+    expected_token: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut hello_frame = read_frame(stream)?;
+    if hello_frame.kind != FrameKind::Hello {
+        send_error(stream, "the first maintenance-helper frame must be HELLO")?;
+        return Ok(false);
+    }
+    let hello = ClientHello::decode(&hello_frame.payload);
+    hello_frame.payload.fill(0);
+    let hello = match hello {
+        Ok(hello) => hello,
+        Err(error) => {
+            send_error(stream, &error.to_string())?;
+            return Ok(false);
+        }
+    };
+    if hello.version != AGENT_PROTOCOL_VERSION
+        || !constant_time_token_eq(&hello.token, expected_token)
+    {
+        send_error(stream, "maintenance-helper authentication failed")?;
+        return Ok(false);
+    }
+    let server_hello = ServerHello {
+        version: AGENT_PROTOCOL_VERSION,
+        capabilities: vec![CAPABILITY_MAINTENANCE_TRIM_V1.to_owned()],
+    };
+    write_frame(
+        stream,
+        &Frame::new(FrameKind::HelloOk, server_hello.encode()?),
+    )?;
+
+    let mut frame = read_frame(stream)?;
+    if frame.kind != FrameKind::MaintenanceTrim || !frame.payload.is_empty() {
+        frame.payload.fill(0);
+        send_error(
+            stream,
+            "maintenance helper accepts only empty MAINTENANCE_TRIM",
+        )?;
+        return Ok(true);
+    }
+    match perform_windows_trim() {
+        Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+        Err(error) => send_error(stream, &error.to_string())?,
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn perform_windows_trim() -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; Optimize-Volume -DriveLetter C -ReTrim",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if output.stderr.len() > 64 * 1024 {
+        return Err("Windows TRIM returned an oversized error".into());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    Err(format!("Windows TRIM failed: {}", detail.trim()).into())
+}
+
 #[cfg(any(windows, test))]
 fn valid_product_key(key: &[u8]) -> bool {
     key.len() == 29
@@ -490,6 +603,7 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Err
                 ServiceKind::Agent => windows_service::run(configuration),
                 ServiceKind::LicenseHelper => windows_license_service::run(configuration),
                 ServiceKind::UserHelper => windows_user_service::run(configuration),
+                ServiceKind::MaintenanceHelper => windows_maintenance_service::run(configuration),
             };
         }
         #[cfg(not(windows))]
@@ -498,6 +612,9 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Err
                 ServiceKind::Agent => "--service is only supported on Windows",
                 ServiceKind::LicenseHelper => "--license-helper is only supported on Windows",
                 ServiceKind::UserHelper => "--user-helper is only supported on Windows",
+                ServiceKind::MaintenanceHelper => {
+                    "--maintenance-helper is only supported on Windows"
+                }
             }
             .into());
         }
@@ -1040,6 +1157,9 @@ fn handle_connection(
         FrameKind::FileGet => send_file(stream, &request_frame.payload),
         FrameKind::PowerHibernate => hibernate_guest(stream, &request_frame.payload),
         FrameKind::UserCreate => create_user(stream, &mut request_frame.payload, expected_token),
+        FrameKind::MaintenanceTrim => {
+            maintenance_trim(stream, &request_frame.payload, expected_token)
+        }
         _ => {
             send_error(&mut stream, "unsupported request after HELLO")?;
             Err("client sent an unsupported request after authentication".into())
@@ -1066,6 +1186,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_TERMINAL_RESIZE_V1.to_owned());
         capabilities.push(CAPABILITY_POWER_HIBERNATE_V1.to_owned());
         capabilities.push(CAPABILITY_USER_ACCOUNT_V1.to_owned());
+        capabilities.push(CAPABILITY_MAINTENANCE_TRIM_V1.to_owned());
         capabilities
     };
     capabilities
@@ -1140,6 +1261,73 @@ fn forward_user_create(
         )
         .into()),
         _ => Err("Windows account helper returned an invalid response".into()),
+    }
+}
+
+fn maintenance_trim(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !payload.is_empty() {
+        send_error(&mut stream, "MAINTENANCE_TRIM payload must be empty")?;
+        return Err("client sent an invalid maintenance request".into());
+    }
+    #[cfg(windows)]
+    let result = forward_maintenance_trim(expected_token);
+    #[cfg(not(windows))]
+    let result: Result<(), Box<dyn std::error::Error>> = {
+        let _ = expected_token;
+        Err("Windows maintenance is unavailable on this platform".into())
+    };
+    if let Err(error) = result {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_windows_helper(
+        MAINTENANCE_HELPER_SERVICE,
+        MAINTENANCE_HELPER_PORT,
+        "maintenance",
+    )?;
+    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token: expected_token.to_owned(),
+    };
+    write_frame(&mut stream, &Frame::new(FrameKind::Hello, hello.encode()?))?;
+    let response = read_frame(&mut stream)?;
+    if response.kind != FrameKind::HelloOk {
+        return Err("Windows maintenance helper rejected authentication".into());
+    }
+    let hello = ServerHello::decode(&response.payload)?;
+    if hello.version != AGENT_PROTOCOL_VERSION
+        || !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_MAINTENANCE_TRIM_V1)
+    {
+        return Err("Windows maintenance helper returned incompatible capabilities".into());
+    }
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::MaintenanceTrim, Vec::new()),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::Pong if response.payload.is_empty() => Ok(()),
+        FrameKind::Error => Err(format!(
+            "Windows maintenance helper refused the request: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows maintenance helper returned an invalid response".into()),
     }
 }
 
@@ -2396,6 +2584,10 @@ mod windows_license_service;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
+mod windows_maintenance_service;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
 mod windows_service;
 
 #[cfg(windows)]
@@ -2424,6 +2616,7 @@ enum ServiceKind {
     Agent,
     LicenseHelper,
     UserHelper,
+    MaintenanceHelper,
 }
 
 impl Configuration {
@@ -2475,6 +2668,10 @@ impl Configuration {
                     service = true;
                     service_kind = ServiceKind::UserHelper;
                 }
+                "--maintenance-helper" => {
+                    service = true;
+                    service_kind = ServiceKind::MaintenanceHelper;
+                }
                 "--help" | "-h" => {
                     println!(
                         "lsw-agent --token-file PATH [--listen IP:PORT] [--max-sessions N] [--once] [--service]\n\
@@ -2489,7 +2686,7 @@ impl Configuration {
         }
         if matches!(
             service_kind,
-            ServiceKind::LicenseHelper | ServiceKind::UserHelper
+            ServiceKind::LicenseHelper | ServiceKind::UserHelper | ServiceKind::MaintenanceHelper
         ) && !listen.ip().is_loopback()
         {
             return Err("privileged helper listeners must use guest loopback".into());

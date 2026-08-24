@@ -252,6 +252,11 @@ lsw diagnose win-dev --bundle
 lsw remove win-dev
 ```
 
+`lsw trim` crosses the Windows privilege boundary through the authenticated,
+demand-start `LSWMaintenanceHelper`. That LocalSystem service accepts only one
+fixed retrim request and exits; ordinary commands still run as the restricted
+`NT SERVICE\LSWAgent` identity.
+
 ## Windows activation
 
 Installation does not add a product key or bypass activation. After the first
