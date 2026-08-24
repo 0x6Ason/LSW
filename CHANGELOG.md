@@ -13,7 +13,12 @@
   covers every volume GUID path even when Windows assigns no drive letter. The
   private identity disk uses the inbox IDE path instead of first-boot USB mass
   storage, remains discoverable across delayed mounting, and backs a bounded
-  ten-minute host wait with live agent-start progress.
+  ten-minute host wait with live agent-start progress. Sealing now pre-registers
+  that disk with the current credential before rotating it, covering Windows'
+  first-boot device-registration delay without weakening token isolation. New
+  installs attach the identity disk from their first Windows boot and disable
+  Fast Startup while preserving explicit hibernation, so changed private media
+  cannot be hidden by a cached hybrid-shutdown kernel.
 - Added manifest v5 and the opt-in resource governor: minimum memory, QMP
   balloon control, host-pressure reclaim, running-to-pause-to-Windows-hibernate
   policy, automatic resume, guest TRIM, qcow2 discard/detect-zeroes, and safe

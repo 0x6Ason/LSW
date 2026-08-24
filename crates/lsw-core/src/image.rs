@@ -237,16 +237,7 @@ impl<'a> ImageManager<'a> {
     /// Stages a fresh boot identity and makes its token the host-side source of
     /// truth. The SCM agent applies it before opening the guest listener.
     pub fn rotate_instance_identity(&self, name: &str) -> Result<()> {
-        let manifest = self.store.load(name)?;
-        if !matches!(
-            manifest.state,
-            InstanceState::Stopped | InstanceState::Hibernated
-        ) {
-            return Err(LswError::InvalidValue {
-                field: "instance state",
-                reason: "identity rotation requires a stopped or hibernated instance".to_owned(),
-            });
-        }
+        self.require_identity_staging_state(name)?;
         let previous = self.store.read_agent_token(name)?;
         let token = generate_agent_token()?;
         let instance_dir = self.store.instance_dir(name)?;
@@ -265,6 +256,31 @@ impl<'a> ImageManager<'a> {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Stages the existing host identity without rotating it. Sealing uses one
+    /// boot with this matching credential so Windows can register the private
+    /// identity disk before a new credential must be consumed from it.
+    pub fn stage_instance_identity(&self, name: &str) -> Result<()> {
+        self.require_identity_staging_state(name)?;
+        let token = self.store.read_agent_token(name)?;
+        let instance_dir = self.store.instance_dir(name)?;
+        stage_identity(name, &instance_dir, &token)
+    }
+
+    fn require_identity_staging_state(&self, name: &str) -> Result<()> {
+        let manifest = self.store.load(name)?;
+        if matches!(
+            manifest.state,
+            InstanceState::Configured | InstanceState::Stopped | InstanceState::Hibernated
+        ) {
+            return Ok(());
+        }
+        Err(LswError::InvalidValue {
+            field: "instance state",
+            reason: "identity staging requires a configured, stopped, or hibernated instance"
+                .to_owned(),
+        })
     }
 
     pub fn list(&self) -> Result<Vec<SealedImage>> {
@@ -570,6 +586,35 @@ mod tests {
         capabilities.ovmf_code = Some(firmware);
         capabilities.ovmf_vars = Some(vars);
         let manager = ImageManager::new(&store, &capabilities);
+        manager
+            .stage_instance_identity("source")
+            .expect("source identity should be staged");
+        assert_eq!(
+            store
+                .read_agent_token("source")
+                .expect("source token should remain readable"),
+            source_token
+        );
+        assert_eq!(
+            fs::read_to_string(
+                source_dir
+                    .join("identity-seed/lsw")
+                    .join(CLONE_IDENTITY_NAME_FILE)
+            )
+            .expect("staged identity name should be readable")
+            .trim(),
+            "source"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                source_dir
+                    .join("identity-seed/lsw")
+                    .join(CLONE_IDENTITY_TOKEN_FILE)
+            )
+            .expect("staged identity token should be readable")
+            .trim(),
+            source_token
+        );
         let image = manager.seal(&source, &agent).expect("source should seal");
         source.base_image_key = Some(image.key.clone());
         store.update(&source).expect("source should record image");

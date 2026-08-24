@@ -16,11 +16,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lsw_core::{
-    HostCapabilities, InstallSeedBuilder, InstanceManifest, InstanceSpec, InstanceState,
-    IsoDownloadEngine, IsoDownloadProgressStage, IsoDownloader, LaunchPhase, LswError,
-    MicrosoftIsoRequest, MicrosoftIsoResolver, Provisioner, SessionKind, StartRequest, StateStore,
-    WinPeDismBackend, WinPeDismProgress, WinPeDismVmPhase, WindowsEdition, WindowsMediaInspector,
-    WindowsProfile, WINPE_VM_TIMEOUT,
+    HostCapabilities, ImageManager, InstallSeedBuilder, InstanceManifest, InstanceSpec,
+    InstanceState, IsoDownloadEngine, IsoDownloadProgressStage, IsoDownloader, LaunchPhase,
+    LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, Provisioner, SessionKind, StartRequest,
+    StateStore, WinPeDismBackend, WinPeDismProgress, WinPeDismVmPhase, WindowsEdition,
+    WindowsMediaInspector, WindowsProfile, WINPE_VM_TIMEOUT,
 };
 
 use crate::agent_client::AgentClient;
@@ -287,6 +287,7 @@ fn install_new_instance(
     };
     let manifest = InstanceManifest::new(spec)?;
     let instance_dir = store.create(&manifest)?;
+    ImageManager::new(store, &capabilities).stage_instance_identity(name)?;
     println!("Created instance {name:?} using {}.", edition.name);
     println!(
         "You are responsible for the license, product key, and activation of the Windows media you supplied."

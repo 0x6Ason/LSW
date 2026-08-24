@@ -385,6 +385,12 @@ function Set-LswSetupStage {
 
 New-Item -ItemType Directory -Force -Path $DataRoot, $SetupScriptsRoot | Out-Null
 Remove-Item -LiteralPath $SetupCompleteMarker, $SetupCompleteMarkerTemporary, $SetupProgressTemporary -Force -ErrorAction SilentlyContinue
+# Explicit hibernation remains available, but a reusable VM must not carry the
+# kernel and removable-media cache across an ordinary shutdown.
+& reg.exe add 'HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power' /v HiberbootEnabled /t REG_DWORD /d 0 /f | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw 'Windows Fast Startup could not be disabled.'
+}
 Set-LswSetupStage 'installing-agent'
 $SetupCompleteContents = @'
 @echo off
@@ -1002,6 +1008,7 @@ mod tests {
         );
         assert!(installer.contains("$TerminationDeadline"));
         assert!(installer.contains("Remove-ItemProperty -Path $RunKey -Name 'LSWAgent'"));
+        assert!(installer.contains("/v HiberbootEnabled /t REG_DWORD /d 0 /f"));
         assert!(installer.contains("Remove-Item -LiteralPath $TokenSource -Force"));
         assert!(installer.contains("$SetupRootFullPath.StartsWith($DataRootFullPath"));
         assert!(installer.contains("net.exe user \"LSWSetup\" /delete"));

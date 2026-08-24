@@ -212,7 +212,11 @@ volume. The SCM agent rotates the embedded credential before listening or
 atomically switches its live authenticator if Windows mounts the volume late.
 The identity disk uses the Windows inbox IDE path, and the agent enumerates all
 volume GUID paths as well as drive letters, so first-boot USB driver timing and
-automount do not decide whether a clone can authenticate.
+automount do not decide whether a clone can authenticate. Sealing performs one
+preparation boot with the existing credential before rotating it, ensuring the
+device is registered in the reusable Windows base. LSW also disables Windows
+Fast Startup while preserving explicit hibernation, preventing a normal
+shutdown from caching stale private-media contents into a linked clone.
 
 Path conversion is explicit and syntactic; it does not make the independent
 guest disk a host mount:

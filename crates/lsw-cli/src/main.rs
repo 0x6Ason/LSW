@@ -199,6 +199,10 @@ fn image_command(
             if manifest.default_user.is_some() {
                 return Err("seal a pristine instance before permanent user registration".into());
             }
+            println!("Registering the private identity disk before credential rotation...");
+            manager.stage_instance_identity(name)?;
+            connect_agent(store, name)?.probe()?;
+            request_graceful_stop_and_wait(store, name, Duration::from_secs(5 * 60))?;
             println!("Retiring the installed instance token before capturing the shared base...");
             manager.rotate_instance_identity(name)?;
             connect_agent(store, name)?.probe()?;
@@ -817,6 +821,8 @@ fn create(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
     };
     let manifest = InstanceManifest::new(spec)?;
     let instance_dir = store.create(&manifest)?;
+    let capabilities = HostCapabilities::detect();
+    ImageManager::new(store, &capabilities).stage_instance_identity(&manifest.spec.name)?;
     if store.default_name()?.is_none() {
         store.set_default(&manifest.spec.name)?;
     }
