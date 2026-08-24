@@ -101,12 +101,12 @@ fn validate_manifest(manifest: &DeclarativeProfile, expected_name: &str) -> Resu
     }
     if manifest.experimental {
         return Err(invalid_profile(
-            "experimental profiles are not enabled in beta.7",
+            "experimental profiles are not enabled in this release line",
         ));
     }
     if !manifest.keeps_servicing {
         return Err(invalid_profile(
-            "beta.7 profiles must preserve Windows servicing",
+            "current profiles must preserve Windows servicing",
         ));
     }
 

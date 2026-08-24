@@ -11,9 +11,10 @@ completion marker. It checks the exact automatic `LSWAgent` Windows service
 configuration and virtual-account process SID, PowerShell command execution,
 guest exit-code propagation, graceful shutdown, an interactive ConPTY shell,
 QEMU/daemon cleanup, socket cleanup, and host-port release. The release job
-exercises the beta.7 beginner `slim` profile, creates a permanent standard user
-through the authenticated one-shot NetAPI helper, seals and boots a linked clone
-with an isolated secret, checks RO/RW share escape boundaries,
+exercises the `slim` profile, creates a permanent standard user through the
+authenticated one-shot NetAPI helper, verifies explicit promotion, demotion,
+and final administrator membership, seals and boots a linked clone with an
+isolated secret, checks RO/RW share escape boundaries,
 balloon/TRIM/hibernate/compaction, and cold-starts the installed guest
 through a bare `lsw`, proves ConPTY and service-backed agent execution return at
 the Windows sign-in screen, requires the same service SID, and verifies that
@@ -160,8 +161,10 @@ paths to be gone, and Winlogon to contain neither automatic logon nor a stored
 `DefaultPassword`. A bare `lsw` must restore an agent-backed ConPTY shell from
 the installed disk without installation media or an interactive console user.
 Before that restart, `lsw user setup --password-stdin` must create an enabled
-standard account without administrator membership or AutoLogon, and no password
-prefix may appear in LSW metadata, seeds, or logs.
+standard account without administrator membership or AutoLogon. The gate then
+requires promote, demote, and final promote operations to update both the native
+Administrators group and manifest v6 without exposing a password prefix in LSW
+metadata, seeds, or logs.
 
 ## Guest service contract
 
@@ -178,8 +181,9 @@ by the release gate.
 
 `LSWUserHelper` must independently be Manual/demand-start under LocalSystem.
 The permanent-user request proves the virtual-account agent can start it over
-its narrow service ACL and that it exits after one authenticated native account
-operation. The password is supplied only in the bounded binary protocol.
+its narrow service ACL and that it exits after each authenticated native account
+operation. User creation supplies the password only in the bounded binary
+protocol; role changes contain no password and are separately capability-gated.
 
 `LSWMaintenanceHelper` must likewise be Manual/demand-start under LocalSystem.
 The TRIM and hibernate checks prove that the restricted agent can request only

@@ -24,7 +24,7 @@ unattended OOBE, the boot-time SCM agent, complete remote process semantics,
 recursive transfer and watch sync, dynamic ports, shell completion, and systemd
 user socket activation.
 
-## 1.0.0-beta.7: fast, quiet background runtime and folder sharing
+## Shipped: 1.0.0-beta.7
 
 This release makes an installed environment inexpensive to keep available and
 gives desktop work a safe file-sharing foundation. Its tag is permitted only
@@ -80,9 +80,30 @@ native Linux desktop application rather than exposing a remote Windows desktop.
   icon discovery, `.desktop` entries, file arguments, working directories, and
   environment values. The intended CLI shape is `lsw run --gui ...`; the final
   spelling will be fixed before the feature is declared stable.
+- Make the Windows account role part of the desktop setup UX. For a personal
+  development VM, recommend adding the confirmed desktop user to the local
+  Administrators group so normal processes still use a filtered token and UAC
+  remains the elevation boundary. Keep a standard-user choice, support explicit
+  promotion, demotion, and creation of a separate administrator, and never
+  enable the built-in Administrator or create a hidden recovery account.
+  Existing instances must not be promoted silently during an upgrade.
+- Detect the native Windows 11 `sudo.exe` capability and offer explicit opt-in
+  enablement using its safer new-window mode. Do not bundle a third-party sudo
+  replacement, disable UAC, or treat sudo as a way to bypass Windows consent.
 - Map every eligible top-level Windows HWND to an independent Wayland window,
   with an X11 fallback, correct parent/modal relationships, focus, pointer,
   keyboard, resize, minimize/maximize, and per-monitor DPI behavior.
+- Preserve the Windows secure desktop for UAC. When an elevation prompt is
+  active, freeze ordinary seamless input and open a trusted Linux modal that
+  displays the real guest secure-desktop framebuffer through the private QEMU
+  display channel. Forward input only while that modal has focus, clearly mark
+  the instance and secure-desktop state, and return to per-window integration
+  after consent. Never synthesize an approval dialog or approve elevation from
+  a Linux notification; use the private full viewer as the recovery fallback.
+- Handle an approved elevated application through a narrowly scoped elevated
+  capture broker when available. If Windows integrity boundaries prevent safe
+  capture or input, report the boundary and retain the trusted viewer fallback
+  instead of weakening UIPI or secure-desktop policy.
 - Synchronize the text clipboard. When a GUI window has focus, Ctrl+C and
   Ctrl+V must reach that application and produce ordinary Linux clipboard
   behavior; terminal SIGINT semantics remain unchanged.
@@ -95,9 +116,11 @@ native Linux desktop application rather than exposing a remote Windows desktop.
   Shared-memory or GPU acceleration may improve performance later but cannot be
   required for correctness.
 
-Acceptance requires common development applications, file dialogs, elevated
-window boundaries, clipboard focus, large-file drag-and-drop, DPI transitions,
-full-screen recovery, and desktop-session restart testing on Wayland and X11.
+Acceptance requires common development applications, administrator and standard
+account flows, native-sudo detection, real UAC consent and credential prompts,
+secure-desktop spoof boundaries, file dialogs, elevated window boundaries,
+clipboard focus, large-file drag-and-drop, DPI transitions, full-screen recovery,
+and desktop-session restart testing on Wayland and X11.
 
 ## beta.9: seamless desktop polish and shell-light mode
 

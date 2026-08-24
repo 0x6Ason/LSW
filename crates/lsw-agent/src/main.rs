@@ -22,7 +22,7 @@ use lsw_core::{
     encode_process_id, read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame,
     FrameKind, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
     SessionOptions, SessionSignal, StartRequest, TerminalStartRequest, UserCreateRequest,
-    AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1,
+    UserSetRoleRequest, AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1,
     CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
     CAPABILITY_SESSION_SIGNAL_V1, SESSION_CANCEL_EXIT_CODE,
 };
@@ -30,9 +30,9 @@ use lsw_core::{
 use lsw_core::{
     TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
     CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
-    CAPABILITY_USER_ACCOUNT_V1, CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE,
-    CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT,
-    USER_HELPER_GUEST_PORT,
+    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CLONE_IDENTITY_MARKER_FILE,
+    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT,
+    MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -366,7 +366,10 @@ fn handle_user_helper_connection(
     }
     let server_hello = ServerHello {
         version: AGENT_PROTOCOL_VERSION,
-        capabilities: vec![CAPABILITY_USER_ACCOUNT_V1.to_owned()],
+        capabilities: vec![
+            CAPABILITY_USER_ACCOUNT_V1.to_owned(),
+            CAPABILITY_USER_ACCOUNT_ROLE_V1.to_owned(),
+        ],
     };
     write_frame(
         stream,
@@ -374,26 +377,46 @@ fn handle_user_helper_connection(
     )?;
 
     let mut frame = read_frame(stream)?;
-    if frame.kind != FrameKind::UserCreate {
-        frame.payload.fill(0);
-        send_error(stream, "account helper accepts only USER_CREATE")?;
-        return Ok(true);
-    }
-    let request = UserCreateRequest::decode(&frame.payload);
-    frame.payload.fill(0);
-    let mut request = match request {
-        Ok(request) => request,
-        Err(error) => {
-            send_error(stream, &error.to_string())?;
+    let result = match frame.kind {
+        FrameKind::UserCreate => {
+            let request = UserCreateRequest::decode(&frame.payload);
+            frame.payload.fill(0);
+            let mut request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    send_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            };
+            let result = windows_user::create_local_user(
+                &request.user_name,
+                &request.password,
+                request.administrator,
+            );
+            request.password.fill(0);
+            result
+        }
+        FrameKind::UserSetRole => {
+            let request = UserSetRoleRequest::decode(&frame.payload);
+            frame.payload.fill(0);
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    send_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            };
+            windows_user::set_local_user_role(&request.user_name, request.role)
+        }
+        _ => {
+            frame.payload.fill(0);
+            send_error(
+                stream,
+                "account helper accepts only USER_CREATE or USER_SET_ROLE",
+            )?;
             return Ok(true);
         }
     };
-    let result = windows_user::create_local_user(
-        &request.user_name,
-        &request.password,
-        request.administrator,
-    );
-    request.password.fill(0);
     match result {
         Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
         Err(error) => send_error(stream, &error.to_string())?,
@@ -1207,6 +1230,7 @@ fn handle_connection(
             hibernate_guest(stream, &request_frame.payload, expected_token)
         }
         FrameKind::UserCreate => create_user(stream, &mut request_frame.payload, expected_token),
+        FrameKind::UserSetRole => set_user_role(stream, &request_frame.payload, expected_token),
         FrameKind::MaintenanceTrim => {
             maintenance_trim(stream, &request_frame.payload, expected_token)
         }
@@ -1236,6 +1260,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_TERMINAL_RESIZE_V1.to_owned());
         capabilities.push(CAPABILITY_POWER_HIBERNATE_V1.to_owned());
         capabilities.push(CAPABILITY_USER_ACCOUNT_V1.to_owned());
+        capabilities.push(CAPABILITY_USER_ACCOUNT_ROLE_V1.to_owned());
         capabilities.push(CAPABILITY_MAINTENANCE_TRIM_V1.to_owned());
         capabilities
     };
@@ -1277,6 +1302,59 @@ fn forward_user_create(
     request: &UserCreateRequest,
     expected_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_user_helper(expected_token, CAPABILITY_USER_ACCOUNT_V1)?;
+    let mut frame = Frame::new(FrameKind::UserCreate, request.encode()?);
+    let write_result = write_frame(&mut stream, &frame);
+    frame.payload.fill(0);
+    write_result?;
+    read_user_helper_response(&mut stream)
+}
+
+fn set_user_role(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match UserSetRoleRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_user_set_role(&request, expected_token);
+    #[cfg(not(windows))]
+    let result: Result<(), Box<dyn std::error::Error>> = {
+        let _ = expected_token;
+        Err("Windows user role changes are unavailable on this platform".into())
+    };
+    if let Err(error) = result {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn forward_user_set_role(
+    request: &UserSetRoleRequest,
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_user_helper(expected_token, CAPABILITY_USER_ACCOUNT_ROLE_V1)?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::UserSetRole, request.encode()?),
+    )?;
+    read_user_helper_response(&mut stream)
+}
+
+#[cfg(windows)]
+fn connect_user_helper(
+    expected_token: &str,
+    required_capability: &str,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let mut stream = connect_windows_helper(USER_HELPER_SERVICE, USER_HELPER_PORT, "account")?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -1294,15 +1372,16 @@ fn forward_user_create(
         || !hello
             .capabilities
             .iter()
-            .any(|capability| capability == CAPABILITY_USER_ACCOUNT_V1)
+            .any(|capability| capability == required_capability)
     {
         return Err("Windows account helper returned incompatible capabilities".into());
     }
-    let mut frame = Frame::new(FrameKind::UserCreate, request.encode()?);
-    let write_result = write_frame(&mut stream, &frame);
-    frame.payload.fill(0);
-    write_result?;
-    let response = read_frame(&mut stream)?;
+    Ok(stream)
+}
+
+#[cfg(windows)]
+fn read_user_helper_response(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+    let response = read_frame(stream)?;
     match response.kind {
         FrameKind::Pong if response.payload.is_empty() => Ok(()),
         FrameKind::Error => Err(format!(

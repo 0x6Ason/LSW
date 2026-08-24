@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Narrow bindings for creating a local Windows account without putting its
-//! password in a child process, command line, environment block, or file.
+//! Narrow bindings for creating a local Windows account and changing its local
+//! Administrators membership without putting a password in a child process,
+//! command line, environment block, or file.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -14,6 +15,7 @@ const UF_SCRIPT: u32 = 0x0001;
 const UF_NORMAL_ACCOUNT: u32 = 0x0200;
 const NERR_SUCCESS: u32 = 0;
 const NERR_USER_EXISTS: u32 = 2224;
+const ERROR_MEMBER_NOT_IN_ALIAS: u32 = 1377;
 const ERROR_MEMBER_IN_ALIAS: u32 = 1378;
 const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
 const LOGON32_LOGON_NETWORK: u32 = 3;
@@ -46,6 +48,13 @@ extern "system" {
     ) -> u32;
     fn NetUserDel(server_name: *const u16, user_name: *const u16) -> u32;
     fn NetLocalGroupAddMembers(
+        server_name: *const u16,
+        group_name: *const u16,
+        level: u32,
+        buffer: *mut u8,
+        entries: u32,
+    ) -> u32;
+    fn NetLocalGroupDelMembers(
         server_name: *const u16,
         group_name: *const u16,
         level: u32,
@@ -156,6 +165,18 @@ pub(super) fn create_local_user(
     Ok(())
 }
 
+pub(super) fn set_local_user_role(
+    user_name: &str,
+    role: lsw_core::WindowsUserRole,
+) -> Result<(), Box<dyn std::error::Error>> {
+    lsw_core::validate_windows_user_name(user_name)?;
+    let mut user_name = wide(user_name);
+    match role {
+        lsw_core::WindowsUserRole::Standard => remove_from_administrators(&mut user_name),
+        lsw_core::WindowsUserRole::Administrator => add_to_administrators(&mut user_name),
+    }
+}
+
 fn verify_existing_password(
     user_name: *const u16,
     password: *const u16,
@@ -186,6 +207,50 @@ fn verify_existing_password(
 }
 
 fn add_to_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::error::Error>> {
+    let group_name = administrators_group_name()?;
+    let mut member = LocalGroupMembersInfo3 {
+        domain_and_name: user_name.as_mut_ptr(),
+    };
+    // SAFETY: group_name and the member account are live, NUL-terminated
+    // UTF-16 strings, and the one-entry structure matches information level 3.
+    let status = unsafe {
+        NetLocalGroupAddMembers(
+            std::ptr::null(),
+            group_name.as_ptr(),
+            3,
+            (&mut member as *mut LocalGroupMembersInfo3).cast(),
+            1,
+        )
+    };
+    if status != NERR_SUCCESS && status != ERROR_MEMBER_IN_ALIAS {
+        return Err(format!("NetLocalGroupAddMembers failed with status {status}").into());
+    }
+    Ok(())
+}
+
+fn remove_from_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::error::Error>> {
+    let group_name = administrators_group_name()?;
+    let mut member = LocalGroupMembersInfo3 {
+        domain_and_name: user_name.as_mut_ptr(),
+    };
+    // SAFETY: group_name and the member account are live, NUL-terminated
+    // UTF-16 strings, and the one-entry structure matches information level 3.
+    let status = unsafe {
+        NetLocalGroupDelMembers(
+            std::ptr::null(),
+            group_name.as_ptr(),
+            3,
+            (&mut member as *mut LocalGroupMembersInfo3).cast(),
+            1,
+        )
+    };
+    if status != NERR_SUCCESS && status != ERROR_MEMBER_NOT_IN_ALIAS {
+        return Err(format!("NetLocalGroupDelMembers failed with status {status}").into());
+    }
+    Ok(())
+}
+
+fn administrators_group_name() -> Result<[u16; 256], Box<dyn std::error::Error>> {
     let mut sid = [0_u8; 68];
     let mut sid_bytes = u32::try_from(sid.len()).expect("SID buffer length fits in u32");
     // SAFETY: sid is a writable SECURITY_MAX_SID_SIZE buffer and sid_bytes
@@ -229,25 +294,7 @@ fn add_to_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::error
         return Err("localized Administrators group name is too long".into());
     }
     group_name[terminator] = 0;
-
-    let mut member = LocalGroupMembersInfo3 {
-        domain_and_name: user_name.as_mut_ptr(),
-    };
-    // SAFETY: group_name and the member account are live, NUL-terminated
-    // UTF-16 strings, and the one-entry structure matches information level 3.
-    let status = unsafe {
-        NetLocalGroupAddMembers(
-            std::ptr::null(),
-            group_name.as_ptr(),
-            3,
-            (&mut member as *mut LocalGroupMembersInfo3).cast(),
-            1,
-        )
-    };
-    if status != NERR_SUCCESS && status != ERROR_MEMBER_IN_ALIAS {
-        return Err(format!("NetLocalGroupAddMembers failed with status {status}").into());
-    }
-    Ok(())
+    Ok(group_name)
 }
 
 fn wide(value: &str) -> Vec<u16> {

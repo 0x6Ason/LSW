@@ -70,10 +70,15 @@ validation claims in the beta.7 release.
    marker that the host waits for. Commands and ConPTY sessions therefore run
    in Windows Session 0 without storing a daily user's password or requiring login.
    After the service is ready, an interactive install registers a confirmed
-   permanent standard desktop account. The normal agent forwards one
-   authenticated loopback request to demand-start LocalSystem `LSWUserHelper`,
-   which calls native Windows NetAPI and exits. Automation must defer or invoke
-   the stdin-only recovery path. AutoLogon is never enabled.
+   permanent desktop account and recommends local administrator membership for
+   a personal development VM while retaining an explicit standard-account
+   choice. The normal agent forwards one authenticated loopback request to the
+   demand-start LocalSystem `LSWUserHelper`, which calls native Windows NetAPI
+   and exits. Capability-gated promote and demote operations use the same
+   one-request boundary; old manifests migrate as standard without changing the
+   guest. Automation must defer or invoke the stdin-only recovery path. Normal
+   applications remain filtered, UAC remains enabled, and AutoLogon is never
+   enabled.
    Visible desktop GUI work still requires the beta.8 user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.

@@ -4,10 +4,11 @@ LSW is a local Windows development runtime for Linux. It provides a WSL-like
 command-line experience while running a real Windows kernel inside one managed
 QEMU/KVM virtual machine per instance.
 
-The current beta line is `1.0.0-beta.7`. It adds sealed linked-clone
-images, opt-in low-memory lifecycle policies, disk-backed Windows hibernation,
+The latest tagged release is `1.0.0-beta.7`. It adds sealed linked-clone images,
+opt-in low-memory lifecycle policies, disk-backed Windows hibernation,
 declarative folder synchronization, and WSL-style permanent-user registration
-to the beta.6 terminal-first runtime on Linux x86_64.
+to the beta.6 terminal-first runtime on Linux x86_64. Development on `master`
+now targets beta.8 seamless desktop integration.
 
 LSW does not start a new VM for every application. Shells, commands, file
 transfers, and GUI processes for an instance all use the same running Windows
@@ -88,9 +89,12 @@ The one-shot installer performs the following steps:
    qcow2, creates UEFI boot files, and deletes temporary seeds/workspace media.
 6. Boots Windows headlessly, completes OOBE, removes the one-shot setup account
    and cached answer file, then verifies the boot-time agent.
-7. In an interactive terminal, asks for a permanent Windows desktop user and a
-   masked password. Automation must explicitly defer this step and may later
-   use `lsw user setup --username USER --password-stdin`.
+7. In an interactive terminal, asks for a permanent Windows desktop user, a
+   masked password, and an account role. Personal development instances
+   recommend administrator membership while retaining filtered normal tokens
+   and UAC. Automation must explicitly defer this step and may later use
+   `lsw user setup --username USER --password-stdin` with an optional
+   `--administrator`.
 
 The terminal UI renders byte-accurate bars for native ISO transfer,
 range assembly, SHA-256 verification, and DISM percentages. WinPE boot,
@@ -155,15 +159,22 @@ lsw push ./main.rs 'C:\src\main.rs'
 lsw push --recursive ./project 'C:\src\project'
 lsw sync --watch ./project 'C:\src\project'
 lsw pull 'C:\src\build\app.exe' ./app.exe
+lsw user promote win-dev       # UAC remains enabled
+lsw user demote win-dev
 ```
 
-The registered desktop identity is a standard local Windows account unless
-`lsw user setup --administrator` is explicitly requested. Its password never
-enters argv, environment, the manifest, installation media, logs, or diagnostic
-bundles. The unprivileged agent forwards one authenticated loopback frame to
-the demand-start LocalSystem `LSWUserHelper`; that helper calls Windows NetAPI
-once and exits. AutoLogon remains disabled. Session 0 CLI commands continue to use the boot-time service
-identity; beta.8 will use the registered identity for visible desktop apps.
+Interactive installation recommends making the confirmed desktop identity a
+local administrator for a WSL-like personal development experience, but keeps
+a standard-account choice. `lsw user setup` remains standard unless
+`--administrator` is explicit, and an existing default user can be changed with
+`lsw user promote` or `lsw user demote`. Normal applications still receive a
+filtered token and Windows UAC remains the elevation boundary. The password
+never enters argv, environment, the manifest, installation media, logs, or
+diagnostic bundles. The unprivileged agent forwards one authenticated loopback
+frame to the demand-start LocalSystem `LSWUserHelper`; that helper performs one
+bounded native account operation and exits. AutoLogon remains disabled. Session
+0 CLI commands continue to use the boot-time service identity; beta.8 will use
+the registered identity for visible desktop apps.
 
 `lsw exec` and ordinary `lsw run` wait and return guest exit codes 0–255
 unchanged. Windows has a 32-bit exit-code space; when a value cannot be

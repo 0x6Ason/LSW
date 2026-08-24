@@ -540,6 +540,9 @@ fn non_windows_agent_does_not_advertise_conpty() {
         .any(|capability| capability == lsw_core::CAPABILITY_USER_ACCOUNT_V1));
     assert!(!capabilities
         .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_USER_ACCOUNT_ROLE_V1));
+    assert!(!capabilities
+        .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_POWER_HIBERNATE_V1));
     assert!(!capabilities
         .iter()
@@ -561,6 +564,7 @@ fn windows_agent_advertises_native_os_operations() {
         lsw_core::CAPABILITY_TERMINAL_RESIZE_V1,
         lsw_core::CAPABILITY_POWER_HIBERNATE_V1,
         lsw_core::CAPABILITY_USER_ACCOUNT_V1,
+        lsw_core::CAPABILITY_USER_ACCOUNT_ROLE_V1,
         lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1,
     ] {
         assert!(capabilities.iter().any(|capability| capability == expected));

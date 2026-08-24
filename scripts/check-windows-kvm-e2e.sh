@@ -175,6 +175,7 @@ cached_unattend_removed=unknown
 setup_payload_removed=unknown
 automatic_logon=unknown
 desktop_user_registered=unknown
+desktop_user_role=unknown
 clone_identity_isolated=unknown
 folder_share_boundaries=unknown
 resource_governor_verified=unknown
@@ -328,6 +329,7 @@ collect_e2e_artifacts() {
         printf 'setup_payload_removed=%s\n' "$setup_payload_removed"
         printf 'automatic_logon=%s\n' "$automatic_logon"
         printf 'desktop_user_registered=%s\n' "$desktop_user_registered"
+        printf 'desktop_user_role=%s\n' "$desktop_user_role"
         printf 'clone_identity_isolated=%s\n' "$clone_identity_isolated"
         printf 'folder_share_boundaries=%s\n' "$folder_share_boundaries"
         printf 'resource_governor_verified=%s\n' "$resource_governor_verified"
@@ -996,6 +998,46 @@ if ! grep -F "default_user=$desktop_user" \
     echo "error: registered desktop user was not persisted as the default identity" >&2
     exit 1
 fi
+if ! grep -F 'default_user_role=standard' \
+    "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null; then
+    echo "error: initial standard desktop-user role was not persisted" >&2
+    exit 1
+fi
+"$lsw" user promote "$instance"
+promoted_user_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$User=Get-LocalUser -Name "lsw-e2e-user"; $Administrators=Get-LocalGroup -SID "S-1-5-32-544"; if (-not (Get-LocalGroupMember -Group $Administrators | Where-Object { $_.SID -eq $User.SID })) { exit 83 }; [Console]::Out.Write("administrator")'
+)
+if [ "$promoted_user_output" != administrator ] \
+    || ! grep -F 'default_user_role=administrator' \
+        "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null
+then
+    echo "error: desktop-user promotion did not update Windows and the manifest" >&2
+    exit 1
+fi
+"$lsw" user demote "$instance"
+demoted_user_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$User=Get-LocalUser -Name "lsw-e2e-user"; $Administrators=Get-LocalGroup -SID "S-1-5-32-544"; if (Get-LocalGroupMember -Group $Administrators | Where-Object { $_.SID -eq $User.SID }) { exit 84 }; [Console]::Out.Write("standard")'
+)
+if [ "$demoted_user_output" != standard ] \
+    || ! grep -F 'default_user_role=standard' \
+        "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null
+then
+    echo "error: desktop-user demotion did not update Windows and the manifest" >&2
+    exit 1
+fi
+"$lsw" user promote "$instance"
+if ! grep -F 'default_user_role=administrator' \
+    "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null; then
+    echo "error: final desktop-user administrator role was not persisted" >&2
+    exit 1
+fi
+desktop_user_role=administrator
 user_helper_output=$(
     # PowerShell expands its own variables in the guest.
     # shellcheck disable=SC2016
@@ -1119,7 +1161,7 @@ then
     exit 1
 fi
 exec_context_verified=true
-echo "beta.7 cwd and environment injection passed."
+echo "cwd and environment injection passed."
 
 set +e
 "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
@@ -1135,7 +1177,7 @@ if [ "$signal_status" -ne 143 ]; then
     cat "$e2e_root/signal.stderr" >&2
     exit 1
 fi
-echo "beta.7 SIGTERM propagation returned exact status 143."
+echo "SIGTERM propagation returned exact status 143."
 
 guest_detached_marker="C:\Windows\Temp\beta6-detached-$$.txt"
 "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
@@ -1169,7 +1211,7 @@ if [ "$(printf '%s' "$detached_marker" | tr -d '\r')" != DETACHED_OK ]; then
     exit 1
 fi
 detached_run_verified=true
-echo "beta.7 detached run completed after client disconnect."
+echo "detached run completed after client disconnect."
 
 transfer_source="$e2e_root/transfer-source"
 transfer_pull="$e2e_root/transfer-pull"
@@ -1185,7 +1227,7 @@ cmp "$transfer_source/root.txt" "$transfer_pull/root.txt"
 cmp "$transfer_source/nested/file with space.txt" \
     "$transfer_pull/nested/file with space.txt"
 recursive_transfer_verified=true
-echo "beta.7 recursive push and pull round-trip passed."
+echo "recursive push and pull round-trip passed."
 
 sync_source="$e2e_root/sync-source"
 sync_log="$e2e_root/sync.log"
@@ -1258,7 +1300,7 @@ if [ "$(printf '%s' "$sync_value" | tr -d '\r')" != sync-two ]; then
     exit 1
 fi
 watch_sync_verified=true
-echo "beta.7 additive sync --watch passed."
+echo "additive sync --watch passed."
 terminate_sync
 
 share_source="$e2e_root/share-source"
@@ -1348,6 +1390,10 @@ if [ "$hibernate_resume" != "$hibernate_resume_marker" ]; then
     exit 1
 fi
 resource_governor_verified=true
+# The read-only share test deliberately replaces the guest root DACL with a
+# protected allow-list. Restore inheritance on that test-only tree before the
+# final removal so PowerShell does not retain a protected directory after the
+# share declaration is gone.
 # PowerShell, not the host shell, expands the cleanup variables.
 # shellcheck disable=SC2016
 if ! "$lsw" exec "$instance" \
@@ -1356,9 +1402,10 @@ if ! "$lsw" exec "$instance" \
     --env "LSW_CLEANUP_SYNC=$guest_sync" \
     --env "LSW_CLEANUP_SHARE=$guest_share" \
     -- powershell.exe -NoLogo -NoProfile -Command \
-    '$ErrorActionPreference="Stop"; foreach ($Path in @($env:LSW_CLEANUP_DETACHED,$env:LSW_CLEANUP_TRANSFER,$env:LSW_CLEANUP_SYNC,$env:LSW_CLEANUP_SHARE)) { for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force }; break } catch { if ($Attempt -eq 39) { throw }; Start-Sleep -Milliseconds 250 } } }'
+    '$ErrorActionPreference="Stop"; $Share=$env:LSW_CLEANUP_SHARE; if (Test-Path -LiteralPath $Share -PathType Container) { $Agent=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; & "$env:SystemRoot\System32\icacls.exe" $Share /reset /T /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { throw ("could not reset the test share ACL at {0}; icacls exited {1}" -f $Share,$LASTEXITCODE) }; & "$env:SystemRoot\System32\icacls.exe" $Share /grant:r ("*{0}:(OI)(CI)F" -f $Agent) /T /C /Q | Out-Null; if ($LASTEXITCODE -ne 0) { throw ("could not grant cleanup access at {0}; icacls exited {1}" -f $Share,$LASTEXITCODE) } }; foreach ($Path in @($env:LSW_CLEANUP_DETACHED,$env:LSW_CLEANUP_TRANSFER,$env:LSW_CLEANUP_SYNC,$Share)) { for ($Attempt=0; $Attempt -lt 40; $Attempt++) { try { if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }; break } catch { if ($Attempt -eq 39) { throw ("guest cleanup failed for {0}: {1}" -f $Path,$_.Exception.Message) }; Start-Sleep -Milliseconds 250 } } }'
 then
-    echo "warning: guest test artifacts remained locked; instance removal will discard them" >&2
+    echo "error: guest test artifact cleanup failed" >&2
+    exit 1
 fi
 
 if [ -n "$artifact_dir" ]; then

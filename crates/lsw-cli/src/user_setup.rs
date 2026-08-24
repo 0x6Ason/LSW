@@ -4,7 +4,9 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
-use lsw_core::{validate_windows_user_name, StateStore, UserCreateRequest};
+use lsw_core::{
+    validate_windows_user_name, StateStore, UserCreateRequest, UserSetRoleRequest, WindowsUserRole,
+};
 
 use super::{connect_agent, resolve_name};
 
@@ -44,7 +46,51 @@ pub(super) fn after_install(
         );
     }
     println!("Create the permanent Windows desktop user for {name:?}.");
-    setup(store, name, None, false, false)
+    let administrator = prompt_administrator_role()?;
+    setup(store, name, None, false, administrator)
+}
+
+pub(super) fn set_role(
+    store: &StateStore,
+    arguments: &[OsString],
+    role: WindowsUserRole,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let requested = match arguments {
+        [] => None,
+        [name] => Some(name.to_str().ok_or("instance name must be valid UTF-8")?),
+        _ => return Err("usage: lsw user <promote|demote> [NAME]".into()),
+    };
+    let name = resolve_name(store, requested)?;
+    let manifest = store.load(&name)?;
+    let user_name = manifest.default_user.ok_or_else(|| {
+        format!("instance {name:?} has no registered desktop user; run `lsw user setup {name}`")
+    })?;
+    let role_was_recorded = manifest.default_user_role == Some(role);
+
+    connect_agent(store, &name)?.set_user_role(&UserSetRoleRequest {
+        user_name: user_name.clone(),
+        role,
+    })?;
+    let mut manifest = store.load(&name)?;
+    if manifest.default_user.as_deref() != Some(user_name.as_str()) {
+        return Err("the default Windows user changed while its role was being updated".into());
+    }
+    manifest.default_user_role = Some(role);
+    store.update(&manifest)?;
+    if role_was_recorded {
+        println!("Confirmed Windows desktop user {user_name:?} is {role}.");
+    } else {
+        println!("Windows desktop user {user_name:?} is now {role}.");
+    }
+    match role {
+        WindowsUserRole::Administrator => {
+            println!("Normal applications remain unelevated; Windows UAC still controls elevation.")
+        }
+        WindowsUserRole::Standard => {
+            println!("Administrative actions now require credentials for a separate administrator.")
+        }
+    }
+    Ok(())
 }
 
 fn setup(
@@ -81,6 +127,11 @@ fn setup(
 
     let mut manifest = store.load(name)?;
     manifest.default_user = Some(user_name.clone());
+    manifest.default_user_role = Some(if administrator {
+        WindowsUserRole::Administrator
+    } else {
+        WindowsUserRole::Standard
+    });
     store.update(&manifest)?;
     println!("Created or securely verified Windows user {user_name:?} for {name:?}.");
     if administrator {
@@ -102,6 +153,31 @@ fn prompt_user_name() -> Result<String, Box<dyn std::error::Error>> {
     let mut value = String::new();
     io::stdin().read_line(&mut value)?;
     Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn prompt_administrator_role() -> Result<bool, Box<dyn std::error::Error>> {
+    let mut stderr = io::stderr().lock();
+    loop {
+        write!(
+            stderr,
+            "Make this user a Windows administrator? Normal apps remain unelevated and UAC stays enabled. [Y/n]: "
+        )?;
+        stderr.flush()?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        match parse_administrator_choice(&value) {
+            Some(choice) => return Ok(choice),
+            None => writeln!(stderr, "Enter y or n.")?,
+        }
+    }
+}
+
+fn parse_administrator_choice(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn read_confirmed_password() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -290,5 +366,13 @@ mod tests {
     fn password_stdin_requires_a_noninteractive_user_name() {
         assert!(UserSetupArguments::parse(&[OsString::from("--password-stdin")]).is_err());
         assert!(UserSetupArguments::parse(&[OsString::from("--administrator")]).is_ok());
+    }
+
+    #[test]
+    fn interactive_install_recommends_an_administrator_without_forcing_it() {
+        assert_eq!(parse_administrator_choice(""), Some(true));
+        assert_eq!(parse_administrator_choice("yes\n"), Some(true));
+        assert_eq!(parse_administrator_choice("N\r\n"), Some(false));
+        assert_eq!(parse_administrator_choice("maybe"), None);
     }
 }

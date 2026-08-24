@@ -56,13 +56,18 @@ After cleanup, interactive installation creates a separately confirmed
 permanent local account. `lsw user setup` validates the name locally and sends
 the password through a dedicated authenticated frame. The normal virtual-account
 agent starts `LSWUserHelper`, forwards the request over authenticated guest
-loopback, and the demand-start LocalSystem helper calls `NetUserAdd`; optional
-administrator membership uses the well-known local Administrators SID and
-`NetLocalGroupAddMembers`. The helper exits after one request. Password bytes
-never enter argv, environment, LSW manifests, seeds, logs, or diagnostics, and
-mutable protocol/UTF-16 buffers are cleared after use. Windows retains its
-normal account verifier. Standard membership is the default and Windows
-AutoLogon is never configured.
+loopback, and the demand-start LocalSystem helper calls `NetUserAdd`. Interactive
+personal-development installation recommends administrator membership while
+retaining a standard-account choice; deferred `lsw user setup` remains standard
+unless `--administrator` is explicit. Administrator membership uses the
+well-known local Administrators SID and `NetLocalGroupAddMembers`.
+Capability-gated `lsw user promote` and `lsw user demote` use the same one-shot
+helper and `NetLocalGroupAddMembers` or `NetLocalGroupDelMembers`; reading an old
+manifest never changes Windows membership. The helper exits after one request.
+Password bytes never enter argv, environment, LSW manifests, seeds, logs, or
+diagnostics, and mutable protocol/UTF-16 buffers are cleared after use. Windows
+retains its normal account verifier, normal administrator processes receive a
+filtered token, UAC remains enabled, and Windows AutoLogon is never configured.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
 guest port 35040 only from the QEMU user-network host address. Authentication is

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use crate::{LswError, Result};
+use crate::{LswError, Result, WindowsUserRole};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
 pub const CAPABILITY_CONPTY_V1: &str = "conpty-v1";
@@ -16,6 +16,7 @@ pub const CAPABILITY_SESSION_SIGNAL_V1: &str = "session-signal-v1";
 pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
 pub const CAPABILITY_POWER_HIBERNATE_V1: &str = "power-hibernate-v1";
 pub const CAPABILITY_USER_ACCOUNT_V1: &str = "user-account-v1";
+pub const CAPABILITY_USER_ACCOUNT_ROLE_V1: &str = "user-account-role-v1";
 pub const CAPABILITY_MAINTENANCE_TRIM_V1: &str = "maintenance-trim-v1";
 pub const CAPABILITY_MAINTENANCE_HIBERNATE_V1: &str = "maintenance-hibernate-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
@@ -59,6 +60,7 @@ pub enum FrameKind {
     UserCreate = 31,
     MaintenanceTrim = 32,
     MaintenanceHibernate = 33,
+    UserSetRole = 34,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -95,6 +97,7 @@ impl TryFrom<u8> for FrameKind {
             31 => Ok(Self::UserCreate),
             32 => Ok(Self::MaintenanceTrim),
             33 => Ok(Self::MaintenanceHibernate),
+            34 => Ok(Self::UserSetRole),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -177,6 +180,42 @@ impl UserCreateRequest {
         crate::validate_windows_user_name(&request.user_name)?;
         validate_password(&request.password)?;
         Ok(request)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UserSetRoleRequest {
+    pub user_name: String,
+    pub role: WindowsUserRole,
+}
+
+impl UserSetRoleRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        crate::validate_windows_user_name(&self.user_name)?;
+        let mut payload = Vec::new();
+        push_string(&mut payload, &self.user_name)?;
+        payload.push(match self.role {
+            WindowsUserRole::Standard => 0,
+            WindowsUserRole::Administrator => 1,
+        });
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let user_name = decoder.string()?;
+        let role = match decoder.u8()? {
+            0 => WindowsUserRole::Standard,
+            1 => WindowsUserRole::Administrator,
+            _ => {
+                return Err(LswError::Protocol(
+                    "Windows user role must be zero or one".to_owned(),
+                ))
+            }
+        };
+        decoder.finish()?;
+        crate::validate_windows_user_name(&user_name)?;
+        Ok(Self { user_name, role })
     }
 }
 
@@ -1026,6 +1065,28 @@ mod tests {
         }
         .encode()
         .is_err());
+    }
+
+    #[test]
+    fn user_role_changes_are_explicit_and_append_only() {
+        let request = UserSetRoleRequest {
+            user_name: "desktop-user".to_owned(),
+            role: WindowsUserRole::Administrator,
+        };
+        let encoded = request.encode().expect("role request should encode");
+        assert_eq!(
+            UserSetRoleRequest::decode(&encoded).expect("role request should decode"),
+            request
+        );
+        assert_eq!(
+            FrameKind::try_from(34).expect("user-set-role kind should decode"),
+            FrameKind::UserSetRole
+        );
+        assert_eq!(FrameKind::UserSetRole as u8, 34);
+
+        let mut invalid_role = encoded;
+        *invalid_role.last_mut().expect("encoded role exists") = 2;
+        assert!(UserSetRoleRequest::decode(&invalid_role).is_err());
     }
 
     #[test]

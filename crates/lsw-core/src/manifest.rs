@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{LswError, Result, WindowsProfile};
 
-const MANIFEST_VERSION: u32 = 5;
+const MANIFEST_VERSION: u32 = 6;
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 pub const DEFAULT_HIBERNATE_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const AGENT_CONTROL_PORT_START: u16 = 42_000;
@@ -24,6 +24,36 @@ pub enum NetworkMode {
 pub enum IdlePolicy {
     Off,
     PauseHibernate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsUserRole {
+    Standard,
+    Administrator,
+}
+
+impl fmt::Display for WindowsUserRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Standard => "standard",
+            Self::Administrator => "administrator",
+        })
+    }
+}
+
+impl FromStr for WindowsUserRole {
+    type Err = LswError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "administrator" => Ok(Self::Administrator),
+            _ => Err(LswError::InvalidValue {
+                field: "Windows user role",
+                reason: format!("unknown role {value:?}; expected standard or administrator"),
+            }),
+        }
+    }
 }
 
 impl fmt::Display for IdlePolicy {
@@ -353,6 +383,7 @@ pub struct InstanceManifest {
     pub state_changed_unix_seconds: u64,
     pub base_image_key: Option<String>,
     pub default_user: Option<String>,
+    pub default_user_role: Option<WindowsUserRole>,
     pub folder_shares: Vec<FolderShare>,
 }
 
@@ -381,6 +412,7 @@ impl InstanceManifest {
             state_changed_unix_seconds: created_unix_seconds,
             base_image_key: None,
             default_user: None,
+            default_user_role: None,
             folder_shares: Vec::new(),
         })
     }
@@ -407,6 +439,9 @@ impl InstanceManifest {
             .join(",");
         let base_image_key = self.base_image_key.as_deref().unwrap_or("");
         let default_user = self.default_user.as_deref().unwrap_or("");
+        let default_user_role = self
+            .default_user_role
+            .map_or(String::new(), |role| role.to_string());
         let mut shares = String::new();
         for (index, share) in self.folder_shares.iter().enumerate() {
             shares.push_str(&format!(
@@ -441,6 +476,7 @@ impl InstanceManifest {
                 "state_changed_unix_seconds={}\n",
                 "base_image_key={}\n",
                 "default_user={}\n",
+                "default_user_role={}\n",
                 "share_count={}\n",
                 "{}"
             ),
@@ -465,6 +501,7 @@ impl InstanceManifest {
             self.state_changed_unix_seconds,
             base_image_key,
             default_user,
+            default_user_role,
             self.folder_shares.len(),
             shares,
         ))
@@ -563,6 +600,13 @@ impl InstanceManifest {
         } else {
             None
         };
+        let default_user_role = if version >= 6 {
+            optional_nonempty_field(&fields, "default_user_role")
+                .map(str::parse)
+                .transpose()?
+        } else {
+            default_user.as_ref().map(|_| WindowsUserRole::Standard)
+        };
         let folder_shares = if version >= 5 {
             parse_folder_shares(&fields)?
         } else {
@@ -582,6 +626,7 @@ impl InstanceManifest {
             state_changed_unix_seconds,
             base_image_key,
             default_user,
+            default_user_role,
             folder_shares,
         };
         validate_runtime_fields(&manifest)?;
@@ -613,6 +658,12 @@ fn validate_runtime_fields(manifest: &InstanceManifest) -> Result<()> {
     }
     if let Some(user) = &manifest.default_user {
         validate_windows_user_name(user)?;
+    }
+    if manifest.default_user.is_some() != manifest.default_user_role.is_some() {
+        return Err(LswError::InvalidValue {
+            field: "default Windows user role",
+            reason: "must be present exactly when a default Windows user is registered".to_owned(),
+        });
     }
     let mut names = BTreeSet::new();
     for (index, share) in manifest.folder_shares.iter().enumerate() {
@@ -908,6 +959,7 @@ mod tests {
                     "state_changed_unix_seconds=",
                     "base_image_key=",
                     "default_user=",
+                    "default_user_role=",
                     "share_count=",
                     "share.",
                 ]
@@ -941,6 +993,7 @@ mod tests {
         manifest.memory_min_mib = 1024;
         manifest.base_image_key = Some("a".repeat(64));
         manifest.default_user = Some("desktop-user".to_owned());
+        manifest.default_user_role = Some(WindowsUserRole::Administrator);
         manifest.folder_shares.push(FolderShare {
             name: "source".to_owned(),
             host_path: PathBuf::from("/srv/source"),
@@ -1143,6 +1196,40 @@ mod tests {
         assert!(migrated.base_image_key.is_none());
         assert!(migrated.default_user.is_none());
         assert!(migrated.folder_shares.is_empty());
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn version_five_desktop_users_migrate_without_privilege_escalation() {
+        let iso = temporary_iso();
+        let mut manifest = InstanceManifest::new(InstanceSpec {
+            name: "version-five".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Slim,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("fixture manifest should be valid");
+        manifest.default_user = Some("desktop-user".to_owned());
+        manifest.default_user_role = Some(WindowsUserRole::Standard);
+        let legacy = manifest
+            .encode()
+            .expect("manifest should encode")
+            .lines()
+            .filter(|line| !line.starts_with("default_user_role="))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replacen("version=6", "version=5", 1);
+
+        let migrated = InstanceManifest::decode(&legacy).expect("v5 manifest should migrate");
+        assert_eq!(migrated.default_user.as_deref(), Some("desktop-user"));
+        assert_eq!(migrated.default_user_role, Some(WindowsUserRole::Standard));
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 

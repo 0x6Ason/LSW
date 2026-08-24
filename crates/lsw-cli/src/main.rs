@@ -150,8 +150,18 @@ fn user_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.first().and_then(|value| value.to_str()) {
         Some("setup") => user_setup::command(store, &arguments[1..]),
+        Some("promote") => user_setup::set_role(
+            store,
+            &arguments[1..],
+            lsw_core::WindowsUserRole::Administrator,
+        ),
+        Some("demote") => user_setup::set_role(
+            store,
+            &arguments[1..],
+            lsw_core::WindowsUserRole::Standard,
+        ),
         _ => Err(
-            "usage: lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]"
+            "usage: lsw user <setup [NAME] [--username USER] [--password-stdin] [--administrator] | promote [NAME] | demote [NAME]>"
                 .into(),
         ),
     }
@@ -340,16 +350,13 @@ fn doctor(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
         let missing = capabilities.missing_for_install_workflow();
         let install_aria2 = capabilities.aria2c.is_none();
         if missing.is_empty() && !install_aria2 {
-            println!("All beta.7 host dependencies are already installed.\n");
+            println!("All required LSW host dependencies are already installed.\n");
         } else {
             let mut requested = missing;
             if install_aria2 {
                 requested.push("aria2c (optional download accelerator)");
             }
-            println!(
-                "Installing beta.7 host dependencies: {}",
-                requested.join(", ")
-            );
+            println!("Installing LSW host dependencies: {}", requested.join(", "));
             fix_host_dependencies(false)?;
             capabilities = HostCapabilities::detect();
         }
@@ -2146,7 +2153,7 @@ fn bench(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::
         );
         println!("{output}");
     } else {
-        println!("LSW beta.7 performance baseline");
+        println!("LSW performance baseline");
         println!(
             "  accelerator: {}",
             QemuBackend::select(&capabilities).accelerator()
@@ -2234,6 +2241,12 @@ fn show(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::e
     println!(
         "default Windows user: {}",
         manifest.default_user.as_deref().unwrap_or("not registered")
+    );
+    println!(
+        "Windows user role:    {}",
+        manifest
+            .default_user_role
+            .map_or("not registered".to_owned(), |role| role.to_string())
     );
     println!(
         "sealed base image:    {}",
@@ -2393,6 +2406,8 @@ fn print_help() {
         "              [--unattended-index N] [--without-agent] [--viewer]\n",
         "              [--accept-windows-license] [--defer-user-setup]\n",
         "  lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]\n",
+        "  lsw user promote [NAME]\n",
+        "  lsw user demote [NAME]\n",
         "  lsw license status [NAME]\n",
         "  lsw license activate [NAME] [--key-stdin | --online]\n",
         "  lsw license open [NAME]\n",
