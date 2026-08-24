@@ -62,6 +62,7 @@ impl ProgressEvent {
 }
 
 pub struct ProgressRenderer {
+    destination: ProgressDestination,
     terminal: bool,
     current_step: Option<u8>,
     current_label: String,
@@ -73,11 +74,29 @@ pub struct ProgressRenderer {
     spinner_frame: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProgressDestination {
+    Stdout,
+    Stderr,
+}
+
 impl ProgressRenderer {
     pub fn new() -> Self {
+        Self::with_destination(ProgressDestination::Stdout)
+    }
+
+    pub fn stderr() -> Self {
+        Self::with_destination(ProgressDestination::Stderr)
+    }
+
+    fn with_destination(destination: ProgressDestination) -> Self {
         let now = Instant::now();
         Self {
-            terminal: io::stdout().is_terminal(),
+            destination,
+            terminal: match destination {
+                ProgressDestination::Stdout => io::stdout().is_terminal(),
+                ProgressDestination::Stderr => io::stderr().is_terminal(),
+            },
             current_step: None,
             current_label: String::new(),
             current_detail: String::new(),
@@ -86,6 +105,26 @@ impl ProgressRenderer {
             last_log_bucket: None,
             line_open: false,
             spinner_frame: 0,
+        }
+    }
+
+    fn print(&self, value: &str) {
+        match self.destination {
+            ProgressDestination::Stdout => {
+                print!("{value}");
+                let _ = io::stdout().flush();
+            }
+            ProgressDestination::Stderr => {
+                eprint!("{value}");
+                let _ = io::stderr().flush();
+            }
+        }
+    }
+
+    fn println(&self, value: &str) {
+        match self.destination {
+            ProgressDestination::Stdout => println!("{value}"),
+            ProgressDestination::Stderr => eprintln!("{value}"),
         }
     }
 
@@ -114,18 +153,18 @@ impl ProgressRenderer {
             }
             let line =
                 format_progress_line(&event, self.stage_started.elapsed(), self.spinner_frame);
-            print!("\r\x1b[2K{line}");
-            let _ = io::stdout().flush();
+            self.print(&format!("\r\x1b[2K{line}"));
             self.line_open = true;
             self.last_rendered = Instant::now();
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
         } else {
             let bucket = percent.map(|percent| percent / 10);
             if changed || percent == Some(100) || bucket != self.last_log_bucket {
-                println!(
-                    "{}",
-                    format_progress_line(&event, self.stage_started.elapsed(), 0)
-                );
+                self.println(&format_progress_line(
+                    &event,
+                    self.stage_started.elapsed(),
+                    0,
+                ));
                 self.last_log_bucket = bucket;
             }
         }
@@ -140,7 +179,7 @@ impl ProgressRenderer {
 
     fn close_line(&mut self) {
         if self.terminal && self.line_open {
-            println!();
+            self.println("");
             self.line_open = false;
         }
     }
@@ -233,6 +272,12 @@ fn format_byte_pair(completed: u64, total: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_progress_can_be_routed_to_stderr() {
+        let progress = ProgressRenderer::stderr();
+        assert_eq!(progress.destination, ProgressDestination::Stderr);
+    }
 
     #[test]
     fn measured_progress_is_bounded_and_human_readable() {

@@ -1403,23 +1403,23 @@ fn connect_agent(
             )
         }
         InstanceState::Stopped | InstanceState::Hibernated | InstanceState::Failed => {
-            println!("Starting {name:?}...");
+            eprintln!("Starting {name:?}...");
             let daemon = DaemonClient::new(store);
             for line in daemon.request_checked(&format!("START {name} run"))? {
-                println!("{line}");
+                eprintln!("{line}");
             }
         }
         InstanceState::Suspended => {
-            println!("Resuming {name:?}...");
+            eprintln!("Resuming {name:?}...");
             let daemon = DaemonClient::new(store);
             for line in daemon.request_checked(&format!("RESUME {name}"))? {
-                println!("{line}");
+                eprintln!("{line}");
             }
         }
         InstanceState::Installing | InstanceState::Running => {}
     }
 
-    let mut progress = ProgressRenderer::new();
+    let mut progress = ProgressRenderer::stderr();
     progress.update(ProgressEvent::stage(
         1,
         1,

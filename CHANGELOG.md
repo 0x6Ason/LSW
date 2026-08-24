@@ -4,6 +4,8 @@
 
 ## 1.0.0-beta.7
 
+- Kept automatic guest-start and resume progress on stderr so scripted
+  `lsw exec` stdout contains only the Windows process output.
 - Added content-addressed sealed images and linked clones. Image identity covers
   the ISO, declarative profile/preparation contract, agent, firmware, and
   source disk. Sealed bases are read-only; clone overlays receive distinct
