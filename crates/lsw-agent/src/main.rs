@@ -1326,7 +1326,7 @@ fn set_user_role(
     let result = forward_user_set_role(&request, expected_token);
     #[cfg(not(windows))]
     let result: Result<(), Box<dyn std::error::Error>> = {
-        let _ = expected_token;
+        let _ = (&request, expected_token);
         Err("Windows user role changes are unavailable on this platform".into())
     };
     if let Err(error) = result {
