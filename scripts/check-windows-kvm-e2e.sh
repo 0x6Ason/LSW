@@ -928,7 +928,8 @@ assert_stopped_runtime_released "$clone_source_pid" "$clone_agent_port"
 base_image_key=$(awk -F= '$1 == "base_image_key" { print $2; exit }' \
     "$LSW_STATE_DIR/instances/$instance/instance.lsw")
 base_disk="$LSW_STATE_DIR/images/$base_image_key/base.qcow2"
-if [ -z "$base_image_key" ] || [ ! -f "$base_disk" ] || [ -w "$base_disk" ]; then
+base_disk_writable=$(find "$base_disk" -maxdepth 0 -perm /222 -print -quit 2>/dev/null || true)
+if [ -z "$base_image_key" ] || [ ! -f "$base_disk" ] || [ -n "$base_disk_writable" ]; then
     echo "error: sealed linked-clone base is absent or writable" >&2
     exit 1
 fi
