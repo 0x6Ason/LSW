@@ -1529,12 +1529,15 @@ terminate_viewer
 terminate_daemon
 cold_daemon_wrapper="$e2e_root/cold-daemon-wrapper.sh"
 cold_daemon_session="$e2e_root/cold-daemon-session.sh"
+# DaemonClient already launches the configured program through setsid. Executing
+# setsid again here would fork because the wrapper is now a session leader, so
+# the child monitored by DaemonClient could exit before the socket is ready.
 # The variables are intentionally expanded later by the generated wrapper.
 # shellcheck disable=SC2016
 printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
-    'exec setsid "$LSW_E2E_COLD_DAEMON_SESSION" "$@"' \
+    'exec "$LSW_E2E_COLD_DAEMON_SESSION" "$@"' \
     >"$cold_daemon_wrapper"
 # Record the daemon only after it owns its private session/process group.
 # shellcheck disable=SC2016
