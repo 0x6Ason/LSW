@@ -36,7 +36,7 @@ Use a dedicated or ephemeral runner that holds no unrelated credentials or
 workloads. Do not attach the label below to a general-purpose self-hosted
 runner. The workflow accepts only:
 
-- a manual dispatch from `master` in `0x6Ason/lsw`;
+- a manual dispatch from `master` in `0x6Ason/LSW`;
 - an exact, operator-entered 40-character candidate commit;
 - the protected `windows-kvm-e2e` GitHub environment; and
 - a runner with all four labels: `self-hosted`, `Linux`, `X64`, and
