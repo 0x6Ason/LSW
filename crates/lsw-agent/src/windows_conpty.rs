@@ -15,6 +15,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::ptr;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use lsw_core::{SessionKind, StartRequest, TerminalSize};
 
@@ -28,6 +30,9 @@ const INFINITE: u32 = u32::MAX;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
+const HRESULT_PATH_NOT_FOUND: i32 = 0x8007_0003_u32 as i32;
+const PSEUDO_CONSOLE_CREATE_ATTEMPTS: usize = 20;
+const PSEUDO_CONSOLE_CREATE_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -175,19 +180,26 @@ unsafe impl Sync for PseudoConsole {}
 
 impl PseudoConsole {
     fn create(size: TerminalSize, input: Handle, output: Handle) -> io::Result<Self> {
-        let mut handle = ptr::null_mut();
-        // SAFETY: both pipe handles are live, `handle` is a valid writable
-        // out-parameter, and the numeric terminal size was range-validated.
-        let result = unsafe { create_pseudo_console(coord(size), input, output, 0, &mut handle) };
-        if result < 0 {
-            return Err(hresult_error("CreatePseudoConsole", result));
+        for attempt in 1..=PSEUDO_CONSOLE_CREATE_ATTEMPTS {
+            let mut handle = ptr::null_mut();
+            // SAFETY: both pipe handles are live, `handle` is a valid writable
+            // out-parameter, and the numeric terminal size was range-validated.
+            let result =
+                unsafe { create_pseudo_console(coord(size), input, output, 0, &mut handle) };
+            if result >= 0 {
+                if handle.is_null() {
+                    return Err(io::Error::other(
+                        "CreatePseudoConsole returned a null handle",
+                    ));
+                }
+                return Ok(Self { handle });
+            }
+            if !should_retry_pseudo_console_create(result, attempt) {
+                return Err(hresult_error("CreatePseudoConsole", result));
+            }
+            thread::sleep(PSEUDO_CONSOLE_CREATE_RETRY_DELAY);
         }
-        if handle.is_null() {
-            return Err(io::Error::other(
-                "CreatePseudoConsole returned a null handle",
-            ));
-        }
-        Ok(Self { handle })
+        unreachable!("the bounded CreatePseudoConsole loop always returns")
     }
 
     pub(super) fn resize(&self, size: TerminalSize) -> io::Result<()> {
@@ -200,6 +212,10 @@ impl PseudoConsole {
             Ok(())
         }
     }
+}
+
+pub(super) fn should_retry_pseudo_console_create(result: i32, attempt: usize) -> bool {
+    result == HRESULT_PATH_NOT_FOUND && attempt < PSEUDO_CONSOLE_CREATE_ATTEMPTS
 }
 
 impl Drop for PseudoConsole {

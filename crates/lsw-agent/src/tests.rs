@@ -455,6 +455,31 @@ fn windows_conpty_process_starts_inside_a_job() {
 
 #[cfg(windows)]
 #[test]
+fn windows_conpty_retries_only_transient_console_driver_startup() {
+    assert!(windows_conpty::should_retry_pseudo_console_create(
+        0x8007_0003_u32 as i32,
+        1
+    ));
+    assert!(windows_conpty::should_retry_pseudo_console_create(
+        0x8007_0003_u32 as i32,
+        19
+    ));
+    assert!(!windows_conpty::should_retry_pseudo_console_create(
+        0x8007_0003_u32 as i32,
+        20
+    ));
+    assert!(!windows_conpty::should_retry_pseudo_console_create(
+        0x8007_0005_u32 as i32,
+        1
+    ));
+    assert!(!windows_conpty::should_retry_pseudo_console_create(
+        0x8007_0057_u32 as i32,
+        1
+    ));
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_conpty_process_round_trips_input_and_output() {
     let request = StartRequest {
         kind: SessionKind::Shell,

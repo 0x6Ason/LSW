@@ -6,6 +6,9 @@
 
 - Kept automatic guest-start and resume progress on stderr so scripted
   `lsw exec` stdout contains only the Windows process output.
+- Made the first ConPTY session after a Windows cold boot tolerate the bounded
+  `ERROR_PATH_NOT_FOUND` window while the console driver initializes. Other
+  pseudoconsole errors still fail immediately.
 - Added content-addressed sealed images and linked clones. Image identity covers
   the ISO, declarative profile/preparation contract, agent, firmware, and
   source disk. Sealed bases are read-only; clone overlays receive distinct
