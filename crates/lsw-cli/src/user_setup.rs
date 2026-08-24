@@ -10,11 +10,16 @@ use lsw_core::{
 
 use super::{connect_agent, resolve_name};
 
+const USER_SETUP_USAGE: &str =
+    "usage: lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]";
+const USER_ADD_USAGE: &str =
+    "usage: lsw user add [NAME] [--username USER] [--password-stdin] [--administrator]";
+
 pub(super) fn command(
     store: &StateStore,
     arguments: &[OsString],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = UserSetupArguments::parse(arguments)?;
+    let parsed = UserSetupArguments::parse(arguments, USER_SETUP_USAGE)?;
     let name = resolve_name(store, parsed.requested.as_deref())?;
     setup(
         store,
@@ -22,6 +27,22 @@ pub(super) fn command(
         parsed.user_name,
         parsed.password_stdin,
         parsed.administrator,
+    )
+}
+
+pub(super) fn add(
+    store: &StateStore,
+    arguments: &[OsString],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = UserSetupArguments::parse(arguments, USER_ADD_USAGE)?;
+    let name = resolve_name(store, parsed.requested.as_deref())?;
+    create_account(
+        store,
+        &name,
+        parsed.user_name,
+        parsed.password_stdin,
+        parsed.administrator,
+        false,
     )
 }
 
@@ -47,7 +68,11 @@ pub(super) fn after_install(
     }
     println!("Create the permanent Windows desktop user for {name:?}.");
     let administrator = prompt_administrator_role()?;
-    setup(store, name, None, false, administrator)
+    setup(store, name, None, false, administrator)?;
+    if administrator {
+        super::windows_sudo::offer_after_install(store, name)?;
+    }
+    Ok(())
 }
 
 pub(super) fn set_role(
@@ -100,8 +125,29 @@ fn setup(
     password_stdin: bool,
     administrator: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    create_account(
+        store,
+        name,
+        supplied_user_name,
+        password_stdin,
+        administrator,
+        true,
+    )
+}
+
+fn create_account(
+    store: &StateStore,
+    name: &str,
+    supplied_user_name: Option<String>,
+    password_stdin: bool,
+    administrator: bool,
+    register_default: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let manifest = store.load(name)?;
-    if let Some(existing) = manifest.default_user {
+    if register_default && manifest.default_user.is_some() {
+        let existing = manifest
+            .default_user
+            .expect("default user was checked immediately above");
         return Err(
             format!("instance {name:?} already has default Windows user {existing:?}").into(),
         );
@@ -111,6 +157,17 @@ fn setup(
         None => prompt_user_name()?,
     };
     validate_windows_user_name(&user_name)?;
+    if !register_default
+        && manifest
+            .default_user
+            .as_ref()
+            .is_some_and(|existing| existing.to_uppercase() == user_name.to_uppercase())
+    {
+        return Err(format!(
+            "Windows user {user_name:?} is already the default identity; use `lsw user promote {name}` or `lsw user demote {name}`"
+        )
+        .into());
+    }
     let mut password = if password_stdin {
         read_password_stdin()?
     } else {
@@ -125,15 +182,22 @@ fn setup(
     password.fill(0);
     result?;
 
-    let mut manifest = store.load(name)?;
-    manifest.default_user = Some(user_name.clone());
-    manifest.default_user_role = Some(if administrator {
-        WindowsUserRole::Administrator
+    if register_default {
+        let mut manifest = store.load(name)?;
+        manifest.default_user = Some(user_name.clone());
+        manifest.default_user_role = Some(if administrator {
+            WindowsUserRole::Administrator
+        } else {
+            WindowsUserRole::Standard
+        });
+        store.update(&manifest)?;
+        println!("Created or securely verified Windows user {user_name:?} for {name:?}.");
     } else {
-        WindowsUserRole::Standard
-    });
-    store.update(&manifest)?;
-    println!("Created or securely verified Windows user {user_name:?} for {name:?}.");
+        println!(
+            "Created or securely verified additional Windows user {user_name:?} for {name:?}."
+        );
+        println!("The default desktop identity was not changed.");
+    }
     if administrator {
         println!("The user was explicitly added to the local Administrators group.");
     } else {
@@ -287,7 +351,10 @@ struct UserSetupArguments {
 }
 
 impl UserSetupArguments {
-    fn parse(arguments: &[OsString]) -> Result<Self, Box<dyn std::error::Error>> {
+    fn parse(
+        arguments: &[OsString],
+        usage: &'static str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut parsed = Self {
             requested: None,
             user_name: None,
@@ -323,11 +390,11 @@ impl UserSetupArguments {
                     parsed.administrator = true;
                 }
                 value if value.starts_with('-') => {
-                    return Err(format!("unknown user setup option {value:?}").into())
+                    return Err(format!("unknown user-account option {value:?}").into())
                 }
                 name => {
                     if parsed.requested.replace(name.to_owned()).is_some() {
-                        return Err(Self::usage().into());
+                        return Err(usage.into());
                     }
                 }
             }
@@ -338,10 +405,6 @@ impl UserSetupArguments {
         }
         Ok(parsed)
     }
-
-    fn usage() -> &'static str {
-        "usage: lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]"
-    }
 }
 
 #[cfg(test)]
@@ -350,12 +413,15 @@ mod tests {
 
     #[test]
     fn parser_keeps_administrator_explicit() {
-        let parsed = UserSetupArguments::parse(&[
-            OsString::from("dev"),
-            OsString::from("--username"),
-            OsString::from("jason"),
-            OsString::from("--password-stdin"),
-        ])
+        let parsed = UserSetupArguments::parse(
+            &[
+                OsString::from("dev"),
+                OsString::from("--username"),
+                OsString::from("jason"),
+                OsString::from("--password-stdin"),
+            ],
+            USER_SETUP_USAGE,
+        )
         .unwrap();
         assert_eq!(parsed.requested.as_deref(), Some("dev"));
         assert_eq!(parsed.user_name.as_deref(), Some("jason"));
@@ -364,8 +430,13 @@ mod tests {
 
     #[test]
     fn password_stdin_requires_a_noninteractive_user_name() {
-        assert!(UserSetupArguments::parse(&[OsString::from("--password-stdin")]).is_err());
-        assert!(UserSetupArguments::parse(&[OsString::from("--administrator")]).is_ok());
+        assert!(
+            UserSetupArguments::parse(&[OsString::from("--password-stdin")], USER_SETUP_USAGE)
+                .is_err()
+        );
+        assert!(
+            UserSetupArguments::parse(&[OsString::from("--administrator")], USER_ADD_USAGE).is_ok()
+        );
     }
 
     #[test]

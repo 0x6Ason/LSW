@@ -19,6 +19,7 @@ pub const CAPABILITY_USER_ACCOUNT_V1: &str = "user-account-v1";
 pub const CAPABILITY_USER_ACCOUNT_ROLE_V1: &str = "user-account-role-v1";
 pub const CAPABILITY_MAINTENANCE_TRIM_V1: &str = "maintenance-trim-v1";
 pub const CAPABILITY_MAINTENANCE_HIBERNATE_V1: &str = "maintenance-hibernate-v1";
+pub const CAPABILITY_WINDOWS_SUDO_V1: &str = "windows-sudo-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -61,6 +62,9 @@ pub enum FrameKind {
     MaintenanceTrim = 32,
     MaintenanceHibernate = 33,
     UserSetRole = 34,
+    WindowsSudoQuery = 35,
+    WindowsSudoConfigure = 36,
+    WindowsSudoStatus = 37,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -98,8 +102,108 @@ impl TryFrom<u8> for FrameKind {
             32 => Ok(Self::MaintenanceTrim),
             33 => Ok(Self::MaintenanceHibernate),
             34 => Ok(Self::UserSetRole),
+            35 => Ok(Self::WindowsSudoQuery),
+            36 => Ok(Self::WindowsSudoConfigure),
+            37 => Ok(Self::WindowsSudoStatus),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum WindowsSudoMode {
+    Disabled = 0,
+    ForceNewWindow = 1,
+    DisableInput = 2,
+    Normal = 3,
+}
+
+impl WindowsSudoMode {
+    fn decode(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Disabled),
+            1 => Ok(Self::ForceNewWindow),
+            2 => Ok(Self::DisableInput),
+            3 => Ok(Self::Normal),
+            _ => Err(LswError::Protocol(format!(
+                "unknown Windows sudo mode {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsSudoConfigureRequest {
+    pub enable: bool,
+}
+
+impl WindowsSudoConfigureRequest {
+    pub fn encode(self) -> Vec<u8> {
+        vec![u8::from(self.enable)]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        match payload {
+            [0] => Ok(Self { enable: false }),
+            [1] => Ok(Self { enable: true }),
+            _ => Err(LswError::Protocol(
+                "Windows sudo configuration must be exactly zero or one".to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsSudoStatus {
+    pub available: bool,
+    pub configured_mode: WindowsSudoMode,
+    pub policy_mode: Option<WindowsSudoMode>,
+}
+
+impl WindowsSudoStatus {
+    const NO_POLICY: u8 = u8::MAX;
+
+    pub fn effective_mode(self) -> WindowsSudoMode {
+        self.policy_mode.map_or(self.configured_mode, |maximum| {
+            self.configured_mode.min(maximum)
+        })
+    }
+
+    pub fn encode(self) -> Vec<u8> {
+        vec![
+            u8::from(self.available),
+            self.configured_mode as u8,
+            self.policy_mode.map_or(Self::NO_POLICY, |mode| mode as u8),
+        ]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let [available, configured_mode, policy_mode] = payload else {
+            return Err(LswError::Protocol(
+                "Windows sudo status must contain exactly three bytes".to_owned(),
+            ));
+        };
+        let available = match available {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LswError::Protocol(
+                    "Windows sudo availability must be zero or one".to_owned(),
+                ))
+            }
+        };
+        let configured_mode = WindowsSudoMode::decode(*configured_mode)?;
+        let policy_mode = if *policy_mode == Self::NO_POLICY {
+            None
+        } else {
+            Some(WindowsSudoMode::decode(*policy_mode)?)
+        };
+        Ok(Self {
+            available,
+            configured_mode,
+            policy_mode,
+        })
     }
 }
 
@@ -1105,6 +1209,52 @@ mod tests {
             FrameKind::MaintenanceHibernate
         );
         assert_eq!(FrameKind::MaintenanceHibernate as u8, 33);
+    }
+
+    #[test]
+    fn windows_sudo_protocol_is_append_only_and_strict() {
+        assert_eq!(FrameKind::WindowsSudoQuery as u8, 35);
+        assert_eq!(FrameKind::WindowsSudoConfigure as u8, 36);
+        assert_eq!(FrameKind::WindowsSudoStatus as u8, 37);
+        assert_eq!(
+            FrameKind::try_from(37).expect("Windows sudo status kind should decode"),
+            FrameKind::WindowsSudoStatus
+        );
+
+        for enable in [false, true] {
+            let request = WindowsSudoConfigureRequest { enable };
+            assert_eq!(
+                WindowsSudoConfigureRequest::decode(&request.encode())
+                    .expect("Windows sudo request should decode"),
+                request
+            );
+        }
+        assert!(WindowsSudoConfigureRequest::decode(&[]).is_err());
+        assert!(WindowsSudoConfigureRequest::decode(&[2]).is_err());
+
+        let status = WindowsSudoStatus {
+            available: true,
+            configured_mode: WindowsSudoMode::Normal,
+            policy_mode: Some(WindowsSudoMode::ForceNewWindow),
+        };
+        assert_eq!(
+            WindowsSudoStatus::decode(&status.encode()).expect("Windows sudo status should decode"),
+            status
+        );
+        assert_eq!(status.effective_mode(), WindowsSudoMode::ForceNewWindow);
+        assert_eq!(
+            WindowsSudoStatus {
+                available: true,
+                configured_mode: WindowsSudoMode::Disabled,
+                policy_mode: Some(WindowsSudoMode::ForceNewWindow),
+            }
+            .effective_mode(),
+            WindowsSudoMode::Disabled
+        );
+        assert!(WindowsSudoStatus::decode(&[1, 3]).is_err());
+        assert!(WindowsSudoStatus::decode(&[2, 0, u8::MAX]).is_err());
+        assert!(WindowsSudoStatus::decode(&[1, 4, u8::MAX]).is_err());
+        assert!(WindowsSudoStatus::decode(&[1, 0, 4]).is_err());
     }
 
     #[test]

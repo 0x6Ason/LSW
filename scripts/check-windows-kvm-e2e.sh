@@ -176,6 +176,10 @@ setup_payload_removed=unknown
 automatic_logon=unknown
 desktop_user_registered=unknown
 desktop_user_role=unknown
+separate_administrator_created=unknown
+windows_sudo_force_new_window=unknown
+windows_sudo_policy=unknown
+windows_uac_enabled=unknown
 clone_identity_isolated=unknown
 folder_share_boundaries=unknown
 resource_governor_verified=unknown
@@ -330,6 +334,10 @@ collect_e2e_artifacts() {
         printf 'automatic_logon=%s\n' "$automatic_logon"
         printf 'desktop_user_registered=%s\n' "$desktop_user_registered"
         printf 'desktop_user_role=%s\n' "$desktop_user_role"
+        printf 'separate_administrator_created=%s\n' "$separate_administrator_created"
+        printf 'windows_sudo_force_new_window=%s\n' "$windows_sudo_force_new_window"
+        printf 'windows_sudo_policy=%s\n' "$windows_sudo_policy"
+        printf 'windows_uac_enabled=%s\n' "$windows_uac_enabled"
         printf 'clone_identity_isolated=%s\n' "$clone_identity_isolated"
         printf 'folder_share_boundaries=%s\n' "$folder_share_boundaries"
         printf 'resource_governor_verified=%s\n' "$resource_governor_verified"
@@ -1038,6 +1046,77 @@ if ! grep -F 'default_user_role=administrator' \
     exit 1
 fi
 desktop_user_role=administrator
+secondary_admin='lsw-e2e-admin'
+secondary_admin_password="Lsw!$(tr -d '-' </proc/sys/kernel/random/uuid)8b"
+if ! printf '%s\n' "$secondary_admin_password" | timeout 120s "$lsw" user add "$instance" \
+    --username "$secondary_admin" --password-stdin --administrator; then
+    secondary_admin_password=
+    unset secondary_admin_password
+    echo "error: separate Windows administrator creation failed" >&2
+    exit 1
+fi
+secondary_admin_password=
+unset secondary_admin_password
+secondary_admin_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$User=Get-LocalUser -Name "lsw-e2e-admin"; $Administrators=Get-LocalGroup -SID "S-1-5-32-544"; if (-not $User.Enabled) { exit 88 }; if (-not (Get-LocalGroupMember -Group $Administrators | Where-Object { $_.SID -eq $User.SID })) { exit 89 }; [Console]::Out.Write($User.Name)'
+)
+if [ "$secondary_admin_output" != "$secondary_admin" ] \
+    || ! grep -F "default_user=$desktop_user" \
+        "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null \
+    || grep -F "$secondary_admin" \
+        "$LSW_STATE_DIR/instances/$instance/instance.lsw" >/dev/null
+then
+    echo "error: separate administrator changed the default desktop identity" >&2
+    exit 1
+fi
+separate_administrator_created=true
+sudo_status_before=$("$lsw" sudo status "$instance")
+if printf '%s\n' "$sudo_status_before" | grep -Fx 'Windows sudo: unavailable' >/dev/null; then
+    echo "error: installed Windows 11 image does not provide native sudo" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$sudo_status_before" \
+    | grep -Fx 'System policy: not configured' >/dev/null; then
+    echo "error: disposable Windows guest unexpectedly has a managed sudo policy" >&2
+    exit 1
+fi
+"$lsw" sudo enable "$instance"
+sudo_enabled_status=$("$lsw" sudo status "$instance")
+if ! printf '%s\n' "$sudo_enabled_status" | grep -Fx 'Windows sudo: new window' >/dev/null \
+    || ! printf '%s\n' "$sudo_enabled_status" \
+        | grep -Fx 'Configured mode: new window' >/dev/null \
+    || ! printf '%s\n' "$sudo_enabled_status" \
+        | grep -Fx 'UAC consent: required for elevation' >/dev/null
+then
+    echo "error: Windows sudo did not report the safe new-window configuration" >&2
+    exit 1
+fi
+sudo_registry_output=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$ErrorActionPreference="Stop"; $Sudo=[int](Get-ItemPropertyValue -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" -Name Enabled); $Uac=[int](Get-ItemPropertyValue -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA); $Policy=Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Sudo" -ErrorAction SilentlyContinue; if ($null -ne $Policy -and $null -ne $Policy.PSObject.Properties["Enabled"]) { exit 85 }; if ($Sudo -ne 1) { exit 86 }; if ($Uac -ne 1) { exit 87 }; [Console]::Out.Write("$Sudo|$Uac")'
+)
+if [ "$sudo_registry_output" != '1|1' ]; then
+    echo "error: Windows sudo registry mode or UAC state is incorrect" >&2
+    exit 1
+fi
+"$lsw" sudo disable "$instance"
+sudo_disabled_mode=$(
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '[Console]::Out.Write((Get-ItemPropertyValue -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo" -Name Enabled))'
+)
+if [ "$sudo_disabled_mode" != 0 ]; then
+    echo "error: Windows sudo disable was not reversible" >&2
+    exit 1
+fi
+"$lsw" sudo enable "$instance"
+windows_sudo_force_new_window=true
+windows_sudo_policy=unmanaged
+windows_uac_enabled=true
 user_helper_output=$(
     # PowerShell expands its own variables in the guest.
     # shellcheck disable=SC2016

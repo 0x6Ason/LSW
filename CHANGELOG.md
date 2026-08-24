@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Began beta.8 with explicit Windows desktop account roles and native Windows
+  sudo integration. Interactive personal-development setup recommends an
+  administrator while keeping standard accounts available. `lsw user add`
+  creates a separately confirmed account without changing the desktop default,
+  `lsw user promote|demote` reconciles native membership, and `lsw sudo
+  status|enable|disable` detects the Windows 11 24H2 inbox feature and exposes
+  only the reversible new-window configuration. The one-shot LocalSystem
+  helper refuses managed policy, UAC remains enabled, and no third-party sudo
+  package is installed.
+
 ## 1.0.0-beta.7
 
 - Kept automatic guest-start and resume progress on stderr so scripted

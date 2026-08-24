@@ -81,6 +81,11 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   service account. Standard accounts are the default, administrator membership
   is explicit, AutoLogon remains disabled, and passwords never enter argv,
   environment, LSW manifests, seeds, logs, or diagnostics.
+  `lsw user add` can create a separate confirmed administrator without changing
+  the default desktop identity.
+- Capability-gated Windows 11 native-sudo status and reversible
+  disabled/new-window configuration. Managed policy and UAC remain untouched;
+  no third-party replacement or less-safe console mode is offered.
 - Unix children enter a dedicated process group before `exec`; remaining group
   members are cleaned up after normal leader exit, cancellation, disconnect,
   protocol failure, or lease expiry. Windows children must enter a

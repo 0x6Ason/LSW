@@ -164,7 +164,12 @@ Before that restart, `lsw user setup --password-stdin` must create an enabled
 standard account without administrator membership or AutoLogon. The gate then
 requires promote, demote, and final promote operations to update both the native
 Administrators group and manifest v6 without exposing a password prefix in LSW
-metadata, seeds, or logs.
+metadata, seeds, or logs. A separately authenticated administrator must be
+created without entering or replacing the manifest's default identity. The gate
+then enables native Windows sudo in new-window
+mode, verifies the exact local registry DWORD and `EnableLUA=1`, disables it to
+prove reversibility, and enables the safe mode again. The disposable official
+image must not contain a machine sudo policy.
 
 ## Guest service contract
 

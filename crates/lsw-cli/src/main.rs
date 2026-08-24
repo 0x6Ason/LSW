@@ -16,6 +16,7 @@ mod progress;
 mod shares;
 mod transfer;
 mod user_setup;
+mod windows_sudo;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -121,6 +122,7 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "install" => install_instance(&store, remaining)?,
         "license" => license(&store, remaining)?,
         "user" => user_command(&store, remaining)?,
+        "sudo" => windows_sudo::command(&store, remaining)?,
         "share" => shares::command(&store, remaining)?,
         "start" => start_instance(&store, remaining, LaunchPhase::Run)?,
         "status" => status(&store, remaining)?,
@@ -150,6 +152,7 @@ fn user_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.first().and_then(|value| value.to_str()) {
         Some("setup") => user_setup::command(store, &arguments[1..]),
+        Some("add") => user_setup::add(store, &arguments[1..]),
         Some("promote") => user_setup::set_role(
             store,
             &arguments[1..],
@@ -161,7 +164,7 @@ fn user_command(
             lsw_core::WindowsUserRole::Standard,
         ),
         _ => Err(
-            "usage: lsw user <setup [NAME] [--username USER] [--password-stdin] [--administrator] | promote [NAME] | demote [NAME]>"
+            "usage: lsw user <setup|add> [NAME] [--username USER] [--password-stdin] [--administrator] | lsw user <promote|demote> [NAME]"
                 .into(),
         ),
     }
@@ -2406,8 +2409,10 @@ fn print_help() {
         "              [--unattended-index N] [--without-agent] [--viewer]\n",
         "              [--accept-windows-license] [--defer-user-setup]\n",
         "  lsw user setup [NAME] [--username USER] [--password-stdin] [--administrator]\n",
+        "  lsw user add [NAME] [--username USER] [--password-stdin] [--administrator]\n",
         "  lsw user promote [NAME]\n",
         "  lsw user demote [NAME]\n",
+        "  lsw sudo <status|enable|disable> [NAME]\n",
         "  lsw license status [NAME]\n",
         "  lsw license activate [NAME] [--key-stdin | --online]\n",
         "  lsw license open [NAME]\n",

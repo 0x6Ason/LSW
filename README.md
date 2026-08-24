@@ -161,6 +161,9 @@ lsw sync --watch ./project 'C:\src\project'
 lsw pull 'C:\src\build\app.exe' ./app.exe
 lsw user promote win-dev       # UAC remains enabled
 lsw user demote win-dev
+lsw user add win-dev --username rescue-admin --administrator
+lsw sudo status win-dev
+lsw sudo enable win-dev        # native Windows sudo, new-window mode only
 ```
 
 Interactive installation recommends making the confirmed desktop identity a
@@ -175,6 +178,15 @@ frame to the demand-start LocalSystem `LSWUserHelper`; that helper performs one
 bounded native account operation and exits. AutoLogon remains disabled. Session
 0 CLI commands continue to use the boot-time service identity; beta.8 will use
 the registered identity for visible desktop apps.
+`lsw user add [NAME] --username USER --administrator` can create a separately
+confirmed administrator without changing the default desktop identity.
+
+On Windows 11 24H2 or later, an interactive administrator setup also offers to
+enable the inbox `sudo.exe` in its safer new-window mode. `lsw sudo
+status|enable|disable [NAME]` keeps the choice explicit and reversible. LSW
+does not install a third-party sudo replacement, offer inline/input-closed
+modes, change managed policy, or disable UAC; Windows still presents consent
+when an elevated process is requested.
 
 `lsw exec` and ordinary `lsw run` wait and return guest exit codes 0–255
 unchanged. Windows has a 32-bit exit-code space; when a value cannot be

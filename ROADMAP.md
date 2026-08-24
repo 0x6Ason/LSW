@@ -92,9 +92,12 @@ headless workflows working.
 - Detect the native Windows 11 `sudo.exe` capability and offer explicit opt-in
   enablement using its safer new-window mode. Do not bundle a third-party sudo
   replacement, disable UAC, or treat sudo as a way to bypass Windows consent.
-- The manifest role, native membership reconciliation, install prompt, and
-  explicit promote/demote commands are already implemented on the beta.8
-  development line. Native-sudo detection remains in this slice.
+- Slice 1 is implemented on the beta.8 development line: manifest role and
+  native membership reconciliation, the install prompt, explicit
+  promote/demote and separate-account creation commands, capability-gated
+  native-sudo status, and reversible safe-mode configuration all pass local
+  source gates. The exact Windows/KVM commit gate remains the release acceptance
+  boundary.
 
 ### Slice 2: zero-configuration UX and live Linux folders
 

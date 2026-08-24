@@ -147,20 +147,21 @@ pub(super) fn create_local_user(
         .into());
     }
 
-    if administrator {
-        if let Err(error) = add_to_administrators(&mut user_name) {
-            if created {
-                // SAFETY: user_name remains a live, NUL-terminated UTF-16 string.
-                let _ = unsafe { NetUserDel(std::ptr::null(), user_name.as_ptr()) };
-                return Err(format!(
-                    "could not add the account to Administrators; the new account was removed: {error}"
-                )
-                .into());
-            }
-            return Err(
-                format!("could not add the existing account to Administrators: {error}").into(),
-            );
+    let role_result = if administrator {
+        add_to_administrators(&mut user_name)
+    } else {
+        remove_from_administrators(&mut user_name)
+    };
+    if let Err(error) = role_result {
+        if created {
+            // SAFETY: user_name remains a live, NUL-terminated UTF-16 string.
+            let _ = unsafe { NetUserDel(std::ptr::null(), user_name.as_ptr()) };
+            return Err(format!(
+                "could not assign the requested account role; the new account was removed: {error}"
+            )
+            .into());
         }
+        return Err(format!("could not reconcile the existing account role: {error}").into());
     }
     Ok(())
 }

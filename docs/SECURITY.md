@@ -64,10 +64,20 @@ well-known local Administrators SID and `NetLocalGroupAddMembers`.
 Capability-gated `lsw user promote` and `lsw user demote` use the same one-shot
 helper and `NetLocalGroupAddMembers` or `NetLocalGroupDelMembers`; reading an old
 manifest never changes Windows membership. The helper exits after one request.
+`lsw user add` uses the same credential and role boundary for an additional
+account but never changes or replaces the manifest's default desktop identity.
 Password bytes never enter argv, environment, LSW manifests, seeds, logs, or
 diagnostics, and mutable protocol/UTF-16 buffers are cleared after use. Windows
 retains its normal account verifier, normal administrator processes receive a
 filtered token, UAC remains enabled, and Windows AutoLogon is never configured.
+
+Native Windows sudo is a separate capability-gated fixed operation. The normal
+agent asks `LSWMaintenanceHelper` to read the inbox binary and the documented
+local and policy registry values. LSW can set only disabled or new-window mode,
+refuses every write when a machine policy is present, verifies the readback,
+and exits the helper after one request. It never exposes the input-closed or
+inline modes and never changes UAC. `sudo.exe` still requests Windows consent;
+it is not an elevation bypass or a substitute for the beta.8 UAC UI boundary.
 
 The QEMU host forward binds only to `127.0.0.1`. The Windows firewall rule allows
 guest port 35040 only from the QEMU user-network host address. Authentication is

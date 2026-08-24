@@ -17,10 +17,11 @@ use lsw_core::{
     write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest,
     ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions, SessionSignal,
     StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest, UserSetRoleRequest,
-    AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1,
-    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
+    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
     CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
     CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1,
+    CAPABILITY_WINDOWS_SUDO_V1,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
@@ -134,6 +135,38 @@ impl AgentClient {
             FrameKind::Pong if response.payload.is_empty() => Ok(()),
             FrameKind::Error => Err(agent_error(&response.payload).into()),
             _ => Err("agent returned an invalid maintenance response".into()),
+        }
+    }
+
+    pub fn windows_sudo_status(mut self) -> Result<WindowsSudoStatus, Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_WINDOWS_SUDO_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::WindowsSudoQuery, Vec::new()),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::WindowsSudoStatus => Ok(WindowsSudoStatus::decode(&response.payload)?),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid Windows sudo status response".into()),
+        }
+    }
+
+    pub fn configure_windows_sudo(
+        mut self,
+        enable: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_WINDOWS_SUDO_V1)?;
+        let request = WindowsSudoConfigureRequest { enable };
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::WindowsSudoConfigure, request.encode()),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::Pong if response.payload.is_empty() => Ok(()),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid Windows sudo configuration response".into()),
         }
     }
 
@@ -895,6 +928,66 @@ mod tests {
         .trim()
         .expect("trim should succeed");
         server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn windows_sudo_status_is_capability_gated_and_strictly_decoded() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let expected = WindowsSudoStatus {
+            available: true,
+            configured_mode: lsw_core::WindowsSudoMode::ForceNewWindow,
+            policy_mode: None,
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let request = read_frame(&mut stream).expect("sudo query should arrive");
+            assert_eq!(request.kind, FrameKind::WindowsSudoQuery);
+            assert!(request.payload.is_empty());
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::WindowsSudoStatus, expected.encode()),
+            )
+            .expect("sudo status should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let actual = AgentClient {
+            stream,
+            capabilities: vec![CAPABILITY_WINDOWS_SUDO_V1.to_owned()],
+        }
+        .windows_sudo_status()
+        .expect("sudo status should succeed");
+        assert_eq!(actual, expected);
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn windows_sudo_configuration_exposes_only_enable_or_disable() {
+        for enable in [false, true] {
+            let listener =
+                std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+            let address = listener.local_addr().expect("listener should have address");
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("client should connect");
+                let request = read_frame(&mut stream).expect("sudo configuration should arrive");
+                assert_eq!(request.kind, FrameKind::WindowsSudoConfigure);
+                assert_eq!(
+                    WindowsSudoConfigureRequest::decode(&request.payload)
+                        .expect("sudo configuration should decode"),
+                    WindowsSudoConfigureRequest { enable }
+                );
+                write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))
+                    .expect("sudo configuration response should be sent");
+            });
+            let stream = TcpStream::connect(address).expect("fixture should connect");
+            AgentClient {
+                stream,
+                capabilities: vec![CAPABILITY_WINDOWS_SUDO_V1.to_owned()],
+            }
+            .configure_windows_sudo(enable)
+            .expect("sudo configuration should succeed");
+            server.join().expect("fixture should not panic");
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 
-const COMMANDS: &str = "bench clone compact completion config create daemon diagnose doctor exec help hibernate image inspect install license list logs media memory path plan prepare profile pull push remove resume run seed share shell show shutdown start status stop suspend sync trim use user version view";
+const COMMANDS: &str = "bench clone compact completion config create daemon diagnose doctor exec help hibernate image inspect install license list logs media memory path plan prepare profile pull push remove resume run seed share shell show shutdown start status stop sudo suspend sync trim use user version view";
 
 pub(super) fn command(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let [shell] = arguments else {
@@ -38,6 +38,8 @@ fn bash() -> String {
     case "${{COMP_WORDS[1]}}" in
         completion) COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- "$cur") ); return ;;
         path) COMPREPLY=( $(compgen -W "--windows -w --unix -u" -- "$cur") ); return ;;
+        sudo) if (( COMP_CWORD == 2 )); then COMPREPLY=( $(compgen -W "status enable disable" -- "$cur") ); return; fi ;;
+        user) if (( COMP_CWORD == 2 )); then COMPREPLY=( $(compgen -W "setup add promote demote" -- "$cur") ); return; fi ;;
     esac
     instances="$(lsw list 2>/dev/null | awk 'NR > 1 {{print $1}}')"
     COMPREPLY=( $(compgen -W "$instances" -- "$cur") )
@@ -60,6 +62,8 @@ _lsw() {{
   case $words[2] in
     completion) _values 'shell' bash zsh fish powershell; return ;;
     path) _values 'direction' --windows -w --unix -u; return ;;
+    sudo) if (( CURRENT == 3 )); then _values 'action' status enable disable; return; fi ;;
+    user) if (( CURRENT == 3 )); then _values 'action' setup add promote demote; return; fi ;;
   esac
   instances=(${{(f)"$(lsw list 2>/dev/null | awk 'NR > 1 {{print $1}}')"}})
   _describe 'instance' instances
@@ -79,7 +83,7 @@ fn fish() -> String {
         ));
     }
     output.push_str(
-        "complete -c lsw -n 'not __fish_use_subcommand' -a '(__lsw_instances)'\ncomplete -c lsw -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish powershell'\ncomplete -c lsw -n '__fish_seen_subcommand_from path' -a '--windows -w --unix -u'\n",
+        "complete -c lsw -n 'not __fish_use_subcommand' -a '(__lsw_instances)'\ncomplete -c lsw -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish powershell'\ncomplete -c lsw -n '__fish_seen_subcommand_from path' -a '--windows -w --unix -u'\ncomplete -c lsw -n '__fish_seen_subcommand_from sudo' -a 'status enable disable'\ncomplete -c lsw -n '__fish_seen_subcommand_from user' -a 'setup add promote demote'\n",
     );
     output
 }
@@ -96,6 +100,10 @@ fn powershell() -> String {
         $candidates = @('bash', 'zsh', 'fish', 'powershell')
     }} elseif ($elements[1].Value -eq 'path') {{
         $candidates = @('--windows', '-w', '--unix', '-u')
+    }} elseif ($elements[1].Value -eq 'sudo' -and $elements.Count -le 3) {{
+        $candidates = @('status', 'enable', 'disable')
+    }} elseif ($elements[1].Value -eq 'user' -and $elements.Count -le 3) {{
+        $candidates = @('setup', 'add', 'promote', 'demote')
     }} else {{
         $candidates = @(lsw list 2>$null | Select-Object -Skip 1 | ForEach-Object {{ ($_ -split '\s+')[0] }})
     }}
@@ -116,6 +124,9 @@ mod tests {
         for script in [bash(), zsh(), fish(), powershell()] {
             assert!(script.contains("install"));
             assert!(script.contains("sync"));
+            assert!(script.contains("sudo"));
+            assert!(script.contains("enable"));
+            assert!(script.contains("disable"));
             assert!(script.contains("lsw list"));
         }
     }

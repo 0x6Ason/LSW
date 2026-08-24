@@ -75,15 +75,19 @@ validation claims in the beta.7 release.
    choice. The normal agent forwards one authenticated loopback request to the
    demand-start LocalSystem `LSWUserHelper`, which calls native Windows NetAPI
    and exits. Capability-gated promote and demote operations use the same
-   one-request boundary; old manifests migrate as standard without changing the
-   guest. Automation must defer or invoke the stdin-only recovery path. Normal
+   one-request boundary, while `lsw user add` creates an additional confirmed
+   account without changing the manifest default; old manifests migrate as
+   standard without changing the guest. Automation must defer or invoke the
+   stdin-only recovery path. Normal
    applications remain filtered, UAC remains enabled, and AutoLogon is never
    enabled.
    Visible desktop GUI work still requires the beta.8 user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
-   Storage retrim and Windows hibernation follow the same boundary through
-   `LSWMaintenanceHelper`, which accepts only empty fixed-operation frames and
+   Storage retrim, Windows hibernation, and native Windows-sudo inspection use
+   the same boundary through `LSWMaintenanceHelper`. Sudo configuration accepts
+   only the protocol's boolean disabled/new-window request, refuses managed
+   policy, verifies native registry readback, and preserves UAC. The helper
    exits after one LocalSystem operation.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise

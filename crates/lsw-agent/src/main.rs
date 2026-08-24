@@ -22,17 +22,18 @@ use lsw_core::{
     encode_process_id, read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame,
     FrameKind, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
     SessionOptions, SessionSignal, StartRequest, TerminalStartRequest, UserCreateRequest,
-    UserSetRoleRequest, AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1,
-    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
-    CAPABILITY_SESSION_SIGNAL_V1, SESSION_CANCEL_EXIT_CODE,
+    UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_GUEST_PORT,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
+    SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
 use lsw_core::{
     TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
     CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
-    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CLONE_IDENTITY_MARKER_FILE,
-    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT,
-    MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
+    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
+    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -489,6 +490,7 @@ fn handle_maintenance_helper_connection(
         capabilities: vec![
             CAPABILITY_MAINTENANCE_TRIM_V1.to_owned(),
             CAPABILITY_MAINTENANCE_HIBERNATE_V1.to_owned(),
+            CAPABILITY_WINDOWS_SUDO_V1.to_owned(),
         ],
     };
     write_frame(
@@ -497,19 +499,18 @@ fn handle_maintenance_helper_connection(
     )?;
 
     let mut frame = read_frame(stream)?;
-    if !matches!(
-        frame.kind,
-        FrameKind::MaintenanceTrim | FrameKind::MaintenanceHibernate
-    ) || !frame.payload.is_empty()
-    {
-        frame.payload.fill(0);
-        send_error(
-            stream,
-            "maintenance helper accepts only empty fixed-operation requests",
-        )?;
-        return Ok(true);
-    }
     match frame.kind {
+        FrameKind::MaintenanceTrim
+        | FrameKind::MaintenanceHibernate
+        | FrameKind::WindowsSudoQuery
+            if !frame.payload.is_empty() =>
+        {
+            frame.payload.fill(0);
+            send_error(
+                stream,
+                "this fixed maintenance request must have an empty payload",
+            )?;
+        }
         FrameKind::MaintenanceTrim => match perform_windows_trim() {
             Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
             Err(error) => send_error(stream, &error.to_string())?,
@@ -521,7 +522,35 @@ fn handle_maintenance_helper_connection(
             }
             Err(error) => send_error(stream, &error.to_string())?,
         },
-        _ => unreachable!("maintenance request kind was validated"),
+        FrameKind::WindowsSudoQuery => match windows_sudo::status() {
+            Ok(status) => write_frame(
+                stream,
+                &Frame::new(FrameKind::WindowsSudoStatus, status.encode()),
+            )?,
+            Err(error) => send_error(stream, &error.to_string())?,
+        },
+        FrameKind::WindowsSudoConfigure => {
+            let request = match WindowsSudoConfigureRequest::decode(&frame.payload) {
+                Ok(request) => request,
+                Err(error) => {
+                    frame.payload.fill(0);
+                    send_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            };
+            frame.payload.fill(0);
+            match windows_sudo::configure(request.enable) {
+                Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+                Err(error) => send_error(stream, &error.to_string())?,
+            }
+        }
+        _ => {
+            frame.payload.fill(0);
+            send_error(
+                stream,
+                "maintenance helper accepts only fixed maintenance and Windows sudo requests",
+            )?;
+        }
     }
     Ok(true)
 }
@@ -1234,6 +1263,12 @@ fn handle_connection(
         FrameKind::MaintenanceTrim => {
             maintenance_trim(stream, &request_frame.payload, expected_token)
         }
+        FrameKind::WindowsSudoQuery => {
+            windows_sudo_query(stream, &request_frame.payload, expected_token)
+        }
+        FrameKind::WindowsSudoConfigure => {
+            windows_sudo_configure(stream, &request_frame.payload, expected_token)
+        }
         _ => {
             send_error(&mut stream, "unsupported request after HELLO")?;
             Err("client sent an unsupported request after authentication".into())
@@ -1262,6 +1297,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_USER_ACCOUNT_V1.to_owned());
         capabilities.push(CAPABILITY_USER_ACCOUNT_ROLE_V1.to_owned());
         capabilities.push(CAPABILITY_MAINTENANCE_TRIM_V1.to_owned());
+        capabilities.push(CAPABILITY_WINDOWS_SUDO_V1.to_owned());
         capabilities
     };
     capabilities
@@ -1417,6 +1453,62 @@ fn maintenance_trim(
     Ok(())
 }
 
+fn windows_sudo_query(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !payload.is_empty() {
+        send_error(&mut stream, "WINDOWS_SUDO_QUERY payload must be empty")?;
+        return Err("client sent an invalid Windows sudo query".into());
+    }
+    #[cfg(windows)]
+    let result = forward_windows_sudo_query(expected_token);
+    #[cfg(not(windows))]
+    let result: Result<WindowsSudoStatus, Box<dyn std::error::Error>> = {
+        let _ = expected_token;
+        Err("Windows sudo is unavailable on this platform".into())
+    };
+    match result {
+        Ok(status) => write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::WindowsSudoStatus, status.encode()),
+        )?,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn windows_sudo_configure(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match WindowsSudoConfigureRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_windows_sudo_configure(expected_token, request);
+    #[cfg(not(windows))]
+    let result: Result<(), Box<dyn std::error::Error>> = {
+        let _ = (expected_token, request);
+        Err("Windows sudo is unavailable on this platform".into())
+    };
+    if let Err(error) = result {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Ok(())
+}
+
 #[cfg(windows)]
 fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::error::Error>> {
     forward_maintenance_operation(
@@ -1438,6 +1530,50 @@ fn forward_maintenance_operation(
     ) {
         return Err("invalid fixed maintenance operation".into());
     }
+    let mut stream = connect_maintenance_helper(expected_token, required_capability)?;
+    write_frame(&mut stream, &Frame::new(request_kind, Vec::new()))?;
+    read_maintenance_fixed_response(&mut stream)
+}
+
+#[cfg(windows)]
+fn forward_windows_sudo_query(
+    expected_token: &str,
+) -> Result<WindowsSudoStatus, Box<dyn std::error::Error>> {
+    let mut stream = connect_maintenance_helper(expected_token, CAPABILITY_WINDOWS_SUDO_V1)?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::WindowsSudoQuery, Vec::new()),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::WindowsSudoStatus => Ok(WindowsSudoStatus::decode(&response.payload)?),
+        FrameKind::Error => Err(format!(
+            "Windows maintenance helper refused the sudo query: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows maintenance helper returned an invalid sudo status".into()),
+    }
+}
+
+#[cfg(windows)]
+fn forward_windows_sudo_configure(
+    expected_token: &str,
+    request: WindowsSudoConfigureRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut stream = connect_maintenance_helper(expected_token, CAPABILITY_WINDOWS_SUDO_V1)?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::WindowsSudoConfigure, request.encode()),
+    )?;
+    read_maintenance_fixed_response(&mut stream)
+}
+
+#[cfg(windows)]
+fn connect_maintenance_helper(
+    expected_token: &str,
+    required_capability: &str,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let mut stream = connect_windows_helper(
         MAINTENANCE_HELPER_SERVICE,
         MAINTENANCE_HELPER_PORT,
@@ -1463,8 +1599,14 @@ fn forward_maintenance_operation(
     {
         return Err("Windows maintenance helper returned incompatible capabilities".into());
     }
-    write_frame(&mut stream, &Frame::new(request_kind, Vec::new()))?;
-    let response = read_frame(&mut stream)?;
+    Ok(stream)
+}
+
+#[cfg(windows)]
+fn read_maintenance_fixed_response(
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = read_frame(stream)?;
     match response.kind {
         FrameKind::Pong if response.payload.is_empty() => Ok(()),
         FrameKind::Error => Err(format!(
@@ -2728,6 +2870,10 @@ mod windows_maintenance_service;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_service;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_sudo;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
