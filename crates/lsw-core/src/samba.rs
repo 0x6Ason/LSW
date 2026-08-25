@@ -126,6 +126,7 @@ fn samba_config(runtime: &Path, share_root: &Path, unix_user: &str) -> Result<St
          \tncalrpc dir = {runtime}/ncalrpc\n\
          \tlog file = {runtime}/log.smbd\n\
          \tmax log size = 1024\n\
+         \tlog level = 1 auth:2\n\
          \tserver role = standalone server\n\
          \tsecurity = user\n\
          \tmap to guest = Never\n\

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use lsw_core::{
     FolderShare, FolderShareMode, FolderShareTransport, HostCapabilities, InstanceState,
-    LaunchPhase, StateStore,
+    LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
 };
 
 use super::daemon_client::DaemonClient;
@@ -150,6 +150,7 @@ fn add_live_path(
     store.update(&manifest)?;
     let result = restart_and_configure(store, name, true);
     if let Err(error) = result {
+        let samba_diagnostic = live_samba_failure_context(store, name);
         let mut rollback = store.load(name)?;
         rollback.folder_shares.retain(|item| {
             !(item.name == share.name && item.transport == FolderShareTransport::LiveSmb)
@@ -157,7 +158,7 @@ fn add_live_path(
         store.update(&rollback)?;
         let _ = restart_instance(store, name);
         return Err(format!(
-            "could not mount Linux (L:); the live export was rolled back: {error}"
+            "could not mount Linux (L:); the live export was rolled back: {error}{samba_diagnostic}"
         )
         .into());
     }
@@ -167,6 +168,54 @@ fn add_live_path(
         share.host_path.display()
     );
     Ok(())
+}
+
+fn live_samba_failure_context(store: &StateStore, name: &str) -> String {
+    let Ok(instance_dir) = store.instance_dir(name) else {
+        return String::new();
+    };
+    let log_path = instance_dir
+        .join("run")
+        .join(LIVE_SMB_RUNTIME_DIRECTORY)
+        .join("log.smbd");
+    let Ok(log) = fs::read(log_path) else {
+        return String::new();
+    };
+    let credential = store.read_agent_token(name).ok();
+    summarize_samba_log(&log, credential.as_deref())
+        .map(|summary| format!("\nSamba diagnostic (redacted):\n{summary}"))
+        .unwrap_or_default()
+}
+
+fn summarize_samba_log(log: &[u8], credential: Option<&str>) -> Option<String> {
+    const MAX_LOG_BYTES: usize = 16 * 1024;
+    const MAX_LINES: usize = 20;
+    const MAX_LINE_CHARS: usize = 600;
+
+    let start = log.len().saturating_sub(MAX_LOG_BYTES);
+    let text = String::from_utf8_lossy(&log[start..]);
+    let mut lines = text
+        .lines()
+        .filter_map(|line| {
+            let sanitized: String = line
+                .chars()
+                .filter(|character| !character.is_control() || *character == '\t')
+                .take(MAX_LINE_CHARS)
+                .collect();
+            (!sanitized.trim().is_empty()).then_some(sanitized)
+        })
+        .collect::<Vec<_>>();
+    if lines.len() > MAX_LINES {
+        lines.drain(..lines.len() - MAX_LINES);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut summary = lines.join("\n");
+    if let Some(credential) = credential {
+        summary = summary.replace(credential, "<redacted>");
+    }
+    Some(summary)
 }
 
 fn add(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
@@ -516,5 +565,20 @@ mod tests {
         set_mode(&mut mode, FolderShareMode::ReadOnly).unwrap();
         assert_eq!(mode, Some(FolderShareMode::ReadOnly));
         assert!(set_mode(&mut mode, FolderShareMode::ReadWrite).is_err());
+    }
+
+    #[test]
+    fn samba_diagnostic_is_bounded_and_redacts_the_credential() {
+        let credential = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut log = (0..30)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        log.push_str(&format!("\nauth token {credential}\n"));
+        let summary = summarize_samba_log(log.as_bytes(), Some(credential)).unwrap();
+        assert!(!summary.contains(credential));
+        assert!(summary.contains("<redacted>"));
+        assert!(summary.lines().count() <= 20);
+        assert!(!summary.contains("line 0"));
     }
 }

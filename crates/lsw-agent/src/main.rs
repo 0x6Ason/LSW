@@ -611,9 +611,8 @@ fn configure_windows_live_share(
     {
         return Err("live-share credential must be 64 lowercase hexadecimal characters".into());
     }
-    let script = if enable {
-        r#"$ErrorActionPreference='Stop'
-$Remote='\\10.0.2.4\qemu'
+    let body = if enable {
+        r#"$Remote='\\10.0.2.4\qemu'
 $Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
 if ($null -ne $Mapping -and $Mapping.RemotePath -ne $Remote) {
     throw 'Windows drive L: is already mapped to a different location'
@@ -627,10 +626,8 @@ $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L\De
 New-Item -Path $Label -Force | Out-Null
 Set-Item -Path $Label -Value 'Linux'
 "#
-        .to_owned()
     } else {
-        r#"$ErrorActionPreference='Stop'
-$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+        r#"$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
 if ($null -ne $Mapping) {
     if ($Mapping.RemotePath -ne '\\10.0.2.4\qemu') {
         throw 'Windows drive L: is mapped to a location not owned by LSW'
@@ -640,8 +637,11 @@ if ($null -ne $Mapping) {
 $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
 Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue
 "#
-        .to_owned()
     };
+    let script = format!(
+        "$ErrorActionPreference='Stop'\ntry {{\n{body}}} catch {{\n\
+         [Console]::Error.WriteLine(($_ | Out-String))\nexit 1\n}}\n"
+    );
     let code = run_fixed_powershell_inner(&script, enable.then_some(credential))?;
     if code == 0 {
         Ok(())
@@ -664,7 +664,7 @@ fn run_fixed_powershell_inner(
     command
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(credential) = credential {
         command.env("LSW_LIVE_SMB_CREDENTIAL", credential);
@@ -676,12 +676,22 @@ fn run_fixed_powershell_inner(
         .ok_or("Windows PowerShell standard input was unavailable")?
         .write_all(script.as_bytes())?;
     let output = child.wait_with_output()?;
-    if output.stderr.len() > 64 * 1024 {
+    if output.stdout.len().saturating_add(output.stderr.len()) > 64 * 1024 {
         return Err("Windows live-share operation returned an oversized error".into());
     }
     if !output.status.success() && !matches!(output.status.code(), Some(3 | 4)) {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Windows live-share operation failed: {}", detail.trim()).into());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut detail = match (stdout.trim(), stderr.trim()) {
+            ("", "") => format!("PowerShell exited with {}", output.status),
+            (stdout, "") => stdout.to_owned(),
+            ("", stderr) => stderr.to_owned(),
+            (stdout, stderr) => format!("{stderr}\n{stdout}"),
+        };
+        if let Some(credential) = credential {
+            detail = detail.replace(credential, "<redacted>");
+        }
+        return Err(format!("Windows live-share operation failed: {detail}").into());
     }
     Ok(output.status.code().unwrap_or(-1))
 }
