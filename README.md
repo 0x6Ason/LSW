@@ -309,9 +309,10 @@ lsw remove win-dev
 ```
 
 `lsw trim` and the fixed Windows hibernation transition cross the privilege
-boundary through the authenticated, demand-start `LSWMaintenanceHelper`. That
-LocalSystem service accepts only empty retrim or hibernate request kinds and
-exits after one operation; ordinary commands still run as the restricted
+boundary through the authenticated, demand-start `LSWMaintenanceHelper`. Those
+operations remain one-shot. While `Linux (L:)` is mounted, the same helper stays
+alive only to retain the Windows global-mapping logon session, then exits after
+authenticated unmount. Ordinary commands still run as the restricted
 `NT SERVICE\LSWAgent` identity.
 
 ## Windows activation

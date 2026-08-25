@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Fixed native Windows sudo configuration for the one-shot maintenance helper.
+//! Fixed native Windows sudo configuration for the privileged maintenance helper.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 

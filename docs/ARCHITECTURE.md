@@ -197,10 +197,12 @@ Manifest version 7 distinguishes the existing `mirror` transport from one
 `live-smb` root. Older manifests migrate every share to `mirror`. On a normal
 run, the planner re-canonicalizes the live root, rejects symlinks, and adds it
 only to that instance's QEMU user-network backend. The Windows agent forwards a
-fixed mapping request to the existing one-shot LocalSystem maintenance helper;
-the resulting global `Linux (L:)` drive is available to service and interactive
-sessions. Adding or removing the root performs a graceful restart because the
-QEMU SMB root is immutable after launch.
+fixed mapping request to the demand-start LocalSystem maintenance helper. The
+helper retains its SCM logon session only while the resulting global `Linux
+(L:)` mapping exists, so the drive remains available to service and interactive
+sessions; authenticated unmount removes the mapping and ends the helper. Adding
+or removing the root performs a graceful restart because the QEMU SMB root is
+immutable after launch.
 
 On Unix the child enters a new process group in the pre-`exec` path. LSW signals
 that group after a normal leader exit and on cancellation, disconnect, protocol

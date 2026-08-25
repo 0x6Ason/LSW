@@ -427,6 +427,13 @@ fn handle_user_helper_connection(
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MaintenanceHelperConnectionOutcome {
+    Unauthenticated,
+    Authenticated { live_share_active: Option<bool> },
+}
+
+#[cfg(windows)]
 fn run_maintenance_helper(
     configuration: Configuration,
     ready: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
@@ -436,19 +443,34 @@ fn run_maintenance_helper(
     listener.set_nonblocking(true)?;
     ready()?;
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut live_share_active = false;
     loop {
         match listener.accept() {
             Ok((mut stream, peer)) if peer.ip().is_loopback() => {
                 stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(10)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-                if handle_maintenance_helper_connection(&mut stream, &token)? {
-                    return Ok(());
+                match handle_maintenance_helper_connection(&mut stream, &token) {
+                    Ok(MaintenanceHelperConnectionOutcome::Unauthenticated) => {}
+                    Ok(MaintenanceHelperConnectionOutcome::Authenticated {
+                        live_share_active: updated,
+                    }) => {
+                        if let Some(updated) = updated {
+                            live_share_active = updated;
+                        }
+                        if !live_share_active {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) if live_share_active => write_stderr(format_args!(
+                        "lsw-agent: live-share helper request failed: {error}"
+                    )),
+                    Err(error) => return Err(error),
                 }
             }
             Ok((_, _)) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                if !live_share_active && Instant::now() >= deadline {
                     return Err(
                         "Windows maintenance helper timed out without an authenticated request"
                             .into(),
@@ -465,11 +487,11 @@ fn run_maintenance_helper(
 fn handle_maintenance_helper_connection(
     stream: &mut TcpStream,
     expected_token: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<MaintenanceHelperConnectionOutcome, Box<dyn std::error::Error>> {
     let mut hello_frame = read_frame(stream)?;
     if hello_frame.kind != FrameKind::Hello {
         send_error(stream, "the first maintenance-helper frame must be HELLO")?;
-        return Ok(false);
+        return Ok(MaintenanceHelperConnectionOutcome::Unauthenticated);
     }
     let hello = ClientHello::decode(&hello_frame.payload);
     hello_frame.payload.fill(0);
@@ -477,14 +499,14 @@ fn handle_maintenance_helper_connection(
         Ok(hello) => hello,
         Err(error) => {
             send_error(stream, &error.to_string())?;
-            return Ok(false);
+            return Ok(MaintenanceHelperConnectionOutcome::Unauthenticated);
         }
     };
     if hello.version != AGENT_PROTOCOL_VERSION
         || !constant_time_token_eq(&hello.token, expected_token)
     {
         send_error(stream, "maintenance-helper authentication failed")?;
-        return Ok(false);
+        return Ok(MaintenanceHelperConnectionOutcome::Unauthenticated);
     }
     let server_hello = ServerHello {
         version: AGENT_PROTOCOL_VERSION,
@@ -501,7 +523,7 @@ fn handle_maintenance_helper_connection(
     )?;
 
     let mut frame = read_frame(stream)?;
-    match frame.kind {
+    let live_share_active = match frame.kind {
         FrameKind::MaintenanceTrim
         | FrameKind::MaintenanceHibernate
         | FrameKind::WindowsSudoQuery
@@ -513,24 +535,41 @@ fn handle_maintenance_helper_connection(
                 stream,
                 "this fixed maintenance request must have an empty payload",
             )?;
+            None
         }
         FrameKind::MaintenanceTrim => match perform_windows_trim() {
-            Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
-            Err(error) => send_error(stream, &error.to_string())?,
+            Ok(()) => {
+                write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+                None
+            }
+            Err(error) => {
+                send_error(stream, &error.to_string())?;
+                None
+            }
         },
         FrameKind::MaintenanceHibernate => match enable_windows_hibernation() {
             Ok(()) => {
                 write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
                 request_windows_hibernation()?;
+                None
             }
-            Err(error) => send_error(stream, &error.to_string())?,
+            Err(error) => {
+                send_error(stream, &error.to_string())?;
+                None
+            }
         },
         FrameKind::WindowsSudoQuery => match windows_sudo::status() {
-            Ok(status) => write_frame(
-                stream,
-                &Frame::new(FrameKind::WindowsSudoStatus, status.encode()),
-            )?,
-            Err(error) => send_error(stream, &error.to_string())?,
+            Ok(status) => {
+                write_frame(
+                    stream,
+                    &Frame::new(FrameKind::WindowsSudoStatus, status.encode()),
+                )?;
+                None
+            }
+            Err(error) => {
+                send_error(stream, &error.to_string())?;
+                None
+            }
         },
         FrameKind::WindowsSudoConfigure => {
             let request = match WindowsSudoConfigureRequest::decode(&frame.payload) {
@@ -538,7 +577,9 @@ fn handle_maintenance_helper_connection(
                 Err(error) => {
                     frame.payload.fill(0);
                     send_error(stream, &error.to_string())?;
-                    return Ok(true);
+                    return Ok(MaintenanceHelperConnectionOutcome::Authenticated {
+                        live_share_active: None,
+                    });
                 }
             };
             frame.payload.fill(0);
@@ -546,13 +587,21 @@ fn handle_maintenance_helper_connection(
                 Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
                 Err(error) => send_error(stream, &error.to_string())?,
             }
+            None
         }
         FrameKind::LiveShareQuery => match query_windows_live_share() {
-            Ok(status) => write_frame(
-                stream,
-                &Frame::new(FrameKind::LiveShareStatus, status.encode()),
-            )?,
-            Err(error) => send_error(stream, &error.to_string())?,
+            Ok(status) => {
+                let mapped = status.mapped;
+                write_frame(
+                    stream,
+                    &Frame::new(FrameKind::LiveShareStatus, status.encode()),
+                )?;
+                Some(mapped)
+            }
+            Err(error) => {
+                send_error(stream, &error.to_string())?;
+                None
+            }
         },
         FrameKind::LiveShareConfigure => {
             let request = match LiveShareConfigureRequest::decode(&frame.payload) {
@@ -560,13 +609,21 @@ fn handle_maintenance_helper_connection(
                 Err(error) => {
                     frame.payload.fill(0);
                     send_error(stream, &error.to_string())?;
-                    return Ok(true);
+                    return Ok(MaintenanceHelperConnectionOutcome::Authenticated {
+                        live_share_active: None,
+                    });
                 }
             };
             frame.payload.fill(0);
             match configure_windows_live_share(request.enable, expected_token) {
-                Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
-                Err(error) => send_error(stream, &error.to_string())?,
+                Ok(()) => {
+                    write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+                    Some(request.enable)
+                }
+                Err(error) => {
+                    send_error(stream, &error.to_string())?;
+                    None
+                }
             }
         }
         _ => {
@@ -575,9 +632,10 @@ fn handle_maintenance_helper_connection(
                 stream,
                 "maintenance helper accepts only fixed maintenance, Windows sudo, and live-share requests",
             )?;
+            None
         }
-    }
-    Ok(true)
+    };
+    Ok(MaintenanceHelperConnectionOutcome::Authenticated { live_share_active })
 }
 
 #[cfg(windows)]
