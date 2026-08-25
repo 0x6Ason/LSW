@@ -200,8 +200,8 @@ only to that instance's QEMU user-network backend. The Windows agent forwards a
 fixed mapping request to the demand-start LocalSystem maintenance helper. The
 helper retains the fixed PowerShell process that owns the resulting global
 `Linux (L:)` mapping, so the drive remains available to service and interactive
-sessions. The keeper accepts only an internal unmount control line;
-authenticated unmount removes the mapping and ends both processes. Adding or
+sessions. The keeper accepts no command input; authenticated unmount terminates
+the fixed child, removes the owned mapping, and ends the helper. Adding or
 removing the root performs a graceful restart because the QEMU SMB root is
 immutable after launch.
 

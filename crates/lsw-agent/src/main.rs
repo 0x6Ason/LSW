@@ -655,36 +655,32 @@ try {
     Set-Item -Path $Label -Value 'Linux'
     [Console]::Out.WriteLine('LSW_LIVE_READY')
     [Console]::Out.Flush()
-    if ([Console]::In.ReadLine() -ne 'UNMOUNT') {
-        throw 'LSW live-share keeper received an invalid control request'
+    $Credential=$null
+    $Password=$null
+    while ($true) {
+        Start-Sleep -Seconds 86400
     }
-    $Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
-    if ($null -ne $Mapping) {
-        if ($Mapping.RemotePath -ne $Remote) {
-            throw 'Windows drive L: is mapped to a location not owned by LSW'
-        }
-        Remove-SmbMapping -GlobalMapping -LocalPath 'L:' -Force
-    }
-    $LabelRoot='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
-    Remove-Item -LiteralPath $LabelRoot -Recurse -Force -ErrorAction SilentlyContinue
 } catch {
     [Console]::Error.WriteLine(($_ | Out-String))
     exit 1
 }
 "#;
+        // Keep the same stdin-hosted invocation used by fixed one-shot
+        // operations. Under the SCM LocalSystem context, the SMB client cmdlet
+        // rejects a direct script command line with Windows error 1312.
         let mut child = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-            ])
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"])
             .env("LSW_LIVE_SMB_CREDENTIAL", credential)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Windows live-share keeper stdin was unavailable")?;
+        stdin.write_all(script.as_bytes())?;
+        drop(stdin);
         let mut stdout = BufReader::new(
             child
                 .stdout
@@ -722,26 +718,11 @@ try {
             .child
             .take()
             .ok_or("Windows live-share keeper process was unavailable")?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or("Windows live-share keeper stdin was unavailable")?;
-        stdin.write_all(b"UNMOUNT\n")?;
-        stdin.flush()?;
-        drop(stdin);
-        let output = child.wait_with_output()?;
-        if output.stdout.len().saturating_add(output.stderr.len()) > 64 * 1024 {
-            return Err("Windows live-share unmount returned an oversized error".into());
+        if child.try_wait()?.is_none() {
+            child.kill()?;
+            child.wait()?;
         }
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Windows live-share keeper could not unmount Linux (L:): {}",
-                format_powershell_output(&output)
-            )
-            .into())
-        }
+        remove_windows_live_share_mapping()
     }
 }
 
@@ -751,19 +732,11 @@ impl Drop for LiveShareKeeper {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(b"UNMOUNT\n");
-            let _ = stdin.flush();
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
         }
-        for _ in 0..20 {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(_) => break,
-            }
-        }
-        let _ = child.kill();
         let _ = child.wait();
+        let _ = remove_windows_live_share_mapping();
     }
 }
 
@@ -801,6 +774,11 @@ fn configure_windows_live_share(
     if let Some(keeper) = live_share_keeper.take() {
         return keeper.stop();
     }
+    remove_windows_live_share_mapping()
+}
+
+#[cfg(windows)]
+fn remove_windows_live_share_mapping() -> Result<(), Box<dyn std::error::Error>> {
     let body = r#"$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
 if ($null -ne $Mapping) {
     if ($Mapping.RemotePath -ne '\\10.0.2.4\qemu') {

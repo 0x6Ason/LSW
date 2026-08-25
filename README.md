@@ -311,9 +311,9 @@ lsw remove win-dev
 `lsw trim` and the fixed Windows hibernation transition cross the privilege
 boundary through the authenticated, demand-start `LSWMaintenanceHelper`. Those
 operations remain one-shot. While `Linux (L:)` is mounted, the same helper stays
-alive with a fixed PowerShell mapping keeper, then exits after authenticated
-unmount. The keeper accepts only the internal unmount control line; ordinary
-commands still run as the restricted
+alive with a fixed PowerShell mapping keeper, then terminates that child and
+exits after authenticated unmount. The keeper accepts no command input;
+ordinary commands still run as the restricted
 `NT SERVICE\LSWAgent` identity.
 
 ## Windows activation
