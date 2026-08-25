@@ -564,7 +564,7 @@ fn handle_maintenance_helper_connection(
                 }
             };
             frame.payload.fill(0);
-            match configure_windows_live_share(request.enable) {
+            match configure_windows_live_share(request.enable, expected_token) {
                 Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
                 Err(error) => send_error(stream, &error.to_string())?,
             }
@@ -600,7 +600,17 @@ exit 0
 }
 
 #[cfg(windows)]
-fn configure_windows_live_share(enable: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn configure_windows_live_share(
+    enable: bool,
+    credential: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if credential.len() != 64
+        || !credential
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("live-share credential must be 64 lowercase hexadecimal characters".into());
+    }
     let script = if enable {
         r#"$ErrorActionPreference='Stop'
 $Remote='\\10.0.2.4\qemu'
@@ -609,14 +619,15 @@ if ($null -ne $Mapping -and $Mapping.RemotePath -ne $Remote) {
     throw 'Windows drive L: is already mapped to a different location'
 }
 if ($null -eq $Mapping) {
-    $Password=ConvertTo-SecureString 'lsw-private-qemu' -AsPlainText -Force
-    $Credential=New-Object Management.Automation.PSCredential('lsw-qemu',$Password)
-    New-SmbGlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -Persistent $true | Out-Null
+    $Password=ConvertTo-SecureString $env:LSW_LIVE_SMB_CREDENTIAL -AsPlainText -Force
+    $Credential=New-Object Management.Automation.PSCredential('lsw',$Password)
+    New-SmbGlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
 }
 $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L\DefaultLabel'
 New-Item -Path $Label -Force | Out-Null
 Set-Item -Path $Label -Value 'Linux'
 "#
+        .to_owned()
     } else {
         r#"$ErrorActionPreference='Stop'
 $Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
@@ -629,8 +640,9 @@ if ($null -ne $Mapping) {
 $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
 Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue
 "#
+        .to_owned()
     };
-    let code = run_fixed_powershell(script)?;
+    let code = run_fixed_powershell_inner(&script, enable.then_some(credential))?;
     if code == 0 {
         Ok(())
     } else {
@@ -640,18 +652,30 @@ Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue
 
 #[cfg(windows)]
 fn run_fixed_powershell(script: &str) -> Result<i32, Box<dyn std::error::Error>> {
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ])
-        .stdin(Stdio::null())
+    run_fixed_powershell_inner(script, None)
+}
+
+#[cfg(windows)]
+fn run_fixed_powershell_inner(
+    script: &str,
+    credential: Option<&str>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
+        .stderr(Stdio::piped());
+    if let Some(credential) = credential {
+        command.env("LSW_LIVE_SMB_CREDENTIAL", credential);
+    }
+    let mut child = command.spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("Windows PowerShell standard input was unavailable")?
+        .write_all(script.as_bytes())?;
+    let output = child.wait_with_output()?;
     if output.stderr.len() > 64 * 1024 {
         return Err("Windows live-share operation returned an oversized error".into());
     }

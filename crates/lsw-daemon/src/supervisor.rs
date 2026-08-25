@@ -11,9 +11,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
-    read_frame, write_frame, ClientHello, CommandInvocation, Frame, FrameKind, HostCapabilities,
-    IdlePolicy, InstanceManifest, InstanceState, LaunchPhase, Provisioner, QemuPlanner,
-    ServerHello, StateStore, WindowsProfile, AGENT_PROTOCOL_VERSION, CAPABILITY_POWER_HIBERNATE_V1,
+    prepare_live_share_runtime, read_frame, write_frame, ClientHello, CommandInvocation, Frame,
+    FrameKind, HostCapabilities, IdlePolicy, InstanceManifest, InstanceState, LaunchPhase,
+    Provisioner, QemuPlanner, ServerHello, StateStore, WindowsProfile, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_POWER_HIBERNATE_V1,
 };
 
 use crate::qmp::QmpClient;
@@ -176,6 +177,10 @@ impl Supervisor {
         cleanup_runtime_sockets(&instance_dir)?;
         remove_shutdown_marker(&self.store, name);
         remove_hibernate_marker(&self.store, name);
+        if phase == LaunchPhase::Run {
+            let credential = self.store.read_agent_token(name)?;
+            prepare_live_share_runtime(&manifest, &instance_dir, &credential)?;
+        }
         if phase == LaunchPhase::Run && manifest.spec.profile == WindowsProfile::Ephemeral {
             self.prepare_ephemeral_overlay(&instance_dir, manifest.state)?;
         }

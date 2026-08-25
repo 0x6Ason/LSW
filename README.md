@@ -219,12 +219,14 @@ lsw unshare linux                  # unmount; host files are preserved
 
 The live folder is a real host-backed view over the VM's private QEMU
 user-network SMB path; changes are visible in both directions without a sync
-step. It requires the host Samba server executable but no Windows filesystem
-driver, public SMB listener, RDP, WebDAV, or whole-home export. The first add
-and final remove restart the guest normally because QEMU fixes the exported
-root when the VM starts. Windows keeps a system-wide `L:` mapping so Explorer,
-file dialogs, Session 0 tools, and the later desktop companion see the same
-path. LSW refuses to replace a pre-existing unrelated `L:` mapping.
+step. Each instance authenticates with its private agent credential, and the
+connection requires SMB signing and encryption. It requires the host Samba
+server executable but no Windows filesystem driver, public SMB listener, RDP,
+WebDAV, anonymous guest login, or whole-home export. The first add and final
+remove restart the guest normally because QEMU fixes the exported root when the
+VM starts. Windows keeps a system-wide `L:` mapping so Explorer, file dialogs,
+Session 0 tools, and the later desktop companion see the same path. LSW refuses
+to replace a pre-existing unrelated `L:` mapping.
 
 The authenticated agent mirror remains available for offline hosts, staging,
 recovery, explicit read-only ACLs, and automation:

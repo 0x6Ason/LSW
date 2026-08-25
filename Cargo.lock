@@ -156,6 +156,7 @@ name = "lsw-core"
 version = "1.0.0-beta.8-dev.0"
 dependencies = [
  "getrandom",
+ "md4",
  "serde",
  "serde_json",
  "sha2",
@@ -168,6 +169,15 @@ name = "lsw-daemon"
 version = "1.0.0-beta.8-dev.0"
 dependencies = [
  "lsw-core",
+]
+
+[[package]]
+name = "md4"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da5ac363534dce5fabf69949225e174fbf111a498bf0ff794c8ea1fba9f3dda"
+dependencies = [
+ "digest",
 ]
 
 [[package]]

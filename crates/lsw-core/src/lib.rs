@@ -17,6 +17,8 @@ mod pe;
 mod preparation;
 mod profile;
 mod qemu;
+#[cfg(not(windows))]
+mod samba;
 mod store;
 mod windows_media;
 mod winpe_dism;
@@ -46,7 +48,12 @@ pub use pe::{
 };
 pub use preparation::{PreparationPlan, PreparationStep, Provisioner};
 pub use profile::{SecuritySettings, WindowsProfile};
-pub use qemu::{CommandInvocation, CommandPlan, LaunchPhase, QemuPlanner};
+pub use qemu::{
+    CommandInvocation, CommandPlan, LaunchPhase, QemuPlanner, LIVE_SMB_CONFIG_FILE,
+    LIVE_SMB_RUNTIME_DIRECTORY,
+};
+#[cfg(not(windows))]
+pub use samba::prepare_live_share_runtime;
 pub use store::StateStore;
 pub use windows_media::{WindowsEdition, WindowsMediaInspector};
 pub use winpe_dism::{

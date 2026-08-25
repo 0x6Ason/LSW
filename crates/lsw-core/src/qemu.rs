@@ -11,6 +11,9 @@ use crate::{
     AGENT_GUEST_PORT,
 };
 
+pub const LIVE_SMB_RUNTIME_DIRECTORY: &str = "live-smb";
+pub const LIVE_SMB_CONFIG_FILE: &str = "smb.conf";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchPhase {
     Install,
@@ -205,10 +208,20 @@ impl QemuPlanner {
         };
         if let Some(share) = live_share {
             let root = canonical_live_share_root(&share.host_path)?;
-            network.push_str(",smb=");
-            network.push_str(&qemu_option_value(&root));
+            let smbd = self
+                .capabilities
+                .smbd
+                .as_deref()
+                .unwrap_or_else(|| Path::new("smbd"));
+            let command = live_smb_guest_forward_command(smbd, instance_dir);
+            for port in [139, 445] {
+                network.push_str(&format!(
+                    ",guestfwd=tcp:10.0.2.4:{port}-cmd:{}",
+                    qemu_option_text(&command)
+                ));
+            }
             notes.push(format!(
-                "live folder {:?}: private QEMU SMB exports {} read-write at \\\\10.0.2.4\\qemu",
+                "live folder {:?}: private authenticated QEMU SMB exports {} read-write at \\\\10.0.2.4\\qemu",
                 share.name,
                 root.display()
             ));
@@ -469,8 +482,24 @@ fn canonical_live_share_root(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn qemu_option_value(path: &Path) -> String {
-    qemu_path(path)
+fn live_smb_guest_forward_command(smbd: &Path, instance_dir: &Path) -> String {
+    let runtime = instance_dir.join("run").join(LIVE_SMB_RUNTIME_DIRECTORY);
+    let config = runtime.join(LIVE_SMB_CONFIG_FILE);
+    [
+        smbd.as_os_str(),
+        OsStr::new("-l"),
+        runtime.as_os_str(),
+        OsStr::new("-s"),
+        config.as_os_str(),
+    ]
+    .into_iter()
+    .map(shell_quote)
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn qemu_option_text(value: &str) -> String {
+    value.replace(',', ",,")
 }
 
 fn display_command(program: &OsStr, arguments: &[OsString]) -> String {
@@ -674,8 +703,13 @@ mod tests {
             .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
             .expect("live-share plan should be built");
         let command = plan.display_command();
-        assert!(command.contains("smb="));
-        assert!(command.contains("root"));
+        assert!(command.contains("guestfwd=tcp:10.0.2.4:139-cmd:"));
+        assert!(command.contains("guestfwd=tcp:10.0.2.4:445-cmd:"));
+        assert!(command.contains("/state/win-dev/run/live-smb/smb.conf"));
+        assert!(!command.contains(",smb="));
+        assert!(plan.notes.iter().any(|note| {
+            note.contains("private authenticated QEMU SMB") && note.contains("root")
+        }));
         assert!(!plan
             .missing_capabilities
             .contains(&"smbd (Samba user-mode server)"));

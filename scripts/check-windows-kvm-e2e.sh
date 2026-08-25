@@ -1453,6 +1453,16 @@ if [ "$live_mapping" != LSW_LIVE_OK ]; then
     echo "error: the private QEMU SMB root was not mounted as Linux (L:)" >&2
     exit 1
 fi
+live_security=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$Connection=Get-SmbConnection | Where-Object { $_.ServerName -eq "10.0.2.4" -and $_.ShareName -eq "qemu" } | Select-Object -First 1; if ($null -ne $Connection -and $Connection.Signed -and $Connection.Encrypted) { [Console]::Out.Write("LSW_LIVE_SECURE") }'
+)
+if [ "$live_security" != LSW_LIVE_SECURE ]; then
+    echo "error: the live SMB connection was not authenticated, signed, and encrypted" >&2
+    exit 1
+fi
 printf 'live-host-two' >"$live_source/host.txt"
 live_value=$(
     "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
