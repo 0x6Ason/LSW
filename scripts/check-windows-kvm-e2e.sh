@@ -1465,14 +1465,19 @@ if [ "$live_helper_state" != Stopped ]; then
     echo "error: live sharing kept the privileged maintenance helper running" >&2
     exit 1
 fi
-live_security=$(
-    # PowerShell expands its own variables in the guest.
-    # shellcheck disable=SC2016
-    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-        '$Connection=Get-SmbConnection | Where-Object { $_.ServerName -eq "10.0.2.4" -and $_.ShareName -eq "qemu" } | Select-Object -First 1; if ($null -ne $Connection -and $Connection.Signed -and $Connection.Encrypted) { [Console]::Out.Write("LSW_LIVE_SECURE") }'
-)
-if [ "$live_security" != LSW_LIVE_SECURE ]; then
-    echo "error: the live SMB connection was not authenticated, signed, and encrypted" >&2
+# The restricted service account cannot use the administrator-only
+# Get-SmbConnection CIM provider. Requiring both server policies here and then
+# proving real I/O below demonstrates that the client negotiated those terms.
+live_smb_config="$LSW_STATE_DIR/instances/$instance/run/live-smb/smb.conf"
+if [ -L "$live_smb_config" ] || [ ! -f "$live_smb_config" ] || \
+   [ "$(stat -c %a -- "$live_smb_config")" != 600 ] || \
+   ! grep -Eq '^[[:space:]]*server signing = mandatory[[:space:]]*$' \
+       "$live_smb_config" || \
+   ! grep -Eq '^[[:space:]]*server smb encrypt = required[[:space:]]*$' \
+       "$live_smb_config" || \
+   ! grep -Eq '^[[:space:]]*smb encrypt = required[[:space:]]*$' \
+       "$live_smb_config"; then
+    echo "error: the private live SMB server did not require signing and encryption" >&2
     exit 1
 fi
 printf 'live-host-two' >"$live_source/host.txt"
