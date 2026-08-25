@@ -549,6 +549,9 @@ fn non_windows_agent_does_not_advertise_conpty() {
         .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1));
     assert!(!capabilities
         .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_SHUTDOWN_V1));
+    assert!(!capabilities
+        .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_WINDOWS_SUDO_V1));
     assert!(capabilities
         .iter()
@@ -569,6 +572,7 @@ fn windows_agent_advertises_native_os_operations() {
         lsw_core::CAPABILITY_USER_ACCOUNT_V1,
         lsw_core::CAPABILITY_USER_ACCOUNT_ROLE_V1,
         lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1,
+        lsw_core::CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
         lsw_core::CAPABILITY_WINDOWS_SUDO_V1,
     ] {
         assert!(capabilities.iter().any(|capability| capability == expected));
@@ -576,6 +580,14 @@ fn windows_agent_advertises_native_os_operations() {
     assert!(!capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_HIBERNATE_V1));
+}
+
+#[test]
+fn native_shutdown_arguments_do_not_force_open_applications() {
+    assert_eq!(WINDOWS_SHUTDOWN_ARGUMENTS, ["/s", "/t", "0", "/d", "p:0:0"]);
+    assert!(!WINDOWS_SHUTDOWN_ARGUMENTS
+        .iter()
+        .any(|argument| argument.eq_ignore_ascii_case("/f")));
 }
 
 fn controlled_test_connection(

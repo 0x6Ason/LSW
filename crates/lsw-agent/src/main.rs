@@ -30,11 +30,11 @@ use lsw_core::{
 #[cfg(windows)]
 use lsw_core::{
     TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_LIVE_SHARE_V1,
-    CAPABILITY_MAINTENANCE_HIBERNATE_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
-    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
-    CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1, CLONE_IDENTITY_MARKER_FILE,
-    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, LICENSE_HELPER_GUEST_PORT,
-    MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    CAPABILITY_MAINTENANCE_HIBERNATE_V1, CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
+    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
+    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
+    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,6 +61,8 @@ const USER_HELPER_SERVICE: &str = "LSWUserHelper";
 const MAINTENANCE_HELPER_PORT: u16 = MAINTENANCE_HELPER_GUEST_PORT;
 #[cfg(windows)]
 const MAINTENANCE_HELPER_SERVICE: &str = "LSWMaintenanceHelper";
+#[cfg(any(windows, test))]
+const WINDOWS_SHUTDOWN_ARGUMENTS: [&str; 5] = ["/s", "/t", "0", "/d", "p:0:0"];
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -493,6 +495,7 @@ fn handle_maintenance_helper_connection(
         capabilities: vec![
             CAPABILITY_MAINTENANCE_TRIM_V1.to_owned(),
             CAPABILITY_MAINTENANCE_HIBERNATE_V1.to_owned(),
+            CAPABILITY_MAINTENANCE_SHUTDOWN_V1.to_owned(),
             CAPABILITY_WINDOWS_SUDO_V1.to_owned(),
         ],
     };
@@ -505,6 +508,7 @@ fn handle_maintenance_helper_connection(
     match frame.kind {
         FrameKind::MaintenanceTrim
         | FrameKind::MaintenanceHibernate
+        | FrameKind::MaintenanceShutdown
         | FrameKind::WindowsSudoQuery
             if !frame.payload.is_empty() =>
         {
@@ -523,6 +527,10 @@ fn handle_maintenance_helper_connection(
                 write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
                 request_windows_hibernation()?;
             }
+            Err(error) => send_error(stream, &error.to_string())?,
+        },
+        FrameKind::MaintenanceShutdown => match request_windows_shutdown() {
+            Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
             Err(error) => send_error(stream, &error.to_string())?,
         },
         FrameKind::WindowsSudoQuery => match windows_sudo::status() {
@@ -605,6 +613,17 @@ fn enable_windows_hibernation() -> Result<(), Box<dyn std::error::Error>> {
 fn request_windows_hibernation() -> Result<(), Box<dyn std::error::Error>> {
     Command::new("shutdown.exe")
         .arg("/h")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn request_windows_shutdown() -> Result<(), Box<dyn std::error::Error>> {
+    Command::new("shutdown.exe")
+        .args(WINDOWS_SHUTDOWN_ARGUMENTS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1266,6 +1285,9 @@ fn handle_connection(
         FrameKind::MaintenanceTrim => {
             maintenance_trim(stream, &request_frame.payload, expected_token)
         }
+        FrameKind::MaintenanceShutdown => {
+            maintenance_shutdown(stream, &request_frame.payload, expected_token)
+        }
         FrameKind::WindowsSudoQuery => {
             windows_sudo_query(stream, &request_frame.payload, expected_token)
         }
@@ -1306,6 +1328,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_USER_ACCOUNT_V1.to_owned());
         capabilities.push(CAPABILITY_USER_ACCOUNT_ROLE_V1.to_owned());
         capabilities.push(CAPABILITY_MAINTENANCE_TRIM_V1.to_owned());
+        capabilities.push(CAPABILITY_MAINTENANCE_SHUTDOWN_V1.to_owned());
         capabilities.push(CAPABILITY_WINDOWS_SUDO_V1.to_owned());
         capabilities.push(CAPABILITY_LIVE_SHARE_V1.to_owned());
         capabilities
@@ -1463,6 +1486,30 @@ fn maintenance_trim(
     Ok(())
 }
 
+fn maintenance_shutdown(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !payload.is_empty() {
+        send_error(&mut stream, "MAINTENANCE_SHUTDOWN payload must be empty")?;
+        return Err("client sent an invalid shutdown request".into());
+    }
+    #[cfg(windows)]
+    let result = forward_maintenance_shutdown(expected_token);
+    #[cfg(not(windows))]
+    let result: Result<(), Box<dyn std::error::Error>> = {
+        let _ = expected_token;
+        Err("Windows shutdown is unavailable on this platform".into())
+    };
+    if let Err(error) = result {
+        send_error(&mut stream, &error.to_string())?;
+        return Err(error);
+    }
+    write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
+    Ok(())
+}
+
 fn windows_sudo_query(
     mut stream: TcpStream,
     payload: &[u8],
@@ -1585,6 +1632,15 @@ fn forward_maintenance_trim(expected_token: &str) -> Result<(), Box<dyn std::err
 }
 
 #[cfg(windows)]
+fn forward_maintenance_shutdown(expected_token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    forward_maintenance_operation(
+        expected_token,
+        FrameKind::MaintenanceShutdown,
+        CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
+    )
+}
+
+#[cfg(windows)]
 fn forward_maintenance_operation(
     expected_token: &str,
     request_kind: FrameKind,
@@ -1592,7 +1648,9 @@ fn forward_maintenance_operation(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !matches!(
         request_kind,
-        FrameKind::MaintenanceTrim | FrameKind::MaintenanceHibernate
+        FrameKind::MaintenanceTrim
+            | FrameKind::MaintenanceHibernate
+            | FrameKind::MaintenanceShutdown
     ) {
         return Err("invalid fixed maintenance operation".into());
     }

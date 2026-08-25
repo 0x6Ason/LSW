@@ -257,14 +257,15 @@ or shell receives the password.
 
 ## Windows maintenance helper
 
-Guest TRIM and Windows hibernation do not grant administrative rights to the
-network-facing agent. `LSWMaintenanceHelper` is Manual/demand-start under
-LocalSystem, binds guest loopback port 35043, authenticates the per-instance
-token, and accepts exactly one empty `MAINTENANCE_TRIM` or
-`MAINTENANCE_HIBERNATE` frame. It runs either fixed `Optimize-Volume C -ReTrim`
-or `powercfg /hibernate on` plus `shutdown /h`, then exits. Its service ACL
-gives `NT SERVICE\LSWAgent` query/start rights only; callers cannot supply a
-command, path, drive, option, or PowerShell fragment.
+Guest TRIM, Windows hibernation, and the native shutdown fallback do not grant
+administrative rights to the network-facing agent. `LSWMaintenanceHelper` is
+Manual/demand-start under LocalSystem, binds guest loopback port 35043,
+authenticates the per-instance token, and accepts exactly one empty
+`MAINTENANCE_TRIM`, `MAINTENANCE_HIBERNATE`, or `MAINTENANCE_SHUTDOWN` frame. It
+runs fixed `Optimize-Volume C -ReTrim`, `powercfg /hibernate on` plus `shutdown
+/h`, or a normal `shutdown /s /t 0` request without `/f`, then exits. Its
+service ACL gives `NT SERVICE\LSWAgent` query/start rights only; callers cannot
+supply a command, path, drive, option, or PowerShell fragment.
 
 ## Remaining security work
 

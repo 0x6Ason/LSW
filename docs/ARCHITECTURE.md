@@ -87,11 +87,12 @@ validation claims in the beta.7 release.
    Visible desktop GUI work still requires the beta.8 user-session companion.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
-   Storage retrim, Windows hibernation, and native Windows-sudo inspection use
-   the same boundary through `LSWMaintenanceHelper`. Sudo configuration accepts
-   only the protocol's boolean disabled/new-window request, refuses managed
-   policy, verifies native registry readback, and preserves UAC. The helper
-   exits after one LocalSystem operation.
+   Storage retrim, Windows hibernation, the fixed non-forcing shutdown fallback,
+   and native Windows-sudo inspection use the same boundary through
+   `LSWMaintenanceHelper`. Sudo configuration accepts only the protocol's
+   boolean disabled/new-window request, refuses managed policy, verifies native
+   registry readback, and preserves UAC. The helper exits after one LocalSystem
+   operation.
 6. Bare `lsw` resolves the default instance and requests `pwsh.exe`, `pwsh`,
    Windows PowerShell, then `cmd.exe`/`cmd` in order. When both ends advertise
    ConPTY and host stdin is a terminal, the host enters raw mode and forwards
@@ -107,6 +108,10 @@ validation claims in the beta.7 release.
    to the demand-start helper, and records `hibernated` only after QEMU exits.
    Resume then performs a normal boot from the Windows hiberfile. The opt-in
    idle policy balloons, pauses, and later hibernates.
+   Live-folder reconfiguration first asks QMP for an ACPI powerdown. If Windows
+   is still running after 15 seconds, the authenticated agent asks the
+   maintenance helper for the fixed native shutdown operation; the original
+   bounded deadline remains authoritative and open applications are not forced.
 8. A pristine stopped/hibernated instance can be sealed. A clone uses a qcow2
    backing overlay and read-only FAT identity volume; the SCM agent rotates the
    embedded token before binding its listener or atomically updates its live

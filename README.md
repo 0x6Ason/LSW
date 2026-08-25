@@ -311,12 +311,14 @@ lsw diagnose win-dev --bundle
 lsw remove win-dev
 ```
 
-`lsw trim` and the fixed Windows hibernation transition cross the privilege
-boundary through the authenticated, demand-start `LSWMaintenanceHelper`. Those
-operations remain one-shot. Live SMB setup does not cross that boundary: the
-restricted `NT SERVICE\LSWAgent` process calls the fixed Windows networking API,
-keeps the credential out of argv and the environment, and owns its session's
-`L:` connection directly.
+`lsw trim`, the fixed Windows hibernation transition, and the bounded native
+shutdown fallback cross the privilege boundary through the authenticated,
+demand-start `LSWMaintenanceHelper`. Each helper invocation remains one-shot;
+the shutdown request is fixed, uses no `/f`, and is attempted only when Windows
+has not exited 15 seconds after an ACPI powerdown. Live SMB setup does not cross
+that boundary: the restricted `NT SERVICE\LSWAgent` process calls the fixed
+Windows networking API, keeps the credential out of argv and the environment,
+and owns its session's `L:` connection directly.
 
 ## Windows activation
 

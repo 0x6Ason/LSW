@@ -124,7 +124,9 @@ beta.8 Slice 2 additionally requires an exact-root, per-instance authenticated
 QEMU SMB export with signing and encryption, an agent-session `Linux (L:)`
 mapping owned without a resident privileged helper, immediate host/guest
 visibility, inferred `lsw cp`, machine-readable file benchmarks, unshare
-preservation, and complete teardown of the restarted VM and Samba helper.
+preservation, an authenticated native fallback when ACPI shutdown is ignored,
+and complete teardown of the restarted VM and Samba helper. The exact gate uses
+a bounded small-file sample; the product benchmark defaults remain unchanged.
 
 ## Release bundle
 

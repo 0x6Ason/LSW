@@ -11,7 +11,11 @@
   in its logon session without a resident LocalSystem or PowerShell keeper;
   Explorer mapping remains assigned to the Slice 3 interactive companion. File
   benchmark cleanup treats an absent prior dataset as success, retries real
-  removal failures, and reports the guest error instead of hiding it.
+  removal failures, and reports the guest error instead of hiding it. Live-share
+  restarts now supplement an ignored ACPI powerdown with a bounded,
+  authenticated native Windows shutdown request without forcing open apps; the
+  exact gate keeps its slow mirror sample bounded while retaining the published
+  benchmark schema and product defaults.
 - Began beta.8 with explicit Windows desktop account roles and native Windows
   sudo integration. Interactive personal-development setup recommends an
   administrator while keeping standard accounts available. `lsw user add`

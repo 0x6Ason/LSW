@@ -68,9 +68,9 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   that Windows mounts after automatic services start.
 - QMP balloon targets, host-pressure reclaim, opt-in pause/hibernate policy,
   Windows hibernate/resume, guest TRIM, qcow2 discard/detect-zeroes, and offline
-  compaction. Guest TRIM and Windows hibernation cross a token-authenticated,
-  fixed-operation, demand-start LocalSystem helper instead of elevating the
-  normal agent.
+  compaction. Guest TRIM, Windows hibernation, and the non-forcing native
+  shutdown fallback cross a token-authenticated, fixed-operation, demand-start
+  LocalSystem helper instead of elevating the normal agent.
   Stopped and hibernated instances retain no QEMU process.
 - Declarative RO/RW folder synchronization, additive change watch, explicit RW
   guest merge, guest ACL enforcement, and host-symlink/guest-reparse boundary

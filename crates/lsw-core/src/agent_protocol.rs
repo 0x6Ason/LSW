@@ -19,6 +19,7 @@ pub const CAPABILITY_USER_ACCOUNT_V1: &str = "user-account-v1";
 pub const CAPABILITY_USER_ACCOUNT_ROLE_V1: &str = "user-account-role-v1";
 pub const CAPABILITY_MAINTENANCE_TRIM_V1: &str = "maintenance-trim-v1";
 pub const CAPABILITY_MAINTENANCE_HIBERNATE_V1: &str = "maintenance-hibernate-v1";
+pub const CAPABILITY_MAINTENANCE_SHUTDOWN_V1: &str = "maintenance-shutdown-v1";
 pub const CAPABILITY_WINDOWS_SUDO_V1: &str = "windows-sudo-v1";
 pub const CAPABILITY_LIVE_SHARE_V1: &str = "live-share-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
@@ -69,6 +70,7 @@ pub enum FrameKind {
     LiveShareQuery = 38,
     LiveShareConfigure = 39,
     LiveShareStatus = 40,
+    MaintenanceShutdown = 41,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -112,6 +114,7 @@ impl TryFrom<u8> for FrameKind {
             38 => Ok(Self::LiveShareQuery),
             39 => Ok(Self::LiveShareConfigure),
             40 => Ok(Self::LiveShareStatus),
+            41 => Ok(Self::MaintenanceShutdown),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -1258,6 +1261,15 @@ mod tests {
             FrameKind::MaintenanceHibernate
         );
         assert_eq!(FrameKind::MaintenanceHibernate as u8, 33);
+    }
+
+    #[test]
+    fn maintenance_shutdown_has_an_append_only_empty_request_kind() {
+        assert_eq!(
+            FrameKind::try_from(41).expect("shutdown request kind should decode"),
+            FrameKind::MaintenanceShutdown
+        );
+        assert_eq!(FrameKind::MaintenanceShutdown as u8, 41);
     }
 
     #[test]

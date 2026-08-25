@@ -196,8 +196,10 @@ protocol; role changes contain no password and are separately capability-gated.
 
 `LSWMaintenanceHelper` must likewise be Manual/demand-start under LocalSystem.
 The TRIM and hibernate checks prove that the restricted agent can request only
-those two fixed operations without gaining an arbitrary privileged command
-channel.
+fixed operations without gaining an arbitrary privileged command channel. A
+live-folder restart first uses ACPI and, if Windows has not exited after 15
+seconds, exercises the same one-shot helper with a fixed normal shutdown request
+that does not force open applications.
 
 Before the first shutdown, the harness resolves both the service process owner
 and the command process identity, requires both to equal the translated

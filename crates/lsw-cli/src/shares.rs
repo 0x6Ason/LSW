@@ -21,6 +21,7 @@ use super::{
 const LIVE_SHARE_NAME: &str = "linux";
 const LIVE_SHARE_GUEST_PATH: &str = "L:\\";
 const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const NATIVE_SHUTDOWN_FALLBACK_DELAY: Duration = Duration::from_secs(15);
 
 pub(super) fn command(
     store: &StateStore,
@@ -414,7 +415,10 @@ fn restart_instance(store: &StateStore, name: &str) -> Result<(), Box<dyn std::e
         for line in client.request_checked(&format!("STOP {name} graceful"))? {
             println!("{line}");
         }
+        let fallback_deadline = Instant::now() + NATIVE_SHUTDOWN_FALLBACK_DELAY;
         let deadline = Instant::now() + GUEST_READY_TIMEOUT;
+        let mut fallback_requested = false;
+        let mut fallback_error = None;
         loop {
             let _ = client.request_checked(&format!("STATUS {name}"));
             if matches!(
@@ -423,13 +427,35 @@ fn restart_instance(store: &StateStore, name: &str) -> Result<(), Box<dyn std::e
             ) {
                 break;
             }
+            if !fallback_requested && Instant::now() >= fallback_deadline {
+                fallback_requested = true;
+                eprintln!(
+                    "Windows did not exit after the ACPI request; requesting an authenticated native shutdown..."
+                );
+                if let Err(error) = request_native_windows_shutdown(store, name) {
+                    fallback_error = Some(error.to_string());
+                }
+            }
             if Instant::now() >= deadline {
-                return Err("timed out waiting for Windows to restart for live sharing".into());
+                let detail = fallback_error
+                    .map(|error| format!("; native shutdown fallback failed: {error}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "timed out waiting for Windows to restart for live sharing{detail}"
+                )
+                .into());
             }
             thread::sleep(Duration::from_millis(500));
         }
     }
     start_named_instance(store, name, LaunchPhase::Run)
+}
+
+fn request_native_windows_shutdown(
+    store: &StateStore,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    connect_agent(store, name)?.shutdown()
 }
 
 fn wait_for_agent(store: &StateStore, name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -600,5 +626,10 @@ mod tests {
         assert!(summary.contains("<redacted>"));
         assert!(summary.lines().count() <= 20);
         assert!(!summary.contains("line 0"));
+    }
+
+    #[test]
+    fn live_share_restart_has_a_safe_native_shutdown_fallback() {
+        assert!(NATIVE_SHUTDOWN_FALLBACK_DELAY < GUEST_READY_TIMEOUT);
     }
 }

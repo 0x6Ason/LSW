@@ -1504,7 +1504,7 @@ if [ "$(cat "$e2e_root/cp-return.txt")" != cp-host ]; then
     exit 1
 fi
 
-files_bench_json=$("$lsw" bench files "$instance" --json --size-mib 16 --small-files 128)
+files_bench_json=$("$lsw" bench files "$instance" --json --size-mib 16 --small-files 32)
 python3 - "$files_bench_json" <<'PY'
 import json
 import sys
@@ -1512,7 +1512,7 @@ import sys
 result = json.loads(sys.argv[1])
 if result.get("schema") != 1:
     raise SystemExit("error: file benchmark schema is not version 1")
-if result.get("dataset") != {"sequential_mib": 16, "small_files": 128}:
+if result.get("dataset") != {"sequential_mib": 16, "small_files": 32}:
     raise SystemExit("error: file benchmark dimensions were not retained")
 if not result.get("guest_local", {}).get("available"):
     raise SystemExit("error: guest-local file benchmark was unavailable")
