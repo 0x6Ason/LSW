@@ -1446,11 +1446,23 @@ mkdir -p -- "$live_source"
 printf 'live-host-one' >"$live_source/host.txt"
 "$lsw" share "$live_source"
 live_mapping=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
     "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-        'if ((Get-SmbGlobalMapping -LocalPath "L:").RemotePath -eq "\\10.0.2.4\qemu" -and (Test-Path -LiteralPath "L:\host.txt")) { [Console]::Out.Write("LSW_LIVE_OK") }'
+        '$Mapping=Get-SmbMapping -LocalPath "L:" -ErrorAction Stop; if ($Mapping.RemotePath -eq "\\10.0.2.4\qemu" -and (Test-Path -LiteralPath "L:\host.txt")) { [Console]::Out.Write("LSW_LIVE_OK") }'
 )
 if [ "$live_mapping" != LSW_LIVE_OK ]; then
-    echo "error: the private QEMU SMB root was not mounted as Linux (L:)" >&2
+    echo "error: the private QEMU SMB root was not mounted in the agent session as Linux (L:)" >&2
+    exit 1
+fi
+live_helper_state=$(
+    # PowerShell expands its own variables in the guest.
+    # shellcheck disable=SC2016
+    "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
+        '$Service=Get-CimInstance -ClassName Win32_Service -Filter "Name = '\''LSWMaintenanceHelper'\''"; [Console]::Out.Write($Service.State)'
+)
+if [ "$live_helper_state" != Stopped ]; then
+    echo "error: live sharing kept the privileged maintenance helper running" >&2
     exit 1
 fi
 live_security=$(
@@ -1511,11 +1523,11 @@ if [ ! -f "$live_source/host.txt" ] || [ ! -f "$live_source/guest.txt" ]; then
     exit 1
 fi
 if "$lsw" exec "$instance" -- powershell.exe -NoLogo -NoProfile -Command \
-    'if (Get-SmbGlobalMapping -LocalPath "L:" -ErrorAction SilentlyContinue) { exit 1 }' >/dev/null
+    'if (Get-SmbMapping -LocalPath "L:" -ErrorAction SilentlyContinue) { exit 1 }' >/dev/null
 then
     :
 else
-    echo "error: unshare left Linux (L:) globally mapped" >&2
+    echo "error: unshare left Linux (L:) mapped in the agent session" >&2
     exit 1
 fi
 live_folder_verified=true

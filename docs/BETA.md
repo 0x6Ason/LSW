@@ -76,7 +76,7 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   guest merge, guest ACL enforcement, and host-symlink/guest-reparse boundary
   rejection. Shares and background watch are never enabled implicitly.
 - Explicit driverless live-folder consent for one canonical host root, private
-  QEMU user-network SMB, fixed global `Linux (L:)` mapping, short
+  QEMU user-network SMB, fixed agent-session `Linux (L:)` mapping, short
   `share`/`unshare`/`cp` commands, and machine-readable file benchmarks.
 - Interactive post-install permanent-user registration and deferred
   `lsw user setup`. A demand-start authenticated LocalSystem helper calls native

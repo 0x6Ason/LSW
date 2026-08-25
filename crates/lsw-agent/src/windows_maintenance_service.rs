@@ -2,11 +2,8 @@
 
 //! Demand-start SCM adapter for fixed privileged maintenance operations.
 //!
-//! The service accepts no stop control. Fixed operations normally exit after
-//! one authenticated loopback request; a live SMB mapping keeps its fixed
-//! PowerShell owner and the service alive until an authenticated unmount ends
-//! the child and removes it. This keeps privileged code out of the normal agent
-//! path.
+//! The service accepts no stop control and exits after one authenticated
+//! loopback request. This keeps privileged code out of the normal agent path.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 

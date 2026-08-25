@@ -109,17 +109,18 @@ headless workflows working.
   `pull` as stable advanced and automation interfaces.
 - After desktop-user setup, offer one recommended-integration dialog with an
   explicit `[Y/n]` choice. Show the exact host root and access mode before
-  enabling it. Recommend a dedicated `~/LSW` read-write directory, map it in
-  Windows as `Linux (L:)`, and never expose the whole Linux home directory
-  implicitly. License acceptance and administrator selection remain separate
-  consent steps.
+  enabling it. Recommend a dedicated `~/LSW` read-write directory, map it for
+  agent tools as `Linux (L:)`, and never expose the whole Linux home directory
+  implicitly. Slice 3 adds the matching interactive desktop mapping. License
+  acceptance and administrator selection remain separate consent steps.
 - Prototype a driverless live share over the VM's private QEMU user-network SMB
-  path so Explorer, file dialogs, and Windows applications see current host
-  contents without copying. Authenticate it per instance, require SMB signing
-  and encryption, and do not enable Windows anonymous guest SMB. Keep the
-  authenticated agent mirror for offline synchronization, recovery, staging,
-  and hosts without the SMB helper. WebDAV is not the primary filesystem
-  transport.
+  path so agent-launched terminal tools see current host contents without
+  copying. Authenticate it per instance, require SMB signing and encryption,
+  and do not enable Windows anonymous guest SMB. Windows isolates drive
+  mappings by logon session, so Explorer and file-dialog mapping belongs to the
+  Slice 3 interactive companion. Keep the authenticated agent mirror for
+  offline synchronization, recovery, staging, and hosts without the SMB helper.
+  WebDAV is not the primary filesystem transport.
 - Before changing the default, benchmark sequential 1 GiB I/O, large trees of
   small files, metadata walks, `git status`, and representative builds against
   the existing agent mirror and guest-local storage. Add a machine-readable
@@ -129,8 +130,8 @@ headless workflows working.
   the same tests. It cannot be required for correct default sharing.
 - Slice 2 is implemented on the beta.8 development line: nameless first install,
   short share/unshare/copy commands, separate recommended-integration consent,
-  a single fail-closed, per-instance authenticated QEMU SMB root mounted
-  globally as `Linux (L:)`, manifest migration, the retained agent-mirror
+  a single fail-closed, per-instance authenticated QEMU SMB root mounted as
+  agent-session `Linux (L:)`, manifest migration, the retained agent-mirror
   interfaces, and
   machine-readable guest-local/live/mirror file benchmarks are covered by the
   exact Windows/KVM gate. The default benchmark uses 1 GiB and 4,096 small

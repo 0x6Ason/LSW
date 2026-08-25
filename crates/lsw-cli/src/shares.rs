@@ -123,7 +123,7 @@ fn add_live_path(
         if existing.host_path == share.host_path {
             ensure_live_mapping(store, name)?;
             println!(
-                "Live folder {:?} is mounted as Linux (L:) for {name:?}.",
+                "Live folder {:?} is mounted as agent-session Linux (L:) for {name:?}.",
                 existing.host_path.display()
             );
             return Ok(());
@@ -163,7 +163,7 @@ fn add_live_path(
         .into());
     }
     println!(
-        "Mounted live read-write folder {:?}: {} -> Linux (L:).",
+        "Mounted live read-write folder {:?}: {} -> agent-session Linux (L:).",
         share.name,
         share.host_path.display()
     );

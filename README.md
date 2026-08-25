@@ -97,7 +97,7 @@ The one-shot installer performs the following steps:
    `--administrator`.
 8. Separately offers the recommended `~/LSW` integration, showing the exact
    read-write host root before consent. If accepted, it performs one normal
-   guest restart and maps only that directory as `Linux (L:)`.
+   guest restart and maps only that directory as agent-session `Linux (L:)`.
 
 The terminal UI renders byte-accurate bars for native ISO transfer,
 range assembly, SHA-256 verification, and DISM percentages. WinPE boot,
@@ -224,9 +224,12 @@ connection requires SMB signing and encryption. It requires the host Samba
 server executable but no Windows filesystem driver, public SMB listener, RDP,
 WebDAV, anonymous guest login, or whole-home export. The first add and final
 remove restart the guest normally because QEMU fixes the exported root when the
-VM starts. Windows keeps a system-wide `L:` mapping so Explorer, file dialogs,
-Session 0 tools, and the later desktop companion see the same path. LSW refuses
-to replace a pre-existing unrelated `L:` mapping.
+VM starts. The restricted agent maps `L:` inside its own Windows logon session,
+so `lsw` terminal commands and benchmarks use the live path without elevating
+the agent. Windows intentionally isolates drive mappings between logon sessions;
+the beta.8 user-session companion will create the separately authenticated
+Explorer/file-dialog mapping. LSW refuses to replace a pre-existing unrelated
+`L:` mapping in either session.
 
 The authenticated agent mirror remains available for offline hosts, staging,
 recovery, explicit read-only ACLs, and automation:
@@ -310,11 +313,10 @@ lsw remove win-dev
 
 `lsw trim` and the fixed Windows hibernation transition cross the privilege
 boundary through the authenticated, demand-start `LSWMaintenanceHelper`. Those
-operations remain one-shot. While `Linux (L:)` is mounted, the same helper stays
-alive with a fixed PowerShell mapping keeper, then terminates that child and
-exits after authenticated unmount. The keeper accepts no command input;
-ordinary commands still run as the restricted
-`NT SERVICE\LSWAgent` identity.
+operations remain one-shot. Live SMB setup does not cross that boundary: the
+restricted `NT SERVICE\LSWAgent` process calls the fixed Windows networking API,
+keeps the credential out of argv and the environment, and owns its session's
+`L:` connection directly.
 
 ## Windows activation
 
@@ -578,8 +580,9 @@ targets, Zig, or operating-system media.
 - Signed VirtIO drivers are not bundled or silently installed. The balloon
   device and governor are available, but useful guest reclaim depends on a
   compatible signed Windows driver; the inbox NVMe/e1000e path remains valid.
-- One driverless live read-write root can be mapped as `Linux (L:)` per
-  instance. Additional declared shares remain synchronized agent mirrors;
+- One driverless live read-write root can be mapped as `Linux (L:)` in the
+  agent session per instance. Explorer integration awaits the beta.8
+  user-session companion. Additional declared shares remain synchronized agent mirrors;
   host-to-guest watch is additive and conflicts/deletions are never resolved
   destructively in the background. Signed Virtio-fs is not required or enabled.
 - Agent authentication is not encrypted and is limited to LSW's local

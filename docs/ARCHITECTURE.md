@@ -29,7 +29,7 @@ validation claims in the beta.7 release.
 | Image manager | Implemented | Content-addressed sealed qcow2 bases, linked overlays, and post-clone credential rotation |
 | Resource governor | Implemented; opt-in | QMP balloon targets, host-pressure response, pause, Windows hibernate, resume, TRIM, and compaction |
 | Folder-share mirror | Implemented; opt-in | Manifest-bound RO/RW roots over authenticated bulk transfer with additive change watch |
-| Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and globally mapped as Windows `L:` without a guest filesystem driver |
+| Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and mapped as agent-session Windows `L:` without a guest filesystem driver |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
 | Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
@@ -196,14 +196,16 @@ Windows reparse points.
 Manifest version 7 distinguishes the existing `mirror` transport from one
 `live-smb` root. Older manifests migrate every share to `mirror`. On a normal
 run, the planner re-canonicalizes the live root, rejects symlinks, and adds it
-only to that instance's QEMU user-network backend. The Windows agent forwards a
-fixed mapping request to the demand-start LocalSystem maintenance helper. The
-helper retains the fixed PowerShell process that owns the resulting global
-`Linux (L:)` mapping, so the drive remains available to service and interactive
-sessions. The keeper accepts no command input; authenticated unmount terminates
-the fixed child, removes the owned mapping, and ends the helper. Adding or
-removing the root performs a graceful restart because the QEMU SMB root is
-immutable after launch.
+only to that instance's QEMU user-network backend. The restricted Windows agent
+uses `WNetAddConnection2W` with the fixed `L:` and private SMB path, then clears
+its mutable credential buffer. The resulting mapping belongs to the agent's
+Windows logon session and is inherited by agent-launched terminal tools; no
+LocalSystem helper or PowerShell mapping owner remains resident. Windows does
+not share drive mappings across logon sessions, so the Slice 3 interactive
+companion will establish the separately authenticated Explorer mapping.
+Authenticated unmount ownership-checks and removes only the agent mapping.
+Adding or removing the root performs a graceful restart because the QEMU SMB
+root is immutable after launch.
 
 On Unix the child enters a new process group in the pre-`exec` path. LSW signals
 that group after a normal leader exit and on cancellation, disconnect, protocol

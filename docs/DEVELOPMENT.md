@@ -121,10 +121,10 @@ identity isolation, folder-share escape rejection, balloon/TRIM, fixed-helper
 Windows hibernate/resume, offline compaction, and zero QEMU RSS after
 stop/hibernate.
 beta.8 Slice 2 additionally requires an exact-root, per-instance authenticated
-QEMU SMB export with signing and encryption, a global `Linux (L:)` mapping,
-immediate host/guest visibility, inferred `lsw cp`, machine-readable file
-benchmarks, unshare preservation, and complete teardown of the restarted VM
-and Samba helper.
+QEMU SMB export with signing and encryption, an agent-session `Linux (L:)`
+mapping owned without a resident privileged helper, immediate host/guest
+visibility, inferred `lsw cp`, machine-readable file benchmarks, unshare
+preservation, and complete teardown of the restarted VM and Samba helper.
 
 ## Release bundle
 

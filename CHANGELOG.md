@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Completed beta.8 Slice 2's short file UX with default-instance
+  `lsw share PATH`, `lsw unshare SHARE`, direction-inferred `lsw cp`, and
+  machine-readable guest-local/live/mirror benchmarks. One explicitly approved
+  canonical host root is exported only through the VM's private QEMU SMB
+  network with per-instance authentication, signing, and encryption. The
+  restricted agent owns `Linux (L:)` through the native Windows networking API
+  in its logon session without a resident LocalSystem or PowerShell keeper;
+  Explorer mapping remains assigned to the Slice 3 interactive companion.
 - Began beta.8 with explicit Windows desktop account roles and native Windows
   sudo integration. Interactive personal-development setup recommends an
   administrator while keeping standard accounts available. `lsw user add`

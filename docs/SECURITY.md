@@ -159,13 +159,17 @@ separate network stacks. LSW never substitutes the Linux home or filesystem
 root. The share is deliberately read-write: the Windows guest is therefore
 trusted to modify or delete content below the approved root.
 
-A capability-gated request is forwarded over authenticated guest loopback to
-the demand-start LocalSystem maintenance helper. That helper can only add,
-query, or remove the fixed `L:` to `\\10.0.2.4\qemu` global mapping and its
-`Linux` label. It refuses an unrelated existing `L:` mapping. The ordinary
-agent remains unprivileged, and no username, password, path, drive letter, or
-command text is accepted by this operation. Removing the share unmaps the drive
-and restarts QEMU without the host export; host files are preserved.
+A capability-gated request makes the restricted agent add, query, or remove the
+fixed `L:` to `\\10.0.2.4\qemu` mapping in its own Windows logon session through
+`WNetAddConnection2W` and `WNetCancelConnection2W`. It refuses an unrelated
+existing `L:` mapping. No LocalSystem helper is involved, and no username,
+password, path, drive letter, or command text is accepted from the client. The
+private credential is passed only in memory to the networking API and its
+mutable UTF-16 copy is cleared immediately. The Samba endpoint requires signing
+and encryption. Removing the share unmaps the drive and restarts QEMU without
+the host export; host files are preserved. A future interactive companion must
+create its own mapping because Windows deliberately scopes redirected drives to
+logon sessions.
 
 Sealed bases are mode 0400 and content-addressed. Sealing rejects an instance
 that already contains a registered permanent user. Clones do not inherit host
