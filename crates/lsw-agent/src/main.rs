@@ -620,8 +620,13 @@ if ($null -ne $Mapping -and $Mapping.RemotePath -ne $Remote) {
 if ($null -eq $Mapping) {
     $Password=ConvertTo-SecureString $env:LSW_LIVE_SMB_CREDENTIAL -AsPlainText -Force
     $Credential=New-Object Management.Automation.PSCredential('lsw',$Password)
-    New-SmbGlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
+    New-SmbMapping -GlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
 }
+$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction Stop
+if ($null -eq $Mapping -or $Mapping.RemotePath -ne $Remote) {
+    throw 'Windows did not register the global Linux (L:) mapping'
+}
+Get-Item -LiteralPath 'L:\' -ErrorAction Stop | Out-Null
 $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L\DefaultLabel'
 New-Item -Path $Label -Force | Out-Null
 Set-Item -Path $Label -Value 'Linux'
@@ -632,7 +637,7 @@ if ($null -ne $Mapping) {
     if ($Mapping.RemotePath -ne '\\10.0.2.4\qemu') {
         throw 'Windows drive L: is mapped to a location not owned by LSW'
     }
-    Remove-SmbGlobalMapping -LocalPath 'L:' -Force
+    Remove-SmbMapping -GlobalMapping -LocalPath 'L:' -Force
 }
 $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
 Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue

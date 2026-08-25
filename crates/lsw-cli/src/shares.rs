@@ -359,10 +359,7 @@ fn ensure_live_mapping(store: &StateStore, name: &str) -> Result<(), Box<dyn std
     if !status.mapped {
         connect_agent(store, name)?.configure_live_share(true)?;
     }
-    if !connect_agent(store, name)?.live_share_status()?.mapped {
-        return Err("Windows did not retain the Linux (L:) mapping".into());
-    }
-    Ok(())
+    wait_for_live_mapping_state(store, name, true)
 }
 
 fn restart_and_configure(
@@ -373,11 +370,34 @@ fn restart_and_configure(
     restart_instance(store, name)?;
     wait_for_agent(store, name)?;
     connect_agent(store, name)?.configure_live_share(enable)?;
-    let status = connect_agent(store, name)?.live_share_status()?;
-    if status.mapped != enable {
-        return Err("Windows did not retain the requested Linux (L:) state".into());
+    wait_for_live_mapping_state(store, name, enable)
+}
+
+fn wait_for_live_mapping_state(
+    store: &StateStore,
+    name: &str,
+    expected: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let query_error =
+            match connect_agent(store, name).and_then(|client| client.live_share_status()) {
+                Ok(status) if status.mapped == expected => return Ok(()),
+                Ok(_) => None,
+                Err(error) => Some(error.to_string()),
+            };
+        if Instant::now() >= deadline {
+            let expected = if expected { "mapped" } else { "unmapped" };
+            let detail = query_error
+                .map(|error| format!("; last query failed: {error}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "Windows did not retain Linux (L:) in the expected {expected} state{detail}"
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(250));
     }
-    Ok(())
 }
 
 fn restart_instance(store: &StateStore, name: &str) -> Result<(), Box<dyn std::error::Error>> {
