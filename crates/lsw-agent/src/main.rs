@@ -5,6 +5,8 @@
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::io::{BufRead, BufReader};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
@@ -427,13 +429,6 @@ fn handle_user_helper_connection(
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MaintenanceHelperConnectionOutcome {
-    Unauthenticated,
-    Authenticated { live_share_active: Option<bool> },
-}
-
-#[cfg(windows)]
 fn run_maintenance_helper(
     configuration: Configuration,
     ready: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
@@ -443,26 +438,24 @@ fn run_maintenance_helper(
     listener.set_nonblocking(true)?;
     ready()?;
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut live_share_active = false;
+    let mut live_share_keeper = None;
     loop {
         match listener.accept() {
             Ok((mut stream, peer)) if peer.ip().is_loopback() => {
                 stream.set_nonblocking(false)?;
                 stream.set_read_timeout(Some(Duration::from_secs(10)))?;
                 stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-                match handle_maintenance_helper_connection(&mut stream, &token) {
-                    Ok(MaintenanceHelperConnectionOutcome::Unauthenticated) => {}
-                    Ok(MaintenanceHelperConnectionOutcome::Authenticated {
-                        live_share_active: updated,
-                    }) => {
-                        if let Some(updated) = updated {
-                            live_share_active = updated;
-                        }
-                        if !live_share_active {
+                match handle_maintenance_helper_connection(
+                    &mut stream,
+                    &token,
+                    &mut live_share_keeper,
+                ) {
+                    Ok(authenticated) => {
+                        if authenticated && live_share_keeper.is_none() {
                             return Ok(());
                         }
                     }
-                    Err(error) if live_share_active => write_stderr(format_args!(
+                    Err(error) if live_share_keeper.is_some() => write_stderr(format_args!(
                         "lsw-agent: live-share helper request failed: {error}"
                     )),
                     Err(error) => return Err(error),
@@ -470,7 +463,7 @@ fn run_maintenance_helper(
             }
             Ok((_, _)) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if !live_share_active && Instant::now() >= deadline {
+                if live_share_keeper.is_none() && Instant::now() >= deadline {
                     return Err(
                         "Windows maintenance helper timed out without an authenticated request"
                             .into(),
@@ -487,11 +480,12 @@ fn run_maintenance_helper(
 fn handle_maintenance_helper_connection(
     stream: &mut TcpStream,
     expected_token: &str,
-) -> Result<MaintenanceHelperConnectionOutcome, Box<dyn std::error::Error>> {
+    live_share_keeper: &mut Option<LiveShareKeeper>,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut hello_frame = read_frame(stream)?;
     if hello_frame.kind != FrameKind::Hello {
         send_error(stream, "the first maintenance-helper frame must be HELLO")?;
-        return Ok(MaintenanceHelperConnectionOutcome::Unauthenticated);
+        return Ok(false);
     }
     let hello = ClientHello::decode(&hello_frame.payload);
     hello_frame.payload.fill(0);
@@ -499,14 +493,14 @@ fn handle_maintenance_helper_connection(
         Ok(hello) => hello,
         Err(error) => {
             send_error(stream, &error.to_string())?;
-            return Ok(MaintenanceHelperConnectionOutcome::Unauthenticated);
+            return Ok(false);
         }
     };
     if hello.version != AGENT_PROTOCOL_VERSION
         || !constant_time_token_eq(&hello.token, expected_token)
     {
         send_error(stream, "maintenance-helper authentication failed")?;
-        return Ok(MaintenanceHelperConnectionOutcome::Unauthenticated);
+        return Ok(false);
     }
     let server_hello = ServerHello {
         version: AGENT_PROTOCOL_VERSION,
@@ -523,7 +517,7 @@ fn handle_maintenance_helper_connection(
     )?;
 
     let mut frame = read_frame(stream)?;
-    let live_share_active = match frame.kind {
+    match frame.kind {
         FrameKind::MaintenanceTrim
         | FrameKind::MaintenanceHibernate
         | FrameKind::WindowsSudoQuery
@@ -535,41 +529,24 @@ fn handle_maintenance_helper_connection(
                 stream,
                 "this fixed maintenance request must have an empty payload",
             )?;
-            None
         }
         FrameKind::MaintenanceTrim => match perform_windows_trim() {
-            Ok(()) => {
-                write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
-                None
-            }
-            Err(error) => {
-                send_error(stream, &error.to_string())?;
-                None
-            }
+            Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+            Err(error) => send_error(stream, &error.to_string())?,
         },
         FrameKind::MaintenanceHibernate => match enable_windows_hibernation() {
             Ok(()) => {
                 write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
                 request_windows_hibernation()?;
-                None
             }
-            Err(error) => {
-                send_error(stream, &error.to_string())?;
-                None
-            }
+            Err(error) => send_error(stream, &error.to_string())?,
         },
         FrameKind::WindowsSudoQuery => match windows_sudo::status() {
-            Ok(status) => {
-                write_frame(
-                    stream,
-                    &Frame::new(FrameKind::WindowsSudoStatus, status.encode()),
-                )?;
-                None
-            }
-            Err(error) => {
-                send_error(stream, &error.to_string())?;
-                None
-            }
+            Ok(status) => write_frame(
+                stream,
+                &Frame::new(FrameKind::WindowsSudoStatus, status.encode()),
+            )?,
+            Err(error) => send_error(stream, &error.to_string())?,
         },
         FrameKind::WindowsSudoConfigure => {
             let request = match WindowsSudoConfigureRequest::decode(&frame.payload) {
@@ -577,9 +554,7 @@ fn handle_maintenance_helper_connection(
                 Err(error) => {
                     frame.payload.fill(0);
                     send_error(stream, &error.to_string())?;
-                    return Ok(MaintenanceHelperConnectionOutcome::Authenticated {
-                        live_share_active: None,
-                    });
+                    return Ok(true);
                 }
             };
             frame.payload.fill(0);
@@ -587,21 +562,18 @@ fn handle_maintenance_helper_connection(
                 Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
                 Err(error) => send_error(stream, &error.to_string())?,
             }
-            None
         }
         FrameKind::LiveShareQuery => match query_windows_live_share() {
             Ok(status) => {
-                let mapped = status.mapped;
+                if live_share_keeper.is_some() && !status.mapped {
+                    live_share_keeper.take();
+                }
                 write_frame(
                     stream,
                     &Frame::new(FrameKind::LiveShareStatus, status.encode()),
                 )?;
-                Some(mapped)
             }
-            Err(error) => {
-                send_error(stream, &error.to_string())?;
-                None
-            }
+            Err(error) => send_error(stream, &error.to_string())?,
         },
         FrameKind::LiveShareConfigure => {
             let request = match LiveShareConfigureRequest::decode(&frame.payload) {
@@ -609,21 +581,13 @@ fn handle_maintenance_helper_connection(
                 Err(error) => {
                     frame.payload.fill(0);
                     send_error(stream, &error.to_string())?;
-                    return Ok(MaintenanceHelperConnectionOutcome::Authenticated {
-                        live_share_active: None,
-                    });
+                    return Ok(true);
                 }
             };
             frame.payload.fill(0);
-            match configure_windows_live_share(request.enable, expected_token) {
-                Ok(()) => {
-                    write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
-                    Some(request.enable)
-                }
-                Err(error) => {
-                    send_error(stream, &error.to_string())?;
-                    None
-                }
+            match configure_windows_live_share(request.enable, expected_token, live_share_keeper) {
+                Ok(()) => write_frame(stream, &Frame::new(FrameKind::Pong, Vec::new()))?,
+                Err(error) => send_error(stream, &error.to_string())?,
             }
         }
         _ => {
@@ -632,10 +596,9 @@ fn handle_maintenance_helper_connection(
                 stream,
                 "maintenance helper accepts only fixed maintenance, Windows sudo, and live-share requests",
             )?;
-            None
         }
-    };
-    Ok(MaintenanceHelperConnectionOutcome::Authenticated { live_share_active })
+    }
+    Ok(true)
 }
 
 #[cfg(windows)]
@@ -658,9 +621,169 @@ exit 0
 }
 
 #[cfg(windows)]
+struct LiveShareKeeper {
+    child: Option<Child>,
+}
+
+#[cfg(windows)]
+impl LiveShareKeeper {
+    fn start(credential: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let script = r#"$ErrorActionPreference='Stop'
+try {
+    $Remote='\\10.0.2.4\qemu'
+    $Secret=$env:LSW_LIVE_SMB_CREDENTIAL
+    Remove-Item Env:LSW_LIVE_SMB_CREDENTIAL -ErrorAction SilentlyContinue
+    $Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+    if ($null -ne $Mapping -and $Mapping.RemotePath -ne $Remote) {
+        throw 'Windows drive L: is already mapped to a different location'
+    }
+    if ($null -eq $Mapping) {
+        $Password=ConvertTo-SecureString $Secret -AsPlainText -Force
+        $Credential=New-Object Management.Automation.PSCredential('lsw',$Password)
+        $Secret=$null
+        New-SmbMapping -GlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
+    } else {
+        $Secret=$null
+    }
+    $Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction Stop
+    if ($null -eq $Mapping -or $Mapping.RemotePath -ne $Remote) {
+        throw 'Windows did not register the global Linux (L:) mapping'
+    }
+    Get-Item -LiteralPath 'L:\' -ErrorAction Stop | Out-Null
+    $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L\DefaultLabel'
+    New-Item -Path $Label -Force | Out-Null
+    Set-Item -Path $Label -Value 'Linux'
+    [Console]::Out.WriteLine('LSW_LIVE_READY')
+    [Console]::Out.Flush()
+    if ([Console]::In.ReadLine() -ne 'UNMOUNT') {
+        throw 'LSW live-share keeper received an invalid control request'
+    }
+    $Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+    if ($null -ne $Mapping) {
+        if ($Mapping.RemotePath -ne $Remote) {
+            throw 'Windows drive L: is mapped to a location not owned by LSW'
+        }
+        Remove-SmbMapping -GlobalMapping -LocalPath 'L:' -Force
+    }
+    $LabelRoot='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
+    Remove-Item -LiteralPath $LabelRoot -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    [Console]::Error.WriteLine(($_ | Out-String))
+    exit 1
+}
+"#;
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .env("LSW_LIVE_SMB_CREDENTIAL", credential)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or("Windows live-share keeper stdout was unavailable")?,
+        );
+        let mut ready = String::new();
+        let ready_result = stdout.read_line(&mut ready);
+        child.stdout = Some(stdout.into_inner());
+        let failure = match ready_result {
+            Ok(0) => Some("Windows live-share keeper exited before reporting ready".to_owned()),
+            Ok(_) if ready.trim_end_matches(['\r', '\n']) == "LSW_LIVE_READY" => None,
+            Ok(_) => {
+                Some("Windows live-share keeper returned an invalid readiness marker".to_owned())
+            }
+            Err(error) => Some(format!(
+                "Windows live-share keeper readiness failed: {error}"
+            )),
+        };
+        if let Some(failure) = failure {
+            let _ = child.kill();
+            let output = child.wait_with_output()?;
+            if output.stdout.len().saturating_add(output.stderr.len()) > 64 * 1024 {
+                return Err("Windows live-share keeper returned an oversized error".into());
+            }
+            let mut detail = format_powershell_output(&output);
+            detail = detail.replace(credential, "<redacted>");
+            return Err(format!("{failure}: {detail}").into());
+        }
+        Ok(Self { child: Some(child) })
+    }
+
+    fn stop(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or("Windows live-share keeper process was unavailable")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("Windows live-share keeper stdin was unavailable")?;
+        stdin.write_all(b"UNMOUNT\n")?;
+        stdin.flush()?;
+        drop(stdin);
+        let output = child.wait_with_output()?;
+        if output.stdout.len().saturating_add(output.stderr.len()) > 64 * 1024 {
+            return Err("Windows live-share unmount returned an oversized error".into());
+        }
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Windows live-share keeper could not unmount Linux (L:): {}",
+                format_powershell_output(&output)
+            )
+            .into())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LiveShareKeeper {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(b"UNMOUNT\n");
+            let _ = stdin.flush();
+        }
+        for _ in 0..20 {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(windows)]
+fn format_powershell_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match (stdout.trim(), stderr.trim()) {
+        ("", "") => format!("PowerShell exited with {}", output.status),
+        (stdout, "") => stdout.to_owned(),
+        ("", stderr) => stderr.to_owned(),
+        (stdout, stderr) => format!("{stderr}\n{stdout}"),
+    }
+}
+
+#[cfg(windows)]
 fn configure_windows_live_share(
     enable: bool,
     credential: &str,
+    live_share_keeper: &mut Option<LiveShareKeeper>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if credential.len() != 64
         || !credential
@@ -669,28 +792,16 @@ fn configure_windows_live_share(
     {
         return Err("live-share credential must be 64 lowercase hexadecimal characters".into());
     }
-    let body = if enable {
-        r#"$Remote='\\10.0.2.4\qemu'
-$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
-if ($null -ne $Mapping -and $Mapping.RemotePath -ne $Remote) {
-    throw 'Windows drive L: is already mapped to a different location'
-}
-if ($null -eq $Mapping) {
-    $Password=ConvertTo-SecureString $env:LSW_LIVE_SMB_CREDENTIAL -AsPlainText -Force
-    $Credential=New-Object Management.Automation.PSCredential('lsw',$Password)
-    New-SmbMapping -GlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
-}
-$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction Stop
-if ($null -eq $Mapping -or $Mapping.RemotePath -ne $Remote) {
-    throw 'Windows did not register the global Linux (L:) mapping'
-}
-Get-Item -LiteralPath 'L:\' -ErrorAction Stop | Out-Null
-$Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L\DefaultLabel'
-New-Item -Path $Label -Force | Out-Null
-Set-Item -Path $Label -Value 'Linux'
-"#
-    } else {
-        r#"$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
+    if enable {
+        if live_share_keeper.is_none() {
+            *live_share_keeper = Some(LiveShareKeeper::start(credential)?);
+        }
+        return Ok(());
+    }
+    if let Some(keeper) = live_share_keeper.take() {
+        return keeper.stop();
+    }
+    let body = r#"$Mapping=Get-SmbGlobalMapping -LocalPath 'L:' -ErrorAction SilentlyContinue
 if ($null -ne $Mapping) {
     if ($Mapping.RemotePath -ne '\\10.0.2.4\qemu') {
         throw 'Windows drive L: is mapped to a location not owned by LSW'
@@ -699,13 +810,12 @@ if ($null -ne $Mapping) {
 }
 $Label='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\DriveIcons\L'
 Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue
-"#
-    };
+"#;
     let script = format!(
         "$ErrorActionPreference='Stop'\ntry {{\n{body}}} catch {{\n\
          [Console]::Error.WriteLine(($_ | Out-String))\nexit 1\n}}\n"
     );
-    let code = run_fixed_powershell_inner(&script, enable.then_some(credential))?;
+    let code = run_fixed_powershell(&script)?;
     if code == 0 {
         Ok(())
     } else {
@@ -715,24 +825,12 @@ Remove-Item -LiteralPath $Label -Recurse -Force -ErrorAction SilentlyContinue
 
 #[cfg(windows)]
 fn run_fixed_powershell(script: &str) -> Result<i32, Box<dyn std::error::Error>> {
-    run_fixed_powershell_inner(script, None)
-}
-
-#[cfg(windows)]
-fn run_fixed_powershell_inner(
-    script: &str,
-    credential: Option<&str>,
-) -> Result<i32, Box<dyn std::error::Error>> {
-    let mut command = Command::new("powershell.exe");
-    command
+    let mut child = Command::new("powershell.exe")
         .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(credential) = credential {
-        command.env("LSW_LIVE_SMB_CREDENTIAL", credential);
-    }
-    let mut child = command.spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()?;
     child
         .stdin
         .take()
@@ -745,15 +843,12 @@ fn run_fixed_powershell_inner(
     if !output.status.success() && !matches!(output.status.code(), Some(3 | 4)) {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut detail = match (stdout.trim(), stderr.trim()) {
+        let detail = match (stdout.trim(), stderr.trim()) {
             ("", "") => format!("PowerShell exited with {}", output.status),
             (stdout, "") => stdout.to_owned(),
             ("", stderr) => stderr.to_owned(),
             (stdout, stderr) => format!("{stderr}\n{stdout}"),
         };
-        if let Some(credential) = credential {
-            detail = detail.replace(credential, "<redacted>");
-        }
         return Err(format!("Windows live-share operation failed: {detail}").into());
     }
     Ok(output.status.code().unwrap_or(-1))
