@@ -638,10 +638,8 @@ try {
         throw 'Windows drive L: is already mapped to a different location'
     }
     if ($null -eq $Mapping) {
-        $Password=ConvertTo-SecureString $Secret -AsPlainText -Force
-        $Credential=New-Object Management.Automation.PSCredential('lsw',$Password)
+        New-SmbMapping -GlobalMapping -LocalPath 'L:' -RemotePath $Remote -UserName 'lsw' -Password $Secret -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
         $Secret=$null
-        New-SmbMapping -GlobalMapping -LocalPath 'L:' -RemotePath $Remote -Credential $Credential -RequireIntegrity $true -RequirePrivacy $true -Persistent $true | Out-Null
     } else {
         $Secret=$null
     }
@@ -655,8 +653,6 @@ try {
     Set-Item -Path $Label -Value 'Linux'
     [Console]::Out.WriteLine('LSW_LIVE_READY')
     [Console]::Out.Flush()
-    $Credential=$null
-    $Password=$null
     while ($true) {
         Start-Sleep -Seconds 86400
     }
@@ -665,22 +661,22 @@ try {
     exit 1
 }
 "#;
-        // Keep the same stdin-hosted invocation used by fixed one-shot
-        // operations. Under the SCM LocalSystem context, the SMB client cmdlet
-        // rejects a direct script command line with Windows error 1312.
+        // Use New-SmbMapping's native username/password parameter set. Creating
+        // a PSCredential under the SCM LocalSystem context fails with Windows
+        // error 1312 because that service has no interactive logon session.
         let mut child = Command::new("powershell.exe")
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"])
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
             .env("LSW_LIVE_SMB_CREDENTIAL", credential)
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or("Windows live-share keeper stdin was unavailable")?;
-        stdin.write_all(script.as_bytes())?;
-        drop(stdin);
         let mut stdout = BufReader::new(
             child
                 .stdout
