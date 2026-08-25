@@ -187,10 +187,10 @@ The broader hardware and soak matrix still includes:
 - `run --detach` discards process standard streams and keeps the process owned
   by the agent's Job. It does not turn a Session 0 process into a visible desktop
   application.
-- There is no per-HWND Wayland/X11 compositor bridge, clipboard, audio, GPU
-  acceleration, or shared-memory graphics driver. `lsw run --gui` starts an
-  EXE in the signed-in Windows user's session, but Slice 3 does not yet create
-  a Linux-native window for it.
+- `lsw run --gui` maps the first visible HWND from the signed-in Windows user's
+  session to a native Wayland window with X11 fallback. It does not yet map
+  additional HWNDs or modal/owner relationships, clipboard, audio, DPI changes,
+  drag-and-drop, UAC secure-desktop state, GPU acceleration, or shared memory.
 - Installation and recovery use private Unix-socket VNC. There is no RDP or TCP
   VNC listener.
 - Agent commands and ConPTY sessions run in Windows Session 0 as

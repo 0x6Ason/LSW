@@ -20,7 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     encode_process_id, read_frame, write_frame, ClientHello, DesktopLiveShareRequest,
-    FileGetRequest, FilePutRequest, Frame, FrameKind, GuiIconRequest, GuiStartRequest,
+    FileGetRequest, FilePutRequest, Frame, FrameKind, GuiIconRequest, GuiInputEvent,
+    GuiStartRequest, GuiWindowClosed, GuiWindowDamage, GuiWindowReady, GuiWindowResize,
     LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
     SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
     TerminalStartRequest, UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest,
@@ -32,7 +33,7 @@ use lsw_core::{
 use lsw_core::{
     DesktopUserRequest, TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1,
     CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
-    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
+    CAPABILITY_GUI_WINDOW_V1, CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
     CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
     CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
     CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1, CLONE_IDENTITY_MARKER_FILE,
@@ -1335,6 +1336,7 @@ fn handle_connection(
             live_share_configure(stream, &request_frame.payload, expected_token)
         }
         FrameKind::GuiStart => gui_start(stream, &request_frame.payload, expected_token),
+        FrameKind::GuiWindowOpen => gui_window(stream, &request_frame.payload, expected_token),
         FrameKind::GuiIcon => gui_icon(stream, &request_frame.payload, expected_token),
         FrameKind::DesktopLiveShareConfigure => {
             desktop_live_share_configure(stream, &request_frame.payload, expected_token)
@@ -1372,6 +1374,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_LIVE_SHARE_V1.to_owned());
         capabilities.push(CAPABILITY_GUI_LAUNCH_V1.to_owned());
         capabilities.push(CAPABILITY_GUI_ICON_V1.to_owned());
+        capabilities.push(CAPABILITY_GUI_WINDOW_V1.to_owned());
         capabilities.push(CAPABILITY_DESKTOP_LIVE_SHARE_V1.to_owned());
         capabilities
     };
@@ -1699,6 +1702,33 @@ fn gui_start(
     Ok(())
 }
 
+fn gui_window(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match GuiStartRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    {
+        forward_gui_window(stream, &request, expected_token)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (request, expected_token);
+        send_error(
+            &mut stream,
+            "Windows seamless GUI capture is unavailable on this platform",
+        )?;
+        Err("Windows seamless GUI capture is unavailable on this platform".into())
+    }
+}
+
 fn gui_icon(
     mut stream: TcpStream,
     payload: &[u8],
@@ -1756,6 +1786,102 @@ fn desktop_live_share_configure(
             send_error(&mut stream, &error.to_string())?;
             return Err(error);
         }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn forward_gui_window(
+    mut host: TcpStream,
+    request: &GuiStartRequest,
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut desktop = connect_or_start_desktop_companion(
+        &request.user_name,
+        expected_token,
+        CAPABILITY_GUI_WINDOW_V1,
+    )?;
+    desktop.set_read_timeout(None)?;
+    desktop.set_write_timeout(None)?;
+    write_frame(
+        &mut desktop,
+        &Frame::new(FrameKind::GuiWindowOpen, request.encode()?),
+    )?;
+
+    let mut host_reader = host.try_clone()?;
+    let mut desktop_writer = desktop.try_clone()?;
+    let input_relay = thread::spawn(move || -> Result<(), String> {
+        loop {
+            let frame = read_frame(&mut host_reader).map_err(|error| error.to_string())?;
+            validate_gui_control_frame(&frame).map_err(|error| error.to_string())?;
+            let terminal = frame.kind == FrameKind::GuiWindowClose;
+            write_frame(&mut desktop_writer, &frame).map_err(|error| error.to_string())?;
+            if terminal {
+                return Ok(());
+            }
+        }
+    });
+
+    let relay_result = loop {
+        let frame = match read_frame(&mut desktop) {
+            Ok(frame) => frame,
+            Err(error) => break Err(error.into()),
+        };
+        if let Err(error) = validate_gui_event_frame(&frame) {
+            break Err(error);
+        }
+        let terminal = matches!(frame.kind, FrameKind::GuiWindowClosed | FrameKind::Error);
+        if let Err(error) = write_frame(&mut host, &frame) {
+            break Err(error.into());
+        }
+        if terminal {
+            break Ok(());
+        }
+    };
+    let _ = host.shutdown(Shutdown::Both);
+    let _ = desktop.shutdown(Shutdown::Both);
+    let input_result = input_relay
+        .join()
+        .map_err(|_| "seamless GUI input relay panicked".to_owned())?;
+    match (relay_result, input_result) {
+        (Err(error), Err(input_error)) => {
+            Err(format!("{error}; input relay: {input_error}").into())
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), _) => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn validate_gui_control_frame(frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
+    match frame.kind {
+        FrameKind::GuiWindowInput => {
+            GuiInputEvent::decode(&frame.payload)?;
+        }
+        FrameKind::GuiWindowResize => {
+            GuiWindowResize::decode(&frame.payload)?;
+        }
+        FrameKind::GuiWindowClose if frame.payload.is_empty() => {}
+        FrameKind::GuiWindowClose => return Err("GUI_WINDOW_CLOSE payload must be empty".into()),
+        _ => return Err("invalid host frame in a seamless GUI session".into()),
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_gui_event_frame(frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
+    match frame.kind {
+        FrameKind::GuiWindowReady => {
+            GuiWindowReady::decode(&frame.payload)?;
+        }
+        FrameKind::GuiWindowDamage => {
+            GuiWindowDamage::decode(&frame.payload)?;
+        }
+        FrameKind::GuiWindowClosed => {
+            GuiWindowClosed::decode(&frame.payload)?;
+        }
+        FrameKind::Error => {}
+        _ => return Err("invalid desktop-companion frame in a seamless GUI session".into()),
     }
     Ok(())
 }
@@ -3305,6 +3431,10 @@ mod windows_desktop;
 
 #[cfg(windows)]
 mod desktop_companion;
+#[cfg(windows)]
+mod windows_capture;
+
+mod gui_damage;
 
 struct Configuration {
     listen: SocketAddr,

@@ -14,6 +14,8 @@ the license supplied with a user's specific media.
 - [Microsoft: Hide sensitive data in answer files](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/wsim/hide-sensitive-data-in-an-answer-file)
 - [Microsoft: SetupComplete.cmd](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/add-a-custom-script-to-windows-setup)
 - [Microsoft: WTSQueryUserToken](https://learn.microsoft.com/en-us/windows/win32/api/wtsapi32/nf-wtsapi32-wtsqueryusertoken)
+- [Microsoft: screen capture with Windows.Graphics.Capture](https://learn.microsoft.com/en-us/windows/apps/develop/media-authoring-processing/screen-capture)
+- [Microsoft: create a GraphicsCaptureItem for an HWND](https://learn.microsoft.com/en-us/windows/win32/api/windows.graphics.capture.interop/nf-windows-graphics-capture-interop-igraphicscaptureiteminterop-createforwindow)
 - [Microsoft: token elevation types](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_elevation_type)
 - [Microsoft: linked access tokens](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-token_linked_token)
 - [Microsoft: Deployment RunSynchronous](https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-deployment-runsynchronous)

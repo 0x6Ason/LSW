@@ -11,6 +11,8 @@ mod completion;
 mod daemon_client;
 mod desktop_launcher;
 mod file_bench;
+#[cfg(unix)]
+mod gui_presenter;
 mod installation;
 mod license;
 mod path_translation;
@@ -1267,14 +1269,21 @@ fn guest_command(
             .folder_shares
             .iter()
             .any(|share| share.transport == FolderShareTransport::LiveSmb);
-        let process_id = connect_agent(store, &name)?.run_gui(&GuiStartRequest {
+        let session = connect_agent(store, &name)?.open_gui_window(&GuiStartRequest {
             user_name,
             request,
             environment: parsed.environment,
             mount_live_share,
         })?;
-        println!("Started GUI process {process_id} in {name:?}.");
-        return Ok(0);
+        #[cfg(unix)]
+        {
+            return guest_exit_code(gui_presenter::present(session)?);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = session;
+            return Err("seamless GUI presentation requires a Wayland or X11 host".into());
+        }
     }
     let client = connect_agent(store, &name)?;
     if parsed.detached {

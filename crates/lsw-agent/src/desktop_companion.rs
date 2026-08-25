@@ -5,26 +5,34 @@
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Read};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use lsw_core::{
     constant_time_token_eq, encode_process_id, read_frame, write_frame, ClientHello,
-    DesktopLiveShareRequest, Frame, FrameKind, GuiIconRequest, GuiStartRequest, LiveShareStatus,
-    ServerHello, AGENT_PROTOCOL_VERSION, CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1,
-    CAPABILITY_GUI_LAUNCH_V1, DESKTOP_COMPANION_GUEST_PORT,
+    DesktopLiveShareRequest, Frame, FrameKind, GuiIconRequest, GuiInputEvent, GuiStartRequest,
+    GuiWindowClosed, GuiWindowResize, LiveShareStatus, ServerHello, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
+    CAPABILITY_GUI_WINDOW_V1, DESKTOP_COMPANION_GUEST_PORT,
 };
 
-use super::{send_error, windows_live_share, DESKTOP_COMPANION_IDLE_TIMEOUT, HANDSHAKE_TIMEOUT};
+use super::{
+    gui_damage::DamageTracker, send_error, windows_capture, windows_live_share,
+    DESKTOP_COMPANION_IDLE_TIMEOUT, HANDSHAKE_TIMEOUT,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_ICON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ICON_ERROR_BYTES: usize = 64 * 1024;
 const ICON_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const FIRST_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const GUI_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const DESKTOP_TOKEN_ENV: &str = "LSW_DESKTOP_TOKEN";
 const LIVE_SHARE_TOKEN_ENV: &str = "LSW_LIVE_SHARE_TOKEN";
 const DESKTOP_USER_ENV: &str = "LSW_DESKTOP_USER";
@@ -110,6 +118,7 @@ fn handle_connection(
         capabilities: vec![
             CAPABILITY_GUI_LAUNCH_V1.to_owned(),
             CAPABILITY_GUI_ICON_V1.to_owned(),
+            CAPABILITY_GUI_WINDOW_V1.to_owned(),
             CAPABILITY_DESKTOP_LIVE_SHARE_V1.to_owned(),
         ],
     };
@@ -130,6 +139,16 @@ fn handle_connection(
                 stream,
                 &Frame::new(FrameKind::Started, encode_process_id(process_id)),
             )?;
+        }
+        FrameKind::GuiWindowOpen => {
+            let request = GuiStartRequest::decode(&request.payload)?;
+            require_user(&request.user_name, expected_user)?;
+            if request.mount_live_share {
+                windows_live_share::configure(true, live_share_token)?;
+            }
+            stream.set_read_timeout(None)?;
+            stream.set_write_timeout(None)?;
+            stream_gui_window(stream, &request)?;
         }
         FrameKind::GuiIcon => {
             let request = GuiIconRequest::decode(&request.payload)?;
@@ -158,9 +177,228 @@ fn handle_connection(
         }
         _ => send_error(
             stream,
-            "desktop companion accepts only GUI_START, GUI_ICON, or DESKTOP_LIVE_SHARE_CONFIGURE",
+            "desktop companion accepts only GUI_START, GUI_WINDOW_OPEN, GUI_ICON, or DESKTOP_LIVE_SHARE_CONFIGURE",
         )?,
     }
+    Ok(())
+}
+
+enum GuiControl {
+    Frame(Frame),
+    Disconnected(String),
+}
+
+fn stream_gui_window(
+    stream: &mut TcpStream,
+    request: &GuiStartRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut child = spawn_gui(request)?;
+    let process_id = child.id();
+    let result = stream_gui_window_inner(stream, process_id, &mut child);
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
+fn stream_gui_window_inner(
+    stream: &mut TcpStream,
+    process_id: u32,
+    child: &mut Child,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let window = windows_capture::find_process_window(process_id, child)?;
+    let mut capture = windows_capture::CaptureSession::start(&window)?;
+    let first_deadline = Instant::now() + FIRST_CAPTURE_TIMEOUT;
+    let first = loop {
+        if let Some(frame) = capture.next_frame(Duration::from_millis(250))? {
+            break frame;
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(format!("GUI process exited with {status} before its first frame").into());
+        }
+        if Instant::now() >= first_deadline {
+            return Err("timed out waiting for the first Windows Graphics Capture frame".into());
+        }
+    };
+    let mut width = first.width;
+    let mut height = first.height;
+    write_frame(
+        stream,
+        &Frame::new(
+            FrameKind::GuiWindowReady,
+            window.ready(process_id, width, height)?.encode()?,
+        ),
+    )?;
+    let mut damage = DamageTracker::default();
+    send_damages(stream, damage.update(width, height, &first.bgra)?)?;
+
+    let mut reader = stream.try_clone()?;
+    let (control_sender, control_receiver) = mpsc::sync_channel(128);
+    let reader_thread = thread::spawn(move || loop {
+        match read_frame(&mut reader) {
+            Ok(frame) => {
+                if control_sender.send(GuiControl::Frame(frame)).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = control_sender.send(GuiControl::Disconnected(error.to_string()));
+                return;
+            }
+        }
+    });
+
+    let mut close_deadline = None;
+    let mut window_missing_since = None;
+    let result = 'session: loop {
+        'control: loop {
+            match control_receiver.try_recv() {
+                Ok(GuiControl::Frame(frame)) => match frame.kind {
+                    FrameKind::GuiWindowInput => {
+                        if let Err(error) = GuiInputEvent::decode(&frame.payload)
+                            .map_err(|error| error.into())
+                            .and_then(|event| window.input(event).map_err(|error| error.into()))
+                        {
+                            break 'session Err(error);
+                        }
+                    }
+                    FrameKind::GuiWindowResize => {
+                        if let Err(error) = GuiWindowResize::decode(&frame.payload)
+                            .map_err(|error| error.into())
+                            .and_then(|resize| window.resize(resize).map_err(|error| error.into()))
+                        {
+                            break 'session Err(error);
+                        }
+                    }
+                    FrameKind::GuiWindowClose if frame.payload.is_empty() => {
+                        if let Err(error) = window.close() {
+                            break 'session Err(error.into());
+                        }
+                        close_deadline = Some(Instant::now() + GUI_CLOSE_TIMEOUT);
+                    }
+                    FrameKind::GuiWindowClose => {
+                        break 'session Err("GUI_WINDOW_CLOSE payload must be empty".into());
+                    }
+                    _ => {
+                        break 'session Err("invalid frame in a seamless GUI session".into());
+                    }
+                },
+                Ok(GuiControl::Disconnected(error)) => {
+                    break 'session Err(format!("seamless GUI client disconnected: {error}").into());
+                }
+                Err(TryRecvError::Empty) => break 'control,
+                Err(TryRecvError::Disconnected) => {
+                    break 'session Err("seamless GUI input channel closed".into());
+                }
+            }
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let exit_code = status.code().unwrap_or(1);
+                if let Err(error) = send_gui_closed(stream, exit_code) {
+                    break 'session Err(error);
+                }
+                break 'session Ok(());
+            }
+            Ok(None) => {}
+            Err(error) => break 'session Err(error.into()),
+        }
+        if close_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if let Err(error) = child.kill() {
+                break 'session Err(error.into());
+            }
+            match child.wait() {
+                Ok(status) => {
+                    if let Err(error) = send_gui_closed(stream, status.code().unwrap_or(1)) {
+                        break 'session Err(error);
+                    }
+                    break 'session Ok(());
+                }
+                Err(error) => break 'session Err(error.into()),
+            }
+        }
+        if window.is_open() {
+            window_missing_since = None;
+        } else {
+            let missing = window_missing_since.get_or_insert_with(Instant::now);
+            if missing.elapsed() >= GUI_CLOSE_TIMEOUT {
+                if let Err(error) = child.kill() {
+                    break 'session Err(error.into());
+                }
+                match child.wait() {
+                    Ok(status) => {
+                        if let Err(error) = send_gui_closed(stream, status.code().unwrap_or(1)) {
+                            break 'session Err(error);
+                        }
+                        break 'session Ok(());
+                    }
+                    Err(error) => break 'session Err(error.into()),
+                }
+            }
+        }
+        match capture.next_frame(CAPTURE_POLL_INTERVAL) {
+            Ok(Some(frame)) => {
+                if (frame.width, frame.height) != (width, height) {
+                    width = frame.width;
+                    height = frame.height;
+                    let ready = window
+                        .ready(process_id, width, height)
+                        .and_then(|ready| Ok(ready.encode()?));
+                    match ready.and_then(|payload| {
+                        write_frame(stream, &Frame::new(FrameKind::GuiWindowReady, payload))
+                            .map_err(|error| error.into())
+                    }) {
+                        Ok(()) => {}
+                        Err(error) => break 'session Err(error),
+                    }
+                }
+                match damage
+                    .update(width, height, &frame.bgra)
+                    .map_err(|error| error.into())
+                    .and_then(|damages| send_damages(stream, damages))
+                {
+                    Ok(()) => {}
+                    Err(error) => break 'session Err(error),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => break 'session Err(error),
+        }
+    };
+    if let Err(error) = &result {
+        let _ = send_error(stream, &error.to_string());
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    let _ = reader_thread.join();
+    result
+}
+
+fn send_damages(
+    stream: &mut TcpStream,
+    damages: Vec<lsw_core::GuiWindowDamage>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for damage in damages {
+        write_frame(
+            stream,
+            &Frame::new(FrameKind::GuiWindowDamage, damage.encode()?),
+        )?;
+    }
+    Ok(())
+}
+
+fn send_gui_closed(
+    stream: &mut TcpStream,
+    exit_code: i32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_frame(
+        stream,
+        &Frame::new(
+            FrameKind::GuiWindowClosed,
+            GuiWindowClosed { exit_code }.encode().to_vec(),
+        ),
+    )?;
     Ok(())
 }
 

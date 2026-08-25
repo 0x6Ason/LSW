@@ -166,6 +166,15 @@ headless workflows working.
   crash recovery for that first window without requiring RDP or public VNC.
   Shared-memory or GPU acceleration may improve performance later but cannot be
   required for correctness.
+- The Slice 4 source path is implemented on the beta.8 development line behind
+  `gui-window-v1`: the desktop companion selects the first visible top-level
+  HWND, captures it through Windows Graphics Capture, emits bounded changed
+  tiles, and owns the child until close, crash, or host disconnect. The Linux
+  client prefers a native Wayland window, falls back to X11, and forwards
+  focus, keyboard, pointer, wheel, resize, and close events. Rust 1.76 protocol,
+  Windows-agent, and Linux cross-target gates pass. A signed-in-user Windows/KVM
+  run remains the exact-commit acceptance boundary before Slice 4 is declared
+  release-validated.
 
 ### Slice 5: complete HWND and display behavior
 

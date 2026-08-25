@@ -98,6 +98,17 @@ child. The companion also case-insensitively binds every request to its expected
 username. It exits after 30 idle seconds when it owns no GUI child or live
 mapping; an active mapping keeps the low-resource broker available.
 
+The append-only `gui-window-v1` request selects only the first visible
+top-level HWND owned by the launched process. The companion uses documented
+Windows Graphics Capture without a picker, caps complete frames at 128 MiB,
+splits output into bounded 128-pixel tiles, and validates every dimension and
+payload length at the companion, service relay, and host client. The relay
+accepts only focus, key, pointer, resize, and close frames for that session.
+Input is posted only to the selected HWND; no global `SendInput`, public VNC,
+RDP, or LAN listener is enabled. Closing the host transport reclaims the owned
+GUI process. Slice 4 does not cross UIPI or the UAC secure desktop; later slices
+must retain the private-viewer fallback instead of weakening those boundaries.
+
 Native Windows sudo is a separate capability-gated fixed operation. The normal
 agent asks `LSWMaintenanceHelper` to read the inbox binary and the documented
 local and policy registry values. LSW can set only disabled or new-window mode,
@@ -304,8 +315,8 @@ supply a command, path, drive, option, or PowerShell fragment.
 - Harden Unix containment against deliberate process-group/session escape, and
   exercise both Unix groups and Windows Job Objects with longer-running native
   stress tests.
-- Threat-model clipboard, host folders, USB and per-HWND input before enabling
-  those integrations.
+- Threat-model clipboard, drag-and-drop, file dialogs, USB, multi-HWND
+  relationships, and secure-desktop presentation before enabling them.
 - Fuzz PE parsing and the ConPTY/resize/session-control protocol in addition to
   malformed agent and QMP traffic.
 - Add signed release provenance and a documented vulnerability-reporting route.

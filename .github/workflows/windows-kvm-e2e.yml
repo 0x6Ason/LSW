@@ -290,12 +290,15 @@ jobs:
               exit 1
               ;;
           esac
+          e2e_filesystem=$(findmnt -n -o FSTYPE --target "$canonical_e2e_root")
           if [[ "$(stat -c %u -- "$canonical_e2e_root")" != "$(id -u)" || \
                 "$(stat -c %a -- "$canonical_e2e_root")" != 700 ]]; then
             echo "error: the E2E root must be owned by the runner account with mode 0700" >&2
+            if [[ "$e2e_filesystem" == 9p ]]; then
+              echo "error: a WSL DrvFS root must be mounted separately with metadata, the runner UID/GID, and umask=077; see docs/WINDOWS_KVM_E2E.md" >&2
+            fi
             exit 1
           fi
-          e2e_filesystem=$(findmnt -n -o FSTYPE --target "$canonical_e2e_root")
           case "$e2e_filesystem" in
             tmpfs|ramfs)
               echo "error: LSW_E2E_ROOT_BASE must use disk-backed storage" >&2

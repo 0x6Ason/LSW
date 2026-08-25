@@ -38,6 +38,9 @@ guest.
 - Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, and a
   UDF-capable `7z`. `remote-viewer` is optional and used only for `--viewer` or
   `lsw view`.
+- `lsw run --gui` additionally needs an ordinary Wayland or X11 desktop session
+  and its standard client libraries; terminal-only install, exec, and recovery
+  remain headless.
 - LSW downloads official media directly from allowlisted Microsoft HTTPS CDNs
   and verifies Microsoft's published SHA-256. It never redistributes Windows,
   product keys, activation data, preactivated disks, or modified images.
@@ -206,12 +209,16 @@ successful start handshake, disconnects from its standard streams, and lets the
 agent retain lifecycle ownership until the process exits.
 
 `lsw run --gui [NAME] [--cwd PATH] [-e KEY=VALUE] -- PROGRAM.exe [ARG ...]`
-starts a GUI program with the registered Windows identity. `lsw app install`
+starts a GUI program with the registered Windows identity and presents its first
+visible top-level HWND as an ordinary Wayland window, with automatic X11
+fallback. The window carries damage-only frames and forwards focus, keyboard,
+pointer, wheel, resize, close, and guest exit state. `lsw app install`
 discovers the EXE icon in Windows and writes a Linux `.desktop` entry;
 `lsw app list` and `lsw app remove ID` manage those entries. Launchers accept
 dropped files through `%F` and translate existing host paths below the approved
-live-share root to `L:\...`. Slice 3 establishes launch and lifecycle plumbing;
-per-window display on Wayland/X11 begins in Slice 4.
+live-share root to `L:\...`. Slice 4 intentionally exposes only the first HWND;
+multi-window ownership, DPI, clipboard, drag-and-drop, and UAC presentation are
+later beta.8 slices.
 
 Recursive transfer refuses host symlinks, guest reparse points, traversal, and
 implicit overwrite. `sync` is intentionally host-to-guest and additive:
@@ -484,10 +491,11 @@ The beta.7 agent runs at boot as the automatic `LSWAgent` Windows service under
 identity in Windows Session 0; they do not impersonate a desktop user. This
 provides command access at the Windows sign-in screen without storing a daily
 user credential.
-The beta.8 Slice 3 companion is launched on demand through a fixed LocalSystem
+The beta.8 companion is launched on demand through a fixed LocalSystem
 WTS boundary and runs as the registered, already signed-in Windows user. It can
-start GUI processes and own that user's `L:` mapping. Clipboard, audio, window
-capture, and per-HWND Wayland/X11 presentation are not enabled yet.
+start GUI processes, own that user's `L:` mapping, and stream the first captured
+HWND to a native Wayland/X11 window. Clipboard, audio, multi-HWND relationships,
+DPI transitions, drag-and-drop, and UAC presentation are not enabled yet.
 
 Controlled sessions distinguish stdin EOF, authenticated cancellation,
 interrupt/terminate signals, detached start acknowledgement, and disconnect
@@ -595,9 +603,9 @@ targets, Zig, or operating-system media.
 - The optional installation and recovery display uses private Unix-socket VNC
   internally; LSW opens it only when requested and does not expose TCP VNC or RDP.
 - Ordinary `lsw run` remains a Session 0 process. `lsw run --gui` starts in the
-  registered user's existing Windows session, but per-window Wayland/X11
-  capture is a Slice 4 feature; Slice 3 does not yet render that HWND as a Linux
-  window.
+  registered user's existing Windows session and renders its first visible HWND
+  as a Wayland/X11 window. Additional top-level windows and transient/modal
+  relationships are not mapped until Slice 5.
 - Signed VirtIO drivers are not bundled or silently installed. The balloon
   device and governor are available, but useful guest reclaim depends on a
   compatible signed Windows driver; the inbox NVMe/e1000e path remains valid.

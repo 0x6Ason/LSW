@@ -116,6 +116,30 @@ this directory to be owned by that account, have mode `0700`, use a filesystem
 other than tmpfs/ramfs, and have a canonical absolute path no longer than 16
 bytes.
 
+For a WSL runner whose large state must live on `D:`, do not point the gate at
+the inherited `/mnt/d/e2e` mount. A default DrvFS mount can report every
+directory as mode `0777`, so `chmod 0700` alone cannot satisfy the ownership
+boundary. Mount only the dedicated Windows directory at the short Linux path
+with DrvFS metadata enabled. From PowerShell, while the runner is stopped:
+
+```powershell
+New-Item -ItemType Directory -Force -Path 'D:\e2e' | Out-Null
+$runnerUid = (wsl.exe -- id -u).Trim()
+$runnerGid = (wsl.exe -- id -g).Trim()
+wsl.exe -u root -- mkdir -p /e
+wsl.exe -u root -- sh -lc 'mountpoint -q /e && umount /e || true'
+wsl.exe -u root -- mount -t drvfs 'D:\e2e' /e -o "metadata,uid=$runnerUid,gid=$runnerGid,umask=077"
+wsl.exe -- chmod 700 /e
+wsl.exe -- stat -c '%u %a' /e
+```
+
+The final command must print the runner UID and `700`. Add the equivalent
+`drvfs` entry to that distribution's `/etc/fstab` if the mount must survive a
+WSL restart; keep the same UID, GID, `metadata`, and `umask=077` options. Set
+`LSW_E2E_ROOT_BASE=/e`, not `/mnt/d/e2e`. This uses the real `D:\e2e` files and
+does not create another ext4 image or consume the distribution VHD for VM
+state.
+
 ## Windows media
 
 Set only the short E2E state root in the runner process environment:
@@ -207,12 +231,13 @@ configuration and identity checks and requires the same SID. It also requires
 neither automatic logon nor a stored default password. This prevents a hidden
 desktop login from making the cold-start test pass.
 
-Session 0 remains sufficient for the command and ConPTY contract. Slice 3 adds
-the on-demand user-session companion for GUI process launch, icon discovery,
-and the user's live `L:` mapping without changing that boot-time service
-boundary. The release gate deliberately remains at the sign-in screen, so it
-tests fail-closed WTS selection; per-window capture, clipboard, and audio belong
-to later beta.8 slices.
+Session 0 remains sufficient for the command and ConPTY contract. The on-demand
+user-session companion handles GUI process launch, icon discovery, the user's
+live `L:` mapping, and the Slice 4 first-HWND capture path without changing that
+boot-time service boundary. This headless gate deliberately remains at the
+sign-in screen, so it tests fail-closed WTS selection. A signed-in-user extension
+must validate the Slice 4 Wayland/X11 window before that slice is release-gated;
+clipboard and audio remain later beta.8 work.
 
 This workflow and harness define the required release evidence; they do not
 claim the service path has passed on real hardware. Tag beta.8 only after the

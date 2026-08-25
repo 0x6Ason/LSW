@@ -16,6 +16,13 @@ to Microsoft and the WSL contributors for publishing that naming and UX
 reference. LSW does not incorporate WSL source code and is not affiliated with
 or endorsed by Microsoft.
 
+## minifb
+
+The first-HWND Wayland/X11 presenter uses
+[minifb](https://github.com/emoon/rust_minifb) 0.25.0 under its MIT option,
+copyright 2014 Daniel Collin. Its complete source and license are included in
+release corresponding-source bundles as described above.
+
 ## windows-iso-downloader / MSDL
 
 LSW's Rust implementation of the Microsoft Windows ISO session flow is based

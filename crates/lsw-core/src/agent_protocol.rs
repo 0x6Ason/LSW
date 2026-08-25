@@ -26,6 +26,7 @@ pub const CAPABILITY_DESKTOP_COMPANION_V1: &str = "desktop-companion-v1";
 pub const CAPABILITY_GUI_LAUNCH_V1: &str = "gui-launch-v1";
 pub const CAPABILITY_GUI_ICON_V1: &str = "gui-icon-v1";
 pub const CAPABILITY_DESKTOP_LIVE_SHARE_V1: &str = "desktop-live-share-v1";
+pub const CAPABILITY_GUI_WINDOW_V1: &str = "gui-window-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -34,6 +35,9 @@ pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 1024;
 pub const MAX_STRING_BYTES: usize = 1024 * 1024;
 pub const MAX_TERMINAL_DIMENSION: u16 = i16::MAX as u16;
+pub const MAX_GUI_WINDOW_DIMENSION: u32 = 8_192;
+pub const MAX_GUI_DAMAGE_DIMENSION: u32 = 512;
+pub const MAX_GUI_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -80,6 +84,13 @@ pub enum FrameKind {
     GuiIcon = 44,
     GuiIconData = 45,
     DesktopLiveShareConfigure = 46,
+    GuiWindowOpen = 47,
+    GuiWindowReady = 48,
+    GuiWindowDamage = 49,
+    GuiWindowInput = 50,
+    GuiWindowResize = 51,
+    GuiWindowClose = 52,
+    GuiWindowClosed = 53,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -129,6 +140,13 @@ impl TryFrom<u8> for FrameKind {
             44 => Ok(Self::GuiIcon),
             45 => Ok(Self::GuiIconData),
             46 => Ok(Self::DesktopLiveShareConfigure),
+            47 => Ok(Self::GuiWindowOpen),
+            48 => Ok(Self::GuiWindowReady),
+            49 => Ok(Self::GuiWindowDamage),
+            50 => Ok(Self::GuiWindowInput),
+            51 => Ok(Self::GuiWindowResize),
+            52 => Ok(Self::GuiWindowClose),
+            53 => Ok(Self::GuiWindowClosed),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -689,6 +707,397 @@ impl GuiStartRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuiWindowReady {
+    pub process_id: u32,
+    pub window_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub title: String,
+}
+
+impl GuiWindowReady {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        validate_gui_dimensions(self.width, self.height)?;
+        if self.process_id == 0 {
+            return Err(LswError::Protocol(
+                "GUI process identifier must be non-zero".to_owned(),
+            ));
+        }
+        if self.window_id == 0 {
+            return Err(LswError::Protocol(
+                "GUI window identifier must be non-zero".to_owned(),
+            ));
+        }
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&self.process_id.to_be_bytes());
+        payload.extend_from_slice(&self.window_id.to_be_bytes());
+        payload.extend_from_slice(&self.width.to_be_bytes());
+        payload.extend_from_slice(&self.height.to_be_bytes());
+        push_string(&mut payload, &self.title)?;
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let ready = Self {
+            process_id: decoder.u32()?,
+            window_id: decoder.u64()?,
+            width: decoder.u32()?,
+            height: decoder.u32()?,
+            title: decoder.string()?,
+        };
+        decoder.finish()?;
+        ready.encode()?;
+        Ok(ready)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuiWindowDamage {
+    pub sequence: u64,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+impl GuiWindowDamage {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        validate_gui_damage(self)?;
+        let mut payload = Vec::with_capacity(24 + self.bgra.len());
+        payload.extend_from_slice(&self.sequence.to_be_bytes());
+        payload.extend_from_slice(&self.x.to_be_bytes());
+        payload.extend_from_slice(&self.y.to_be_bytes());
+        payload.extend_from_slice(&self.width.to_be_bytes());
+        payload.extend_from_slice(&self.height.to_be_bytes());
+        payload.extend_from_slice(&self.bgra);
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let sequence = decoder.u64()?;
+        let x = decoder.u32()?;
+        let y = decoder.u32()?;
+        let width = decoder.u32()?;
+        let height = decoder.u32()?;
+        let bgra = decoder.remaining.to_vec();
+        decoder.remaining = &[];
+        decoder.finish()?;
+        let damage = Self {
+            sequence,
+            x,
+            y,
+            width,
+            height,
+            bgra,
+        };
+        validate_gui_damage(&damage)?;
+        Ok(damage)
+    }
+}
+
+fn validate_gui_damage(damage: &GuiWindowDamage) -> Result<()> {
+    if damage.width == 0
+        || damage.height == 0
+        || damage.width > MAX_GUI_DAMAGE_DIMENSION
+        || damage.height > MAX_GUI_DAMAGE_DIMENSION
+    {
+        return Err(LswError::Protocol(format!(
+            "GUI damage dimensions must be between 1 and {MAX_GUI_DAMAGE_DIMENSION}"
+        )));
+    }
+    let right = damage
+        .x
+        .checked_add(damage.width)
+        .ok_or_else(|| LswError::Protocol("GUI damage x coordinate overflowed".to_owned()))?;
+    let bottom = damage
+        .y
+        .checked_add(damage.height)
+        .ok_or_else(|| LswError::Protocol("GUI damage y coordinate overflowed".to_owned()))?;
+    if right > MAX_GUI_WINDOW_DIMENSION || bottom > MAX_GUI_WINDOW_DIMENSION {
+        return Err(LswError::Protocol(
+            "GUI damage lies outside the supported window bounds".to_owned(),
+        ));
+    }
+    let expected = usize::try_from(damage.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(damage.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| LswError::Protocol("GUI damage byte length overflowed".to_owned()))?;
+    if damage.bgra.len() != expected {
+        return Err(LswError::Protocol(format!(
+            "GUI damage contains {} bytes; expected {expected}",
+            damage.bgra.len()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiPointerButton {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+impl GuiPointerButton {
+    fn encode(self) -> u8 {
+        match self {
+            Self::Left => 1,
+            Self::Right => 2,
+            Self::Middle => 3,
+            Self::Back => 4,
+            Self::Forward => 5,
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::Left),
+            2 => Ok(Self::Right),
+            3 => Ok(Self::Middle),
+            4 => Ok(Self::Back),
+            5 => Ok(Self::Forward),
+            _ => Err(LswError::Protocol(format!(
+                "unknown GUI pointer button {value}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiInputEvent {
+    Focus {
+        focused: bool,
+    },
+    Key {
+        virtual_key: u16,
+        scan_code: u16,
+        pressed: bool,
+        extended: bool,
+    },
+    PointerMove {
+        x: u32,
+        y: u32,
+    },
+    PointerButton {
+        button: GuiPointerButton,
+        pressed: bool,
+        x: u32,
+        y: u32,
+    },
+    PointerWheel {
+        delta: i16,
+        horizontal: bool,
+        x: u32,
+        y: u32,
+    },
+}
+
+impl GuiInputEvent {
+    pub fn encode(self) -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        match self {
+            Self::Focus { focused } => {
+                payload.extend_from_slice(&[1, u8::from(focused)]);
+            }
+            Self::Key {
+                virtual_key,
+                scan_code,
+                pressed,
+                extended,
+            } => {
+                if virtual_key == 0 {
+                    return Err(LswError::Protocol(
+                        "GUI virtual key must be non-zero".to_owned(),
+                    ));
+                }
+                payload.push(2);
+                payload.extend_from_slice(&virtual_key.to_be_bytes());
+                payload.extend_from_slice(&scan_code.to_be_bytes());
+                payload.push(u8::from(pressed));
+                payload.push(u8::from(extended));
+            }
+            Self::PointerMove { x, y } => {
+                validate_gui_coordinate(x, y)?;
+                payload.push(3);
+                payload.extend_from_slice(&x.to_be_bytes());
+                payload.extend_from_slice(&y.to_be_bytes());
+            }
+            Self::PointerButton {
+                button,
+                pressed,
+                x,
+                y,
+            } => {
+                validate_gui_coordinate(x, y)?;
+                payload.extend_from_slice(&[4, button.encode(), u8::from(pressed)]);
+                payload.extend_from_slice(&x.to_be_bytes());
+                payload.extend_from_slice(&y.to_be_bytes());
+            }
+            Self::PointerWheel {
+                delta,
+                horizontal,
+                x,
+                y,
+            } => {
+                if delta == 0 {
+                    return Err(LswError::Protocol(
+                        "GUI pointer wheel delta must be non-zero".to_owned(),
+                    ));
+                }
+                validate_gui_coordinate(x, y)?;
+                payload.push(5);
+                payload.extend_from_slice(&delta.to_be_bytes());
+                payload.push(u8::from(horizontal));
+                payload.extend_from_slice(&x.to_be_bytes());
+                payload.extend_from_slice(&y.to_be_bytes());
+            }
+        }
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let event = match decoder.u8()? {
+            1 => Self::Focus {
+                focused: decode_bool(decoder.u8()?, "GUI focus")?,
+            },
+            2 => Self::Key {
+                virtual_key: decoder.u16()?,
+                scan_code: decoder.u16()?,
+                pressed: decode_bool(decoder.u8()?, "GUI key pressed")?,
+                extended: decode_bool(decoder.u8()?, "GUI key extended")?,
+            },
+            3 => Self::PointerMove {
+                x: decoder.u32()?,
+                y: decoder.u32()?,
+            },
+            4 => Self::PointerButton {
+                button: GuiPointerButton::decode(decoder.u8()?)?,
+                pressed: decode_bool(decoder.u8()?, "GUI pointer button pressed")?,
+                x: decoder.u32()?,
+                y: decoder.u32()?,
+            },
+            5 => Self::PointerWheel {
+                delta: decoder.i16()?,
+                horizontal: decode_bool(decoder.u8()?, "GUI pointer wheel direction")?,
+                x: decoder.u32()?,
+                y: decoder.u32()?,
+            },
+            kind => {
+                return Err(LswError::Protocol(format!(
+                    "unknown GUI input event kind {kind}"
+                )))
+            }
+        };
+        decoder.finish()?;
+        event.encode()?;
+        Ok(event)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuiWindowResize {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl GuiWindowResize {
+    pub fn encode(self) -> Result<Vec<u8>> {
+        validate_gui_dimensions(self.width, self.height)?;
+        let mut payload = self.width.to_be_bytes().to_vec();
+        payload.extend_from_slice(&self.height.to_be_bytes());
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let resize = Self {
+            width: decoder.u32()?,
+            height: decoder.u32()?,
+        };
+        decoder.finish()?;
+        validate_gui_dimensions(resize.width, resize.height)?;
+        Ok(resize)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuiWindowClosed {
+    pub exit_code: i32,
+}
+
+impl GuiWindowClosed {
+    pub fn encode(self) -> [u8; 4] {
+        self.exit_code.to_be_bytes()
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let bytes: [u8; 4] = payload.try_into().map_err(|_| {
+            LswError::Protocol("GUI closed payload must contain four bytes".to_owned())
+        })?;
+        Ok(Self {
+            exit_code: i32::from_be_bytes(bytes),
+        })
+    }
+}
+
+fn validate_gui_dimensions(width: u32, height: u32) -> Result<()> {
+    if width == 0
+        || height == 0
+        || width > MAX_GUI_WINDOW_DIMENSION
+        || height > MAX_GUI_WINDOW_DIMENSION
+    {
+        return Err(LswError::Protocol(format!(
+            "GUI window dimensions must be between 1 and {MAX_GUI_WINDOW_DIMENSION}"
+        )));
+    }
+    let bytes = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| LswError::Protocol("GUI frame byte length overflowed".to_owned()))?;
+    if bytes > MAX_GUI_FRAME_BYTES {
+        return Err(LswError::Protocol(format!(
+            "GUI frame exceeds the {MAX_GUI_FRAME_BYTES} byte memory limit"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_gui_coordinate(x: u32, y: u32) -> Result<()> {
+    if x >= MAX_GUI_WINDOW_DIMENSION || y >= MAX_GUI_WINDOW_DIMENSION {
+        return Err(LswError::Protocol(
+            "GUI pointer coordinate exceeds the supported window bounds".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn decode_bool(value: u8, field: &str) -> Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(LswError::Protocol(format!(
+            "{field} flag must be zero or one"
+        ))),
+    }
+}
+
 fn validate_gui_start(request: &StartRequest, environment: &ProcessEnvironment) -> Result<()> {
     if request.kind != SessionKind::Run {
         return Err(LswError::Protocol(
@@ -1245,6 +1654,11 @@ impl<'a> Decoder<'a> {
         ))
     }
 
+    fn i16(&mut self) -> Result<i16> {
+        let bytes = self.take(2)?;
+        Ok(i16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
     fn string(&mut self) -> Result<String> {
         let length = usize::try_from(self.u32()?)
             .map_err(|_| LswError::Protocol("invalid string length".to_owned()))?;
@@ -1537,6 +1951,117 @@ mod tests {
         }
         .encode()
         .is_err());
+    }
+
+    #[test]
+    fn seamless_window_protocol_is_append_only_bounded_and_strict() {
+        assert_eq!(FrameKind::GuiWindowOpen as u8, 47);
+        assert_eq!(FrameKind::GuiWindowReady as u8, 48);
+        assert_eq!(FrameKind::GuiWindowDamage as u8, 49);
+        assert_eq!(FrameKind::GuiWindowInput as u8, 50);
+        assert_eq!(FrameKind::GuiWindowResize as u8, 51);
+        assert_eq!(FrameKind::GuiWindowClose as u8, 52);
+        assert_eq!(FrameKind::GuiWindowClosed as u8, 53);
+        for value in 47..=53 {
+            assert!(FrameKind::try_from(value).is_ok());
+        }
+
+        let ready = GuiWindowReady {
+            process_id: 4242,
+            window_id: 0x10203,
+            width: 800,
+            height: 600,
+            title: "Notepad".to_owned(),
+        };
+        assert_eq!(
+            GuiWindowReady::decode(&ready.encode().unwrap()).unwrap(),
+            ready
+        );
+        assert!(GuiWindowReady {
+            process_id: 0,
+            ..ready.clone()
+        }
+        .encode()
+        .is_err());
+
+        let damage = GuiWindowDamage {
+            sequence: 7,
+            x: 128,
+            y: 64,
+            width: 2,
+            height: 2,
+            bgra: vec![0x10; 16],
+        };
+        assert_eq!(
+            GuiWindowDamage::decode(&damage.encode().unwrap()).unwrap(),
+            damage
+        );
+        let mut invalid_damage = damage.clone();
+        invalid_damage.bgra.pop();
+        assert!(invalid_damage.encode().is_err());
+        assert!(GuiWindowDamage {
+            width: MAX_GUI_DAMAGE_DIMENSION + 1,
+            ..damage
+        }
+        .encode()
+        .is_err());
+
+        let input = [
+            GuiInputEvent::Focus { focused: true },
+            GuiInputEvent::Key {
+                virtual_key: 0x41,
+                scan_code: 0x1e,
+                pressed: true,
+                extended: false,
+            },
+            GuiInputEvent::PointerMove { x: 12, y: 34 },
+            GuiInputEvent::PointerButton {
+                button: GuiPointerButton::Left,
+                pressed: true,
+                x: 12,
+                y: 34,
+            },
+            GuiInputEvent::PointerWheel {
+                delta: 120,
+                horizontal: false,
+                x: 12,
+                y: 34,
+            },
+        ];
+        for event in input {
+            assert_eq!(
+                GuiInputEvent::decode(&event.encode().unwrap()).unwrap(),
+                event
+            );
+        }
+        assert!(GuiInputEvent::decode(&[1, 2]).is_err());
+        assert!(GuiInputEvent::Key {
+            virtual_key: 0,
+            scan_code: 0,
+            pressed: true,
+            extended: false,
+        }
+        .encode()
+        .is_err());
+
+        let resize = GuiWindowResize {
+            width: 1280,
+            height: 720,
+        };
+        assert_eq!(
+            GuiWindowResize::decode(&resize.encode().unwrap()).unwrap(),
+            resize
+        );
+        assert!(GuiWindowResize {
+            width: 0,
+            height: 720,
+        }
+        .encode()
+        .is_err());
+
+        let closed = GuiWindowClosed { exit_code: 17 };
+        assert_eq!(GuiWindowClosed::decode(&closed.encode()).unwrap(), closed);
+        assert!(GuiWindowClosed::decode(&[0, 0, 0]).is_err());
     }
 
     #[test]
