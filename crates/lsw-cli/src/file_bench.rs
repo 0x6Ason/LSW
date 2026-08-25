@@ -15,13 +15,31 @@ const DEFAULT_SMALL_FILES: u32 = 4096;
 const OUTPUT_LIMIT: usize = 64 * 1024;
 const GUEST_LOCAL_ROOT: &str = "C:\\ProgramData\\LSW\\file-bench-local";
 const MIRROR_ROOT: &str = "C:\\ProgramData\\LSW\\file-bench-mirror";
+const REMOVE_MIRROR_SCRIPT: &str = r#"
+$ErrorActionPreference='Stop'
+$Root='C:\ProgramData\LSW\file-bench-mirror'
+for ($Attempt=0; $Attempt -lt 40; $Attempt++) {
+    try {
+        if (Test-Path -LiteralPath $Root) {
+            Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
+        }
+        break
+    } catch {
+        if ($Attempt -eq 39) { throw }
+        Start-Sleep -Milliseconds 250
+    }
+}
+if (Test-Path -LiteralPath $Root) { throw "benchmark cleanup left $Root behind" }
+"#;
 const BENCHMARK_SCRIPT: &str = r#"
 $ErrorActionPreference='Stop'
 $Root=[IO.Path]::GetFullPath($env:LSW_BENCH_ROOT)
 $SizeMiB=[int]$env:LSW_BENCH_SIZE_MIB
 $SmallFiles=[int]$env:LSW_BENCH_SMALL_FILES
 if ($SizeMiB -lt 1 -or $SmallFiles -lt 1) { throw 'invalid benchmark dimensions' }
-Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $Root) {
+    Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
+}
 New-Item -ItemType Directory -Path $Root | Out-Null
 try {
     $Payload=Join-Path $Root 'sequential.bin'
@@ -81,7 +99,17 @@ try {
         [Console]::Out.WriteLine('GIT_STATUS_MS='+$Watch.ElapsedMilliseconds)
     }
 } finally {
-    Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+    for ($Attempt=0; $Attempt -lt 40; $Attempt++) {
+        try {
+            if (Test-Path -LiteralPath $Root) {
+                Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction Stop
+            }
+            break
+        } catch {
+            if ($Attempt -eq 39) { throw }
+            Start-Sleep -Milliseconds 250
+        }
+    }
 }
 "#;
 
@@ -275,7 +303,7 @@ fn remove_remote_benchmark_root(
             "-NoProfile".to_owned(),
             "-NonInteractive".to_owned(),
             "-Command".to_owned(),
-            "Remove-Item -LiteralPath 'C:\\ProgramData\\LSW\\file-bench-mirror' -Recurse -Force -ErrorAction SilentlyContinue".to_owned(),
+            REMOVE_MIRROR_SCRIPT.to_owned(),
         ],
         working_directory: None,
     };
@@ -283,7 +311,12 @@ fn remove_remote_benchmark_root(
     if process.exit_code == 0 {
         Ok(())
     } else {
-        Err("could not clean the guest mirror benchmark directory".into())
+        Err(format!(
+            "could not clean the guest mirror benchmark directory (exit {}): {}",
+            process.exit_code,
+            String::from_utf8_lossy(&process.stderr).trim()
+        )
+        .into())
     }
 }
 
@@ -418,5 +451,12 @@ mod tests {
         assert!(json.contains("\"schema\":1"));
         assert!(json.contains("\"git_status_ms\":null"));
         assert!(json.contains("\"dataset_sync_ms\":9"));
+    }
+
+    #[test]
+    fn mirror_cleanup_treats_an_absent_directory_as_success() {
+        assert!(REMOVE_MIRROR_SCRIPT.contains("Test-Path -LiteralPath $Root"));
+        assert!(REMOVE_MIRROR_SCRIPT.contains("-ErrorAction Stop"));
+        assert!(!REMOVE_MIRROR_SCRIPT.contains("SilentlyContinue"));
     }
 }

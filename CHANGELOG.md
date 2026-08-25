@@ -9,7 +9,9 @@
   network with per-instance authentication, signing, and encryption. The
   restricted agent owns `Linux (L:)` through the native Windows networking API
   in its logon session without a resident LocalSystem or PowerShell keeper;
-  Explorer mapping remains assigned to the Slice 3 interactive companion.
+  Explorer mapping remains assigned to the Slice 3 interactive companion. File
+  benchmark cleanup treats an absent prior dataset as success, retries real
+  removal failures, and reports the guest error instead of hiding it.
 - Began beta.8 with explicit Windows desktop account roles and native Windows
   sudo integration. Interactive personal-development setup recommends an
   administrator while keeping standard accounts available. `lsw user add`
