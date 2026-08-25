@@ -1014,6 +1014,17 @@ if ! grep -F 'default_user_role=standard' \
     echo "error: initial standard desktop-user role was not persisted" >&2
     exit 1
 fi
+set +e
+gui_without_login_output=$(timeout 60s "$lsw" run "$instance" --gui -- notepad.exe 2>&1)
+gui_without_login_status=$?
+set -e
+if [ "$gui_without_login_status" -eq 0 ] \
+    || ! printf '%s\n' "$gui_without_login_output" | grep -F 'sign in once' >/dev/null
+then
+    printf '%s\n' "$gui_without_login_output" >&2
+    echo "error: GUI launch did not fail closed with an actionable sign-in requirement" >&2
+    exit 1
+fi
 "$lsw" user promote "$instance"
 promoted_user_output=$(
     # PowerShell expands its own variables in the guest.

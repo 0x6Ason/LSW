@@ -178,7 +178,12 @@ impl Supervisor {
         remove_shutdown_marker(&self.store, name);
         remove_hibernate_marker(&self.store, name);
         if phase == LaunchPhase::Run {
-            let credential = self.store.read_agent_token(name)?;
+            let token = self.store.read_agent_token(name)?;
+            let credential = if manifest.scoped_live_share_credential {
+                lsw_core::derive_scoped_credential(&token, lsw_core::LIVE_SHARE_CREDENTIAL_SCOPE)?
+            } else {
+                token
+            };
             prepare_live_share_runtime(&manifest, &instance_dir, &credential)?;
         }
         if phase == LaunchPhase::Run && manifest.spec.profile == WindowsProfile::Ephemeral {

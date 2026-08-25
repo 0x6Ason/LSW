@@ -158,6 +158,8 @@ lsw                         # enter PowerShell in the default instance
 lsw exec -- cmd.exe /c ver
 lsw exec --cwd 'C:\src' --env BUILD_MODE=release -- cmd.exe /d /c build.cmd
 lsw run --detach -- powershell.exe -NoProfile -File 'C:\src\worker.ps1'
+lsw run --gui -- notepad.exe 'L:\notes.txt'
+lsw app install --title Notepad -- notepad.exe
 lsw push ./main.rs 'C:\src\main.rs'
 lsw push --recursive ./project 'C:\src\project'
 lsw sync --watch ./project 'C:\src\project'
@@ -179,8 +181,11 @@ never enters argv, environment, the manifest, installation media, logs, or
 diagnostic bundles. The unprivileged agent forwards one authenticated loopback
 frame to the demand-start LocalSystem `LSWUserHelper`; that helper performs one
 bounded native account operation and exits. AutoLogon remains disabled. Session
-0 CLI commands continue to use the boot-time service identity; beta.8 will use
-the registered identity for visible desktop apps.
+0 CLI commands continue to use the boot-time service identity. `run --gui`
+uses an authenticated, on-demand companion in an already signed-in registered
+user's Windows session; it never turns on AutoLogon or stores the user's
+password. If no such session exists, LSW asks the user to open `lsw view` and
+sign in once.
 `lsw user add [NAME] --username USER --administrator` can create a separately
 confirmed administrator without changing the default desktop identity.
 
@@ -199,6 +204,14 @@ sessions, host `SIGINT` and `SIGTERM` terminate the owned Windows Job and return
 130 and 143 respectively. `run --detach` returns the guest PID after a
 successful start handshake, disconnects from its standard streams, and lets the
 agent retain lifecycle ownership until the process exits.
+
+`lsw run --gui [NAME] [--cwd PATH] [-e KEY=VALUE] -- PROGRAM.exe [ARG ...]`
+starts a GUI program with the registered Windows identity. `lsw app install`
+discovers the EXE icon in Windows and writes a Linux `.desktop` entry;
+`lsw app list` and `lsw app remove ID` manage those entries. Launchers accept
+dropped files through `%F` and translate existing host paths below the approved
+live-share root to `L:\...`. Slice 3 establishes launch and lifecycle plumbing;
+per-window display on Wayland/X11 begins in Slice 4.
 
 Recursive transfer refuses host symlinks, guest reparse points, traversal, and
 implicit overwrite. `sync` is intentionally host-to-guest and additive:
@@ -219,17 +232,20 @@ lsw unshare linux                  # unmount; host files are preserved
 
 The live folder is a real host-backed view over the VM's private QEMU
 user-network SMB path; changes are visible in both directions without a sync
-step. Each instance authenticates with its private agent credential, and the
-connection requires SMB signing and encryption. It requires the host Samba
+step. Fresh manifest-v8 instances authenticate with a domain-separated
+credential derived from their private agent token, and the connection requires
+SMB signing and encryption. Existing manifest-v7 instances retain their legacy
+agent-token mapping until their guest agent is explicitly migrated, so a host
+update does not break an already installed `L:` drive. It requires the host Samba
 server executable but no Windows filesystem driver, public SMB listener, RDP,
 WebDAV, anonymous guest login, or whole-home export. The first add and final
 remove restart the guest normally because QEMU fixes the exported root when the
-VM starts. The restricted agent maps `L:` inside its own Windows logon session,
-so `lsw` terminal commands and benchmarks use the live path without elevating
-the agent. Windows intentionally isolates drive mappings between logon sessions;
-the beta.8 user-session companion will create the separately authenticated
-Explorer/file-dialog mapping. LSW refuses to replace a pre-existing unrelated
-`L:` mapping in either session.
+VM starts. The restricted agent maps `L:` inside its own Windows logon session
+so `lsw` terminal commands and benchmarks use the live path without elevation.
+The on-demand desktop companion creates the same ownership-checked mapping in
+the registered user's independent logon session and restores it on the next GUI
+or integration request after a session restart. LSW refuses to replace a
+pre-existing unrelated `L:` mapping in either session.
 
 The authenticated agent mirror remains available for offline hosts, staging,
 recovery, explicit read-only ACLs, and automation:
@@ -288,9 +304,8 @@ lsw path -w /mnt/c/Users/Jason/project
 lsw path -u 'C:\Users\Jason\project'
 ```
 
-Use `push`, `pull`, or `sync` when content must cross the VM boundary. Visible
-GUI launch still requires the future user-session companion described in the
-roadmap.
+Use `push`, `pull`, or `sync` when content must cross the VM boundary. Use the
+approved live root when a GUI application must open a host file directly.
 
 ## Daily management
 
@@ -318,7 +333,9 @@ the shutdown request is fixed, uses no `/f`, and is attempted only when Windows
 has not exited 15 seconds after an ACPI powerdown. Live SMB setup does not cross
 that boundary: the restricted `NT SERVICE\LSWAgent` process calls the fixed
 Windows networking API, keeps the credential out of argv and the environment,
-and owns its session's `L:` connection directly.
+and owns its session's `L:` connection directly. The main agent token never
+enters the desktop session; a domain-separated live-share credential is passed
+only to the companion and removed from every GUI child's environment.
 
 ## Windows activation
 
@@ -467,9 +484,10 @@ The beta.7 agent runs at boot as the automatic `LSWAgent` Windows service under
 identity in Windows Session 0; they do not impersonate a desktop user. This
 provides command access at the Windows sign-in screen without storing a daily
 user credential.
-The permanent-user identity and authenticated bulk file channel form the
-companion boundary for beta.8; visible desktop GUI processes, clipboard, audio,
-and per-window integration are not enabled yet.
+The beta.8 Slice 3 companion is launched on demand through a fixed LocalSystem
+WTS boundary and runs as the registered, already signed-in Windows user. It can
+start GUI processes and own that user's `L:` mapping. Clipboard, audio, window
+capture, and per-HWND Wayland/X11 presentation are not enabled yet.
 
 Controlled sessions distinguish stdin EOF, authenticated cancellation,
 interrupt/terminate signals, detached start acknowledgement, and disconnect
@@ -516,7 +534,7 @@ Windows 11/KVM hardware gate with Microsoft's published ISO SHA-256. The gate
 covers real WinPE DISM, unattended OOBE and cleanup, NetAPI user creation,
 SCM/licensing identity, ConPTY, clone-secret isolation, folder boundaries,
 balloon/TRIM/hibernate/compaction, full shutdown, no-login cold restart, and
-complete runtime cleanup. A beta.7 revision may be tagged only after that exact
+complete runtime cleanup. A beta.8 revision may be tagged only after that exact
 commit passes.
 
 See [the operator workflow and evidence contract](docs/WINDOWS_KVM_E2E.md) and
@@ -571,20 +589,21 @@ targets, Zig, or operating-system media.
 
 ## Current limitations
 
-- Tagged releases still require the dedicated KVM-capable release host and a
-  pre-provisioned current official ISO. beta.7 publication requires that exact-commit gate;
-  ordinary GitHub-hosted CI cannot reproduce it without KVM and Windows media.
+- Tagged releases still require the dedicated KVM-capable release host. The
+  guarded workflow resolves and verifies current official media automatically,
+  but ordinary GitHub-hosted CI cannot reproduce the KVM/Windows execution.
 - The optional installation and recovery display uses private Unix-socket VNC
   internally; LSW opens it only when requested and does not expose TCP VNC or RDP.
-- `lsw run` can start a Session 0 process, but a service-launched GUI is not a
-  visible desktop application. A user-session companion and per-window
-  Wayland/X11 integration are not implemented yet.
+- Ordinary `lsw run` remains a Session 0 process. `lsw run --gui` starts in the
+  registered user's existing Windows session, but per-window Wayland/X11
+  capture is a Slice 4 feature; Slice 3 does not yet render that HWND as a Linux
+  window.
 - Signed VirtIO drivers are not bundled or silently installed. The balloon
   device and governor are available, but useful guest reclaim depends on a
   compatible signed Windows driver; the inbox NVMe/e1000e path remains valid.
 - One driverless live read-write root can be mapped as `Linux (L:)` in the
-  agent session per instance. Explorer integration awaits the beta.8
-  user-session companion. Additional declared shares remain synchronized agent mirrors;
+  agent and registered desktop sessions per instance. Additional declared
+  shares remain synchronized agent mirrors;
   host-to-guest watch is additive and conflicts/deletions are never resolved
   destructively in the background. Signed Virtio-fs is not required or enabled.
 - Agent authentication is not encrypted and is limited to LSW's local

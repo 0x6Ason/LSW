@@ -148,6 +148,14 @@ headless workflows working.
   icon discovery, `.desktop` entries, file arguments, working directories, and
   environment values. The intended CLI shape is `lsw run --gui ...`; the final
   spelling will be fixed before the feature is declared stable.
+- Slice 3 is implemented on the beta.8 development line: a SID-checked WTS
+  launch boundary starts the authenticated companion only for the registered
+  active user; scoped credentials isolate companion control and live SMB from
+  the main agent token; desktop `L:` recovery, `lsw run --gui`, EXE icon
+  discovery, `.desktop` install/list/remove, `%F` live-root translation,
+  working directories, environments, child lifetime tracking, and idle exit
+  are source-gated. AutoLogon and password persistence remain prohibited. The
+  exact Windows/KVM commit gate remains the release acceptance boundary.
 
 ### Slice 4: first seamless application window
 

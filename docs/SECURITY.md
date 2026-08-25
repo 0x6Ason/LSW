@@ -33,6 +33,11 @@ is complete.
   zero RSS. LSW does not implement cross-host migration.
 - Storage preparation and install-seed creation reject symlink destinations and
   do not overwrite existing disks, firmware stores, seeds, or transferred files.
+- `lsw media resolve --request-file` writes a create-only mode-0600 file and
+  never prints its signed Microsoft CDN URL. The release workflow transfers
+  that short-lived file as a one-day private artifact, validates its bounded
+  allowlisted form, keeps the URL off process argv and logs, and deletes the
+  request and verified ISO in its always-run cleanup.
 
 ## Guest agent
 
@@ -50,8 +55,7 @@ desktop logon. OOBE receives a per-install random password that is independent
 from the agent token and obfuscated with Windows unattend's `PlainText=false`
 encoding, which is not encryption. SetupComplete removes the one-shot account,
 cached answer files, its script, and the staging payload before the host accepts
-the setup marker. Visible desktop GUI integration will require a future
-user-session companion.
+the setup marker.
 
 After cleanup, interactive installation creates a separately confirmed
 permanent local account. `lsw user setup` validates the name locally and sends
@@ -71,6 +75,28 @@ Password bytes never enter argv, environment, LSW manifests, seeds, logs, or
 diagnostics, and mutable protocol/UTF-16 buffers are cleared after use. Windows
 retains its normal account verifier, normal administrator processes receive a
 filtered token, UAC remains enabled, and Windows AutoLogon is never configured.
+
+GUI launch uses a second fixed request on `LSWUserHelper`. LocalSystem accepts
+only a validated local username, enumerates active WTS sessions, compares the
+session token SID with that exact local account SID, and starts the fixed
+installed `lsw-agent.exe --desktop-companion` command on `winsta0\default`.
+It does not accept an executable or GUI arguments. If the registered user is
+not already signed in, the request fails closed and asks for one interactive
+sign-in; LSW does not cache a password or enable AutoLogon. The helper inspects
+the token elevation type and elevation flag. If WTS supplies an elevated split
+token, the helper selects and revalidates only its linked limited token; it
+refuses any token that remains elevated, preserving UAC for administrator
+accounts.
+
+The companion binds only guest loopback port 35044 and authenticates with a
+domain-separated credential derived from the per-instance agent token. The
+main token is never readable by the desktop user. On fresh manifest-v8 guests,
+a separate scoped credential authenticates the one approved SMB root. Both
+scoped values arrive only in the companion environment and are explicitly
+removed from every GUI and icon-helper
+child. The companion also case-insensitively binds every request to its expected
+username. It exits after 30 idle seconds when it owns no GUI child or live
+mapping; an active mapping keeps the low-resource broker available.
 
 Native Windows sudo is a separate capability-gated fixed operation. The normal
 agent asks `LSWMaintenanceHelper` to read the inbox binary and the documented
@@ -163,13 +189,17 @@ A capability-gated request makes the restricted agent add, query, or remove the
 fixed `L:` to `\\10.0.2.4\qemu` mapping in its own Windows logon session through
 `WNetAddConnection2W` and `WNetCancelConnection2W`. It refuses an unrelated
 existing `L:` mapping. No LocalSystem helper is involved, and no username,
-password, path, drive letter, or command text is accepted from the client. The
-private credential is passed only in memory to the networking API and its
-mutable UTF-16 copy is cleared immediately. The Samba endpoint requires signing
-and encryption. Removing the share unmaps the drive and restarts QEMU without
-the host export; host files are preserved. A future interactive companion must
-create its own mapping because Windows deliberately scopes redirected drives to
-logon sessions.
+password, path, drive letter, or command text is accepted from the client. For
+a fresh manifest-v8 guest, the domain-separated private credential is passed
+only in memory to the networking API and its mutable UTF-16 copy is cleared
+immediately. An older manifest retains the credential scheme expected by its
+installed agent rather than losing an existing mapping after a host upgrade.
+The Samba endpoint requires signing and encryption. Removing the share unmaps
+the drive and restarts QEMU without the host export; host files are preserved.
+The authenticated interactive
+companion performs the same fixed ownership check in the registered user's
+logon session. Its per-instance scoped credential and VM-private network keep
+unrelated instances from authenticating to that export.
 
 Sealed bases are mode 0400 and content-addressed. Sealing rejects an instance
 that already contains a registered permanent user. Clones do not inherit host

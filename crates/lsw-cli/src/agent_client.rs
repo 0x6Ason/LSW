@@ -14,12 +14,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     decode_exit, decode_file_length, decode_process_id, encode_file_length, read_frame,
-    write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, InstanceManifest,
-    LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
-    SessionLease, SessionOptions, SessionSignal, StartRequest, TerminalSize, TerminalStartRequest,
-    UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoStatus,
-    AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1,
-    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
+    write_frame, ClientHello, DesktopLiveShareRequest, FileGetRequest, FilePutRequest, Frame,
+    FrameKind, GuiIconRequest, GuiStartRequest, InstanceManifest, LiveShareConfigureRequest,
+    LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions,
+    SessionSignal, StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest,
+    UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_DETACHED_RUN_V1,
+    CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1, CAPABILITY_LIVE_SHARE_V1,
+    CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
     CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
     CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
     CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
@@ -211,6 +213,54 @@ impl AgentClient {
             FrameKind::Pong if response.payload.is_empty() => Ok(()),
             FrameKind::Error => Err(agent_error(&response.payload).into()),
             _ => Err("agent returned an invalid live-share configuration response".into()),
+        }
+    }
+
+    pub fn run_gui(mut self, request: &GuiStartRequest) -> Result<u32, Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_GUI_LAUNCH_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::GuiStart, request.encode()?),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::Started => Ok(decode_process_id(&response.payload)?),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid GUI launch response".into()),
+        }
+    }
+
+    pub fn gui_icon(
+        mut self,
+        request: &GuiIconRequest,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_GUI_ICON_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::GuiIcon, request.encode()?),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::GuiIconData => Ok(response.payload),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid GUI icon response".into()),
+        }
+    }
+
+    pub fn configure_desktop_live_share(
+        mut self,
+        request: &DesktopLiveShareRequest,
+    ) -> Result<LiveShareStatus, Box<dyn std::error::Error>> {
+        self.require_capability(CAPABILITY_DESKTOP_LIVE_SHARE_V1)?;
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::DesktopLiveShareConfigure, request.encode()?),
+        )?;
+        let response = read_frame(&mut self.stream)?;
+        match response.kind {
+            FrameKind::LiveShareStatus => Ok(LiveShareStatus::decode(&response.payload)?),
+            FrameKind::Error => Err(agent_error(&response.payload).into()),
+            _ => Err("agent returned an invalid desktop live-share response".into()),
         }
     }
 
@@ -1082,6 +1132,44 @@ mod tests {
         .live_share_status()
         .expect("live-share query should succeed");
         assert!(status.mapped);
+        server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn gui_operations_are_capability_gated_and_keep_the_user_explicit() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let frame = read_frame(&mut stream).expect("GUI start should arrive");
+            assert_eq!(frame.kind, FrameKind::GuiStart);
+            let request = GuiStartRequest::decode(&frame.payload).expect("GUI start should decode");
+            assert_eq!(request.user_name, "desktop-user");
+            assert_eq!(request.request.argv, ["notepad.exe"]);
+            assert!(request.mount_live_share);
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::Started, lsw_core::encode_process_id(8123)),
+            )
+            .expect("GUI response should be sent");
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let process_id = AgentClient {
+            stream,
+            capabilities: vec![CAPABILITY_GUI_LAUNCH_V1.to_owned()],
+        }
+        .run_gui(&GuiStartRequest {
+            user_name: "desktop-user".to_owned(),
+            request: StartRequest {
+                kind: SessionKind::Run,
+                argv: vec!["notepad.exe".to_owned()],
+                working_directory: None,
+            },
+            environment: ProcessEnvironment::default(),
+            mount_live_share: true,
+        })
+        .expect("GUI start should succeed");
+        assert_eq!(process_id, 8123);
         server.join().expect("fixture should not panic");
     }
 

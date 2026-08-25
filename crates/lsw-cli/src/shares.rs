@@ -8,8 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lsw_core::{
-    FolderShare, FolderShareMode, FolderShareTransport, HostCapabilities, InstanceState,
-    LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
+    DesktopLiveShareRequest, FolderShare, FolderShareMode, FolderShareTransport, HostCapabilities,
+    InstanceState, LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
 };
 
 use super::daemon_client::DaemonClient;
@@ -182,7 +182,14 @@ fn live_samba_failure_context(store: &StateStore, name: &str) -> String {
     let Ok(log) = fs::read(log_path) else {
         return String::new();
     };
-    let credential = store.read_agent_token(name).ok();
+    let credential = store.read_agent_token(name).ok().and_then(|token| {
+        let manifest = store.load(name).ok()?;
+        if manifest.scoped_live_share_credential {
+            lsw_core::derive_scoped_credential(&token, lsw_core::LIVE_SHARE_CREDENTIAL_SCOPE).ok()
+        } else {
+            Some(token)
+        }
+    });
     summarize_samba_log(&log, credential.as_deref())
         .map(|summary| format!("\nSamba diagnostic (redacted):\n{summary}"))
         .unwrap_or_default()
@@ -322,6 +329,7 @@ fn remove(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std:
     {
         ensure_live_mapping(store, &name)?;
         connect_agent(store, &name)?.configure_live_share(false)?;
+        configure_desktop_mapping_if_signed_in(store, &name, false)?;
         let status = connect_agent(store, &name)?.live_share_status()?;
         if status.mapped {
             return Err("Windows retained Linux (L:); the share was not removed".into());
@@ -371,7 +379,45 @@ fn restart_and_configure(
     restart_instance(store, name)?;
     wait_for_agent(store, name)?;
     connect_agent(store, name)?.configure_live_share(enable)?;
-    wait_for_live_mapping_state(store, name, enable)
+    wait_for_live_mapping_state(store, name, enable)?;
+    configure_desktop_mapping_if_signed_in(store, name, enable)
+}
+
+fn configure_desktop_mapping_if_signed_in(
+    store: &StateStore,
+    name: &str,
+    enable: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(user_name) = store.load(name)?.default_user else {
+        return Ok(());
+    };
+    let request = DesktopLiveShareRequest { user_name, enable };
+    match connect_agent(store, name)?.configure_desktop_live_share(&request) {
+        Ok(status) if status.mapped == enable => Ok(()),
+        Ok(_) => Err("Windows desktop session retained an unexpected Linux (L:) state".into()),
+        Err(error)
+            if error
+                .to_string()
+                .contains(lsw_core::CAPABILITY_DESKTOP_LIVE_SHARE_V1) =>
+        {
+            eprintln!(
+                "lsw: this guest agent predates desktop Linux (L:) mapping; terminal tools still use the live share."
+            );
+            Ok(())
+        }
+        Err(error)
+            if error.to_string().contains("is not signed in")
+                || error.to_string().contains("sign in once") =>
+        {
+            if enable {
+                eprintln!(
+                    "lsw: Linux (L:) will appear after the registered Windows user signs in and launches an LSW GUI app."
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn wait_for_live_mapping_state(

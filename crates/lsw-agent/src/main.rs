@@ -19,9 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
-    encode_process_id, read_frame, write_frame, ClientHello, FileGetRequest, FilePutRequest, Frame,
-    FrameKind, LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello,
-    SessionKind, SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
+    encode_process_id, read_frame, write_frame, ClientHello, DesktopLiveShareRequest,
+    FileGetRequest, FilePutRequest, Frame, FrameKind, GuiIconRequest, GuiStartRequest,
+    LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
+    SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
     TerminalStartRequest, UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest,
     WindowsSudoStatus, AGENT_GUEST_PORT, AGENT_PROTOCOL_VERSION, CAPABILITY_DETACHED_RUN_V1,
     CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
@@ -29,12 +30,15 @@ use lsw_core::{
 };
 #[cfg(windows)]
 use lsw_core::{
-    TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_LIVE_SHARE_V1,
-    CAPABILITY_MAINTENANCE_HIBERNATE_V1, CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
-    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
-    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
-    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
-    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    DesktopUserRequest, TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1,
+    CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
+    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
+    CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
+    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
+    CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1, CLONE_IDENTITY_MARKER_FILE,
+    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, DESKTOP_COMPANION_CREDENTIAL_SCOPE,
+    DESKTOP_COMPANION_GUEST_PORT, LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT,
+    USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -61,6 +65,10 @@ const USER_HELPER_SERVICE: &str = "LSWUserHelper";
 const MAINTENANCE_HELPER_PORT: u16 = MAINTENANCE_HELPER_GUEST_PORT;
 #[cfg(windows)]
 const MAINTENANCE_HELPER_SERVICE: &str = "LSWMaintenanceHelper";
+#[cfg(windows)]
+const DESKTOP_COMPANION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+const DESKTOP_COMPANION_START_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(windows, test))]
 const WINDOWS_SHUTDOWN_ARGUMENTS: [&str; 5] = ["/s", "/t", "0", "/d", "p:0:0"];
 
@@ -373,6 +381,7 @@ fn handle_user_helper_connection(
         capabilities: vec![
             CAPABILITY_USER_ACCOUNT_V1.to_owned(),
             CAPABILITY_USER_ACCOUNT_ROLE_V1.to_owned(),
+            CAPABILITY_DESKTOP_COMPANION_V1.to_owned(),
         ],
     };
     write_frame(
@@ -412,11 +421,23 @@ fn handle_user_helper_connection(
             };
             windows_user::set_local_user_role(&request.user_name, request.role)
         }
+        FrameKind::DesktopCompanionStart => {
+            let request = DesktopUserRequest::decode(&frame.payload);
+            frame.payload.fill(0);
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    send_error(stream, &error.to_string())?;
+                    return Ok(true);
+                }
+            };
+            windows_desktop::launch_companion(&request.user_name, expected_token)
+        }
         _ => {
             frame.payload.fill(0);
             send_error(
                 stream,
-                "account helper accepts only USER_CREATE or USER_SET_ROLE",
+                "account helper accepts only USER_CREATE, USER_SET_ROLE, or DESKTOP_COMPANION_START",
             )?;
             return Ok(true);
         }
@@ -714,6 +735,19 @@ fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std::error::Err
         #[cfg(not(windows))]
         {
             return Err("--license-client is only supported on Windows".into());
+        }
+    }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--desktop-companion")
+    {
+        #[cfg(windows)]
+        {
+            return desktop_companion::run(&arguments[1..]);
+        }
+        #[cfg(not(windows))]
+        {
+            return Err("--desktop-companion is only supported on Windows".into());
         }
     }
     let configuration = Configuration::parse(&arguments)?;
@@ -1300,6 +1334,11 @@ fn handle_connection(
         FrameKind::LiveShareConfigure => {
             live_share_configure(stream, &request_frame.payload, expected_token)
         }
+        FrameKind::GuiStart => gui_start(stream, &request_frame.payload, expected_token),
+        FrameKind::GuiIcon => gui_icon(stream, &request_frame.payload, expected_token),
+        FrameKind::DesktopLiveShareConfigure => {
+            desktop_live_share_configure(stream, &request_frame.payload, expected_token)
+        }
         _ => {
             send_error(&mut stream, "unsupported request after HELLO")?;
             Err("client sent an unsupported request after authentication".into())
@@ -1331,6 +1370,9 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_MAINTENANCE_SHUTDOWN_V1.to_owned());
         capabilities.push(CAPABILITY_WINDOWS_SUDO_V1.to_owned());
         capabilities.push(CAPABILITY_LIVE_SHARE_V1.to_owned());
+        capabilities.push(CAPABILITY_GUI_LAUNCH_V1.to_owned());
+        capabilities.push(CAPABILITY_GUI_ICON_V1.to_owned());
+        capabilities.push(CAPABILITY_DESKTOP_LIVE_SHARE_V1.to_owned());
         capabilities
     };
     capabilities
@@ -1608,7 +1650,10 @@ fn live_share_configure(
         }
     };
     #[cfg(windows)]
-    let result = windows_live_share::configure(request.enable, expected_token);
+    let result =
+        lsw_core::derive_scoped_credential(expected_token, lsw_core::LIVE_SHARE_CREDENTIAL_SCOPE)
+            .map_err(|error| error.into())
+            .and_then(|credential| windows_live_share::configure(request.enable, &credential));
     #[cfg(not(windows))]
     let result: Result<(), Box<dyn std::error::Error>> = {
         let _ = (expected_token, request);
@@ -1620,6 +1665,245 @@ fn live_share_configure(
     }
     write_frame(&mut stream, &Frame::new(FrameKind::Pong, Vec::new()))?;
     Ok(())
+}
+
+fn gui_start(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match GuiStartRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_gui_start(&request, expected_token);
+    #[cfg(not(windows))]
+    let result: Result<u32, Box<dyn std::error::Error>> = {
+        let _ = (&request, expected_token);
+        Err("Windows GUI launch is unavailable on this platform".into())
+    };
+    match result {
+        Ok(process_id) => write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Started, encode_process_id(process_id)),
+        )?,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn gui_icon(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match GuiIconRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_gui_icon(&request, expected_token);
+    #[cfg(not(windows))]
+    let result: Result<Vec<u8>, Box<dyn std::error::Error>> = {
+        let _ = (&request, expected_token);
+        Err("Windows GUI icon discovery is unavailable on this platform".into())
+    };
+    match result {
+        Ok(icon) => write_frame(&mut stream, &Frame::new(FrameKind::GuiIconData, icon))?,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn desktop_live_share_configure(
+    mut stream: TcpStream,
+    payload: &[u8],
+    expected_token: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request = match DesktopLiveShareRequest::decode(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error.into());
+        }
+    };
+    #[cfg(windows)]
+    let result = forward_desktop_live_share(&request, expected_token);
+    #[cfg(not(windows))]
+    let result: Result<LiveShareStatus, Box<dyn std::error::Error>> = {
+        let _ = (&request, expected_token);
+        Err("Windows desktop live-share mapping is unavailable on this platform".into())
+    };
+    match result {
+        Ok(status) => write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::LiveShareStatus, status.encode()),
+        )?,
+        Err(error) => {
+            send_error(&mut stream, &error.to_string())?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn forward_gui_start(
+    request: &GuiStartRequest,
+    expected_token: &str,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let mut stream = connect_or_start_desktop_companion(
+        &request.user_name,
+        expected_token,
+        CAPABILITY_GUI_LAUNCH_V1,
+    )?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::GuiStart, request.encode()?),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::Started => Ok(lsw_core::decode_process_id(&response.payload)?),
+        FrameKind::Error => Err(format!(
+            "Windows desktop companion refused GUI launch: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows desktop companion returned an invalid GUI response".into()),
+    }
+}
+
+#[cfg(windows)]
+fn forward_gui_icon(
+    request: &GuiIconRequest,
+    expected_token: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut stream = connect_or_start_desktop_companion(
+        &request.user_name,
+        expected_token,
+        CAPABILITY_GUI_ICON_V1,
+    )?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::GuiIcon, request.encode()?),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::GuiIconData => Ok(response.payload),
+        FrameKind::Error => Err(format!(
+            "Windows desktop companion could not discover the icon: {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows desktop companion returned an invalid icon response".into()),
+    }
+}
+
+#[cfg(windows)]
+fn forward_desktop_live_share(
+    request: &DesktopLiveShareRequest,
+    expected_token: &str,
+) -> Result<LiveShareStatus, Box<dyn std::error::Error>> {
+    let mut stream = connect_or_start_desktop_companion(
+        &request.user_name,
+        expected_token,
+        CAPABILITY_DESKTOP_LIVE_SHARE_V1,
+    )?;
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::DesktopLiveShareConfigure, request.encode()?),
+    )?;
+    let response = read_frame(&mut stream)?;
+    match response.kind {
+        FrameKind::LiveShareStatus => Ok(LiveShareStatus::decode(&response.payload)?),
+        FrameKind::Error => Err(format!(
+            "Windows desktop companion could not configure Linux (L:): {}",
+            String::from_utf8_lossy(&response.payload)
+        )
+        .into()),
+        _ => Err("Windows desktop companion returned an invalid live-share response".into()),
+    }
+}
+
+#[cfg(windows)]
+fn connect_or_start_desktop_companion(
+    user_name: &str,
+    expected_token: &str,
+    required_capability: &str,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let credential =
+        lsw_core::derive_scoped_credential(expected_token, DESKTOP_COMPANION_CREDENTIAL_SCOPE)?;
+    if let Ok(stream) = connect_desktop_companion(&credential, required_capability) {
+        return Ok(stream);
+    }
+    let mut helper = connect_user_helper(expected_token, CAPABILITY_DESKTOP_COMPANION_V1)?;
+    let request = DesktopUserRequest {
+        user_name: user_name.to_owned(),
+    };
+    write_frame(
+        &mut helper,
+        &Frame::new(FrameKind::DesktopCompanionStart, request.encode()?),
+    )?;
+    read_user_helper_response(&mut helper)?;
+
+    let deadline = Instant::now() + DESKTOP_COMPANION_START_TIMEOUT;
+    loop {
+        let last_error = match connect_desktop_companion(&credential, required_capability) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for the Windows desktop companion; last error: {last_error}"
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+fn connect_desktop_companion(
+    credential: &str,
+    required_capability: &str,
+) -> Result<TcpStream, Box<dyn std::error::Error>> {
+    let address = SocketAddr::from(([127, 0, 0, 1], DESKTOP_COMPANION_GUEST_PORT));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(250))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token: credential.to_owned(),
+    };
+    write_frame(&mut stream, &Frame::new(FrameKind::Hello, hello.encode()?))?;
+    let response = read_frame(&mut stream)?;
+    if response.kind != FrameKind::HelloOk {
+        return Err("Windows desktop companion rejected authentication".into());
+    }
+    let hello = ServerHello::decode(&response.payload)?;
+    if hello.version != AGENT_PROTOCOL_VERSION
+        || !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == required_capability)
+    {
+        return Err("Windows desktop companion returned incompatible capabilities".into());
+    }
+    Ok(stream)
 }
 
 #[cfg(windows)]
@@ -3014,6 +3298,13 @@ mod windows_user;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_user_service;
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod windows_desktop;
+
+#[cfg(windows)]
+mod desktop_companion;
 
 struct Configuration {
     listen: SocketAddr,

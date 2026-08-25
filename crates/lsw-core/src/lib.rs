@@ -19,6 +19,7 @@ mod profile;
 mod qemu;
 #[cfg(not(windows))]
 mod samba;
+mod scoped_credential;
 mod store;
 mod windows_media;
 mod winpe_dism;
@@ -54,6 +55,9 @@ pub use qemu::{
 };
 #[cfg(not(windows))]
 pub use samba::prepare_live_share_runtime;
+pub use scoped_credential::{
+    derive_scoped_credential, DESKTOP_COMPANION_CREDENTIAL_SCOPE, LIVE_SHARE_CREDENTIAL_SCOPE,
+};
 pub use store::StateStore;
 pub use windows_media::{WindowsEdition, WindowsMediaInspector};
 pub use winpe_dism::{
@@ -70,6 +74,7 @@ pub const AGENT_GUEST_PORT: u16 = 35040;
 pub const LICENSE_HELPER_GUEST_PORT: u16 = 35041;
 pub const USER_HELPER_GUEST_PORT: u16 = 35042;
 pub const MAINTENANCE_HELPER_GUEST_PORT: u16 = 35043;
+pub const DESKTOP_COMPANION_GUEST_PORT: u16 = 35044;
 pub const AGENT_TOKEN_FILE: &str = "agent.token";
 pub const CLONE_IDENTITY_MARKER_FILE: &str = "clone-identity.marker";
 pub const CLONE_IDENTITY_NAME_FILE: &str = "instance.name";
@@ -79,12 +84,14 @@ pub const MANIFEST_FILE: &str = "instance.lsw";
 pub use agent_protocol::{
     constant_time_token_eq, decode_exit, decode_file_length, decode_process_id, decode_resize,
     encode_exit, encode_file_length, encode_process_id, encode_resize, read_frame, write_frame,
-    ClientHello, FileGetRequest, FilePutRequest, Frame, FrameKind, LiveShareConfigureRequest,
-    LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState,
-    SessionOptions, SessionSignal, StartRequest, TerminalSize, TerminalStartRequest,
-    UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoMode,
-    WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1,
-    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
+    ClientHello, DesktopLiveShareRequest, DesktopUserRequest, FileGetRequest, FilePutRequest,
+    Frame, FrameKind, GuiIconRequest, GuiStartRequest, LiveShareConfigureRequest, LiveShareStatus,
+    ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionLeaseState, SessionOptions,
+    SessionSignal, StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest,
+    UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoMode, WindowsSudoStatus,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1,
+    CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_GUI_ICON_V1,
+    CAPABILITY_GUI_LAUNCH_V1, CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
     CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
     CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
     CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,

@@ -553,6 +553,9 @@ fn non_windows_agent_does_not_advertise_conpty() {
     assert!(!capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_WINDOWS_SUDO_V1));
+    assert!(!capabilities
+        .iter()
+        .any(|capability| capability == lsw_core::CAPABILITY_GUI_LAUNCH_V1));
     assert!(capabilities
         .iter()
         .any(|capability| capability == lsw_core::CAPABILITY_SESSION_CONTROL_V1));
@@ -574,6 +577,9 @@ fn windows_agent_advertises_native_os_operations() {
         lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1,
         lsw_core::CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
         lsw_core::CAPABILITY_WINDOWS_SUDO_V1,
+        lsw_core::CAPABILITY_GUI_LAUNCH_V1,
+        lsw_core::CAPABILITY_GUI_ICON_V1,
+        lsw_core::CAPABILITY_DESKTOP_LIVE_SHARE_V1,
     ] {
         assert!(capabilities.iter().any(|capability| capability == expected));
     }

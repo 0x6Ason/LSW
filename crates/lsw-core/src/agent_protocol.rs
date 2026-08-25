@@ -22,6 +22,10 @@ pub const CAPABILITY_MAINTENANCE_HIBERNATE_V1: &str = "maintenance-hibernate-v1"
 pub const CAPABILITY_MAINTENANCE_SHUTDOWN_V1: &str = "maintenance-shutdown-v1";
 pub const CAPABILITY_WINDOWS_SUDO_V1: &str = "windows-sudo-v1";
 pub const CAPABILITY_LIVE_SHARE_V1: &str = "live-share-v1";
+pub const CAPABILITY_DESKTOP_COMPANION_V1: &str = "desktop-companion-v1";
+pub const CAPABILITY_GUI_LAUNCH_V1: &str = "gui-launch-v1";
+pub const CAPABILITY_GUI_ICON_V1: &str = "gui-icon-v1";
+pub const CAPABILITY_DESKTOP_LIVE_SHARE_V1: &str = "desktop-live-share-v1";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -71,6 +75,11 @@ pub enum FrameKind {
     LiveShareConfigure = 39,
     LiveShareStatus = 40,
     MaintenanceShutdown = 41,
+    DesktopCompanionStart = 42,
+    GuiStart = 43,
+    GuiIcon = 44,
+    GuiIconData = 45,
+    DesktopLiveShareConfigure = 46,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -115,6 +124,11 @@ impl TryFrom<u8> for FrameKind {
             39 => Ok(Self::LiveShareConfigure),
             40 => Ok(Self::LiveShareStatus),
             41 => Ok(Self::MaintenanceShutdown),
+            42 => Ok(Self::DesktopCompanionStart),
+            43 => Ok(Self::GuiStart),
+            44 => Ok(Self::GuiIcon),
+            45 => Ok(Self::GuiIconData),
+            46 => Ok(Self::DesktopLiveShareConfigure),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -563,6 +577,180 @@ impl ProcessEnvironment {
 
     pub fn is_empty(&self) -> bool {
         self.variables.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopUserRequest {
+    pub user_name: String,
+}
+
+impl DesktopUserRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        crate::validate_windows_user_name(&self.user_name)?;
+        let mut payload = Vec::new();
+        push_string(&mut payload, &self.user_name)?;
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let user_name = decoder.string()?;
+        decoder.finish()?;
+        crate::validate_windows_user_name(&user_name)?;
+        Ok(Self { user_name })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DesktopLiveShareRequest {
+    pub user_name: String,
+    pub enable: bool,
+}
+
+impl DesktopLiveShareRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        crate::validate_windows_user_name(&self.user_name)?;
+        let mut payload = Vec::new();
+        push_string(&mut payload, &self.user_name)?;
+        payload.push(u8::from(self.enable));
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let user_name = decoder.string()?;
+        let enable = match decoder.u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LswError::Protocol(
+                    "desktop live-share flag must be zero or one".to_owned(),
+                ))
+            }
+        };
+        decoder.finish()?;
+        crate::validate_windows_user_name(&user_name)?;
+        Ok(Self { user_name, enable })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuiStartRequest {
+    pub user_name: String,
+    pub request: StartRequest,
+    pub environment: ProcessEnvironment,
+    pub mount_live_share: bool,
+}
+
+impl GuiStartRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        crate::validate_windows_user_name(&self.user_name)?;
+        validate_gui_start(&self.request, &self.environment)?;
+        let request = self.request.encode()?;
+        let environment = self.environment.encode()?;
+        let request_length = u32::try_from(request.len())
+            .map_err(|_| LswError::Protocol("GUI start request is too long".to_owned()))?;
+        let mut payload = Vec::new();
+        push_string(&mut payload, &self.user_name)?;
+        payload.push(u8::from(self.mount_live_share));
+        payload.extend_from_slice(&request_length.to_be_bytes());
+        payload.extend_from_slice(&request);
+        payload.extend_from_slice(&environment);
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let user_name = decoder.string()?;
+        let mount_live_share = match decoder.u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LswError::Protocol(
+                    "GUI live-share flag must be zero or one".to_owned(),
+                ))
+            }
+        };
+        let request_length = usize::try_from(decoder.u32()?)
+            .map_err(|_| LswError::Protocol("invalid GUI start length".to_owned()))?;
+        let request = StartRequest::decode(decoder.take(request_length)?)?;
+        let environment = ProcessEnvironment::decode(decoder.remaining)?;
+        decoder.remaining = &[];
+        decoder.finish()?;
+        crate::validate_windows_user_name(&user_name)?;
+        validate_gui_start(&request, &environment)?;
+        Ok(Self {
+            user_name,
+            request,
+            environment,
+            mount_live_share,
+        })
+    }
+}
+
+fn validate_gui_start(request: &StartRequest, environment: &ProcessEnvironment) -> Result<()> {
+    if request.kind != SessionKind::Run {
+        return Err(LswError::Protocol(
+            "GUI launch requires a run request".to_owned(),
+        ));
+    }
+    let program = request
+        .argv
+        .first()
+        .ok_or_else(|| LswError::Protocol("GUI launch requires an executable".to_owned()))?;
+    if !program.to_ascii_lowercase().ends_with(".exe") {
+        return Err(LswError::Protocol(
+            "GUI launch program must end in .exe".to_owned(),
+        ));
+    }
+    const RESERVED: [&str; 4] = [
+        "LSW_DESKTOP_TOKEN",
+        "LSW_LIVE_SHARE_TOKEN",
+        "LSW_DESKTOP_USER",
+        "LSW_ICON_SOURCE",
+    ];
+    if environment.variables.iter().any(|(name, _)| {
+        RESERVED
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(LswError::Protocol(
+            "GUI environment must not replace reserved LSW integration variables".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuiIconRequest {
+    pub user_name: String,
+    pub program: String,
+}
+
+impl GuiIconRequest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        crate::validate_windows_user_name(&self.user_name)?;
+        if self.program.is_empty() || !self.program.to_ascii_lowercase().ends_with(".exe") {
+            return Err(LswError::Protocol(
+                "GUI icon program must be a non-empty .exe path".to_owned(),
+            ));
+        }
+        let mut payload = Vec::new();
+        push_string(&mut payload, &self.user_name)?;
+        push_string(&mut payload, &self.program)?;
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder::new(payload);
+        let request = Self {
+            user_name: decoder.string()?,
+            program: decoder.string()?,
+        };
+        decoder.finish()?;
+        request.encode()?;
+        Ok(request)
     }
 }
 
@@ -1270,6 +1458,85 @@ mod tests {
             FrameKind::MaintenanceShutdown
         );
         assert_eq!(FrameKind::MaintenanceShutdown as u8, 41);
+    }
+
+    #[test]
+    fn desktop_protocol_is_append_only_bounded_and_round_trips() {
+        assert_eq!(FrameKind::DesktopCompanionStart as u8, 42);
+        assert_eq!(FrameKind::GuiStart as u8, 43);
+        assert_eq!(FrameKind::GuiIcon as u8, 44);
+        assert_eq!(FrameKind::GuiIconData as u8, 45);
+        assert_eq!(FrameKind::DesktopLiveShareConfigure as u8, 46);
+        for value in 42..=46 {
+            assert!(FrameKind::try_from(value).is_ok());
+        }
+
+        let user = DesktopUserRequest {
+            user_name: "desktop-user".to_owned(),
+        };
+        assert_eq!(
+            DesktopUserRequest::decode(&user.encode().unwrap()).unwrap(),
+            user
+        );
+        let live = DesktopLiveShareRequest {
+            user_name: "desktop-user".to_owned(),
+            enable: true,
+        };
+        assert_eq!(
+            DesktopLiveShareRequest::decode(&live.encode().unwrap()).unwrap(),
+            live
+        );
+        let gui = GuiStartRequest {
+            user_name: "desktop-user".to_owned(),
+            request: StartRequest {
+                kind: SessionKind::Run,
+                argv: vec!["notepad.exe".to_owned(), "L:\\note.txt".to_owned()],
+                working_directory: Some("L:\\".to_owned()),
+            },
+            environment: ProcessEnvironment::new(vec![("MODE".to_owned(), "desktop".to_owned())])
+                .unwrap(),
+            mount_live_share: true,
+        };
+        assert_eq!(
+            GuiStartRequest::decode(&gui.encode().unwrap()).unwrap(),
+            gui
+        );
+        let icon = GuiIconRequest {
+            user_name: "desktop-user".to_owned(),
+            program: "notepad.exe".to_owned(),
+        };
+        assert_eq!(
+            GuiIconRequest::decode(&icon.encode().unwrap()).unwrap(),
+            icon
+        );
+
+        let mut invalid_live = live.encode().unwrap();
+        *invalid_live.last_mut().unwrap() = 2;
+        assert!(DesktopLiveShareRequest::decode(&invalid_live).is_err());
+        let invalid_gui = GuiStartRequest {
+            request: StartRequest {
+                kind: SessionKind::Exec,
+                argv: vec!["cmd.exe".to_owned()],
+                working_directory: None,
+            },
+            ..gui.clone()
+        };
+        assert!(invalid_gui.encode().is_err());
+        let reserved_gui = GuiStartRequest {
+            environment: ProcessEnvironment::new(vec![(
+                "lsw_desktop_token".to_owned(),
+                "override".to_owned(),
+            )])
+            .unwrap(),
+            ..gui
+        };
+        assert!(reserved_gui.encode().is_err());
+        assert!(GuiIconRequest {
+            user_name: "desktop-user".to_owned(),
+            program: "notepad".to_owned(),
+        }
+        .encode()
+        .is_err());
     }
 
     #[test]

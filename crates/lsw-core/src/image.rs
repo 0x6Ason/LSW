@@ -196,6 +196,7 @@ impl<'a> ImageManager<'a> {
         manifest.hibernate_timeout_seconds = source.hibernate_timeout_seconds;
         manifest.idle_policy = source.idle_policy;
         manifest.memory_min_mib = source.memory_min_mib.min(manifest.spec.memory_mib);
+        manifest.scoped_live_share_credential = source.scoped_live_share_credential;
 
         let instance_dir = self.store.create(&manifest)?;
         let result = (|| -> Result<()> {
@@ -573,6 +574,7 @@ mod tests {
         })
         .expect("source manifest should be valid");
         source.state = InstanceState::Stopped;
+        source.scoped_live_share_credential = false;
         let source_dir = store.create(&source).expect("source should be created");
         fs::write(source_dir.join("disk.qcow2"), b"installed windows")
             .expect("source disk should be written");
@@ -628,6 +630,10 @@ mod tests {
 
         assert_eq!(clone.state, InstanceState::Stopped);
         assert_eq!(clone.base_image_key.as_deref(), Some(image.key.as_str()));
+        assert_eq!(
+            clone.scoped_live_share_credential,
+            source.scoped_live_share_credential
+        );
         assert_ne!(source.control_port, clone.control_port);
         assert_ne!(source_token, clone_token);
         assert_eq!(

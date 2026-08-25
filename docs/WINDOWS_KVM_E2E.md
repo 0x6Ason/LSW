@@ -2,8 +2,10 @@
 
 The real Windows gate validates the release candidate on an explicitly
 dedicated Linux x86_64 KVM runner. It resolves Microsoft's current English x64
-ISO metadata, requires the operator-supplied read-only media to match that exact
-published SHA-256, and runs the network-disabled WinPE DISM prepare/apply path.
+ISO metadata on a GitHub-hosted authorization job, transfers only the private
+short-lived CDN request, downloads the payload directly from Microsoft on the
+KVM runner, requires its exact published SHA-256, and runs the network-disabled
+WinPE DISM prepare/apply path.
 The normal boot then completes OOBE without a viewer, desktop session, or guest
 input. The gate verifies that the one-shot setup account, cached answer files,
 SetupComplete script, and staging payload are removed before accepting the
@@ -75,7 +77,7 @@ Install these dependencies before registering the runner:
 
 - QEMU x86_64, `qemu-img`, OVMF, and swtpm;
 - wimlib, xorriso, and a UDF-capable `7z`;
-- Git, Python 3, GNU coreutils, and standard POSIX shell tools;
+- Git, Python 3, aria2, GNU coreutils, and standard POSIX shell tools;
 - rustup with Rust 1.76.0 and the `x86_64-pc-windows-gnu` target; and
 - the MinGW-w64 x86_64 compiler.
 
@@ -83,7 +85,7 @@ On Debian or Ubuntu, the relevant packages include:
 
 ```sh
 sudo apt-get install \
-  coreutils gcc-mingw-w64-x86-64 git ovmf python3 qemu-system-x86 \
+  aria2 coreutils gcc-mingw-w64-x86-64 git ovmf python3 qemu-system-x86 \
   7zip qemu-utils swtpm util-linux wimtools xorriso
 rustup toolchain install 1.76.0 --profile minimal
 rustup target add --toolchain 1.76.0 x86_64-pc-windows-gnu
@@ -98,7 +100,7 @@ distribution does not use one of LSW's standard OVMF paths, set both
 environment. The preflight fails before installation if no complete firmware
 pair is available.
 
-The beta.7 gate is headless. The runner may run as a background service and does
+The beta.8 gate is headless. The runner may run as a background service and does
 not need `DISPLAY`, `WAYLAND_DISPLAY`, a session bus, or `remote-viewer`.
 
 Provision a short, dedicated, encrypted, disk-backed state directory. Long
@@ -114,39 +116,28 @@ this directory to be owned by that account, have mode `0700`, use a filesystem
 other than tmpfs/ramfs, and have a canonical absolute path no longer than 16
 bytes.
 
-## Provision Windows media
+## Windows media
 
-Obtain an unmodified, properly licensed Windows 11 x64 ISO outside GitHub.
-Place it outside the Actions checkout and runner temporary directory. The
-runner account must be able to read the file but must not be able to modify it;
-a root-owned read-only mount or file is recommended.
-
-Set these variables in the runner process environment before starting the
-runner:
+Set only the short E2E state root in the runner process environment:
 
 ```sh
-export LSW_WINDOWS_ISO=/srv/lsw-media/Windows11.iso
-export LSW_WINDOWS_ISO_SHA256=replace-with-the-64-character-sha256
 export LSW_E2E_ROOT_BASE=/e
 ./run.sh
 ```
 
-Use a canonical absolute path, not a symlink. Calculate the digest once from
-the provisioned file with `sha256sum`, and compare it with an expected digest
-obtained independently from Microsoft before configuring the runner. The
-workflow variable enforces that reviewed value consistently; it does not by
-itself prove that an arbitrary ISO is official. The preflight rejects missing,
-workspace-local, writable, symlinked, or digest-mismatched media.
+The authorization job builds the exact candidate's resolver, creates a mode
+`0600` request containing an allowlisted 24-hour Microsoft CDN URL and the
+published English x64 SHA-256, and transfers that small file as a one-day
+Actions artifact. The URL is never printed. The KVM runner downloads the ISO
+with at most four aria2 connections, verifies the exact SHA-256, marks the ISO
+read-only, and keeps it below the isolated per-run build root. The final
+always-run cleanup deletes the request, URL input, ISO, build output, VM disks,
+vTPM state, and agent credentials. It never uploads the ISO or caches it.
 
-The workflow never downloads the ISO payload, copies it into the repository,
-caches it, or uploads it as an artifact. It does contact Microsoft's resolver
-and download page to obtain the current signed-link metadata and published
-SHA-256. VM disks, vTPM state, and agent credentials
-also remain on the dedicated runner. The workflow uploads only the harness's
-redacted `attestation.env`, `doctor.txt`, `bench.json`, and
-`diagnose.tar.gz` evidence for 14 days. Cargo may still use the network for
-normal Rust dependencies; pre-warm the dedicated runner and apply an outbound
-firewall if a fully controlled network boundary is required.
+The workflow retains only the harness's redacted `attestation.env`,
+`doctor.txt`, `bench.json`, and `diagnose.tar.gz` evidence for 14 days. Cargo
+and the Microsoft media path require outbound network access; pre-warm Rust
+dependencies and restrict other destinations if a tighter boundary is needed.
 
 ## Run the gate
 
@@ -170,7 +161,10 @@ requires promote, demote, and final promote operations to update both the native
 Administrators group and manifest v6 without exposing a password prefix in LSW
 metadata, seeds, or logs. A separately authenticated administrator must be
 created without entering or replacing the manifest's default identity. The gate
-then enables native Windows sudo in new-window
+also requires `lsw run --gui` to fail closed with an actionable sign-in request
+while no console user exists; that exercises the fixed WTS launch boundary
+without weakening the headless cold-start invariant. The gate then enables
+native Windows sudo in new-window
 mode, verifies the exact local registry DWORD and `EnableLUA=1`, disables it to
 prove reversibility, and enables the safe mode again. The disposable official
 image must not contain a machine sudo policy.
@@ -193,6 +187,9 @@ The permanent-user request proves the virtual-account agent can start it over
 its narrow service ACL and that it exits after each authenticated native account
 operation. User creation supplies the password only in the bounded binary
 protocol; role changes contain no password and are separately capability-gated.
+GUI launch uses a third request kind that accepts only the registered username;
+the helper must reject it when no matching active WTS token exists. Executable
+arguments are sent only to the unprivileged per-user companion.
 
 `LSWMaintenanceHelper` must likewise be Manual/demand-start under LocalSystem.
 The TRIM and hibernate checks prove that the restricted agent can request only
@@ -210,13 +207,15 @@ configuration and identity checks and requires the same SID. It also requires
 neither automatic logon nor a stored default password. This prevents a hidden
 desktop login from making the cold-start test pass.
 
-Session 0 is sufficient for the beta.7 command and ConPTY contract, but it does
-not provide visible desktop GUI applications. A future user-session companion
-will own GUI, clipboard, audio, and per-window integration without changing the
-boot-time service boundary.
+Session 0 remains sufficient for the command and ConPTY contract. Slice 3 adds
+the on-demand user-session companion for GUI process launch, icon discovery,
+and the user's live `L:` mapping without changing that boot-time service
+boundary. The release gate deliberately remains at the sign-in screen, so it
+tests fail-closed WTS selection; per-window capture, clipboard, and audio belong
+to later beta.8 slices.
 
 This workflow and harness define the required release evidence; they do not
-claim the service path has passed on real hardware. Tag beta.7 only after the
+claim the service path has passed on real hardware. Tag beta.8 only after the
 exact candidate completes this job successfully on the dedicated KVM runner.
 
 Tag only the exact commit named in a successful run. If `master` changes, run

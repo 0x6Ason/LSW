@@ -53,9 +53,45 @@ jobs:
             exit 1
           fi
 
+  resolve-media:
+    name: Resolve official Windows media
+    needs: authorize
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: "1.76.0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Create a private short-lived Microsoft download request
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.76.0 --profile minimal
+          request="$RUNNER_TEMP/windows-media-request.lsw"
+          cargo run --locked --release -p lsw-cli -- \
+            media resolve --language English --request-file "$request"
+          if [[ -L "$request" || ! -f "$request" || \
+                "$(stat -c %a -- "$request")" != 600 ]]; then
+            echo "error: LSW did not create a private media request" >&2
+            exit 1
+          fi
+
+      - name: Transfer only the short-lived request to the KVM runner
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-media-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-media-request.lsw
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 1
+
   windows-kvm-e2e:
     name: Windows 11 headless WinPE, agent, ConPTY, and cold restart
-    needs: authorize
+    needs: [authorize, resolve-media]
     environment: windows-kvm-e2e
     runs-on:
       - self-hosted
@@ -84,6 +120,78 @@ jobs:
           {
             printf 'LSW_BUILD_ROOT=%s\n' "$JOB_BUILD_ROOT"
             printf 'CARGO_TARGET_DIR=%s/target\n' "$JOB_BUILD_ROOT"
+          } >>"$GITHUB_ENV"
+
+      - name: Receive the private Microsoft media request
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-media-request-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.LSW_BUILD_ROOT }}/media-request
+
+      - name: Download and verify official Windows media
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v aria2c >/dev/null 2>&1; then
+            echo "error: aria2c is required to fetch official Windows media" >&2
+            exit 1
+          fi
+          request="$LSW_BUILD_ROOT/media-request/windows-media-request.lsw"
+          if [[ -L "$request" || ! -f "$request" || \
+                "$(stat -c %s -- "$request")" -gt 8192 ]]; then
+            echo "error: invalid Windows media request artifact" >&2
+            exit 1
+          fi
+          chmod 600 -- "$request"
+          mapfile -t fields <"$request"
+          if (( ${#fields[@]} != 4 )) || [[ "${fields[0]}" != version=1 || \
+                "${fields[1]}" != url=* || "${fields[2]}" != sha256=* || \
+                "${fields[3]}" != filename=* ]]; then
+            echo "error: malformed Windows media request artifact" >&2
+            exit 1
+          fi
+          media_url=${fields[1]#url=}
+          media_sha=${fields[2]#sha256=}
+          media_name=${fields[3]#filename=}
+          case "$media_url" in
+            https://*.download.prss.microsoft.com/*\?*) ;;
+            *) echo "error: media request is not an allowlisted Microsoft CDN URL" >&2; exit 1 ;;
+          esac
+          if [[ ! "$media_sha" =~ ^[0-9a-f]{64}$ || \
+                ! "$media_name" =~ ^[A-Za-z0-9._-]+\.iso$ ]]; then
+            echo "error: invalid official media identity" >&2
+            exit 1
+          fi
+
+          media_directory="$LSW_BUILD_ROOT/media"
+          media_path="$media_directory/windows.iso"
+          input_file="$LSW_BUILD_ROOT/media-download.input"
+          download_log="$LSW_BUILD_ROOT/media-download.log"
+          mkdir -p -- "$media_directory"
+          chmod 700 -- "$media_directory"
+          printf '%s\n  out=windows.iso\n' "$media_url" >"$input_file"
+          chmod 600 -- "$input_file"
+          unset media_url
+          if ! aria2c --input-file="$input_file" --dir="$media_directory" \
+              --allow-overwrite=false --auto-file-renaming=false \
+              --check-certificate=true --file-allocation=none \
+              --max-connection-per-server=4 --split=4 \
+              --console-log-level=warn --summary-interval=0 \
+              >"$download_log" 2>&1; then
+            sed -E 's#https://[^?[:space:]]+\?[^[:space:]]+#<redacted Microsoft URL>#g' \
+              "$download_log" >&2
+            exit 1
+          fi
+          rm -f -- "$input_file" "$download_log" "$request"
+          actual_sha=$(sha256sum -- "$media_path" | awk '{ print $1 }')
+          if [[ "$actual_sha" != "$media_sha" ]]; then
+            echo "error: downloaded Windows media failed Microsoft's SHA-256" >&2
+            exit 1
+          fi
+          chmod 400 -- "$media_path"
+          {
+            printf 'LSW_WINDOWS_ISO=%s\n' "$media_path"
+            printf 'LSW_WINDOWS_ISO_SHA256=%s\n' "$media_sha"
           } >>"$GITHUB_ENV"
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -116,7 +224,7 @@ jobs:
             exit 1
           fi
           for command in \
-            awk cargo df find findmnt git grep id python3 qemu-img \
+            aria2c awk cargo df find findmnt git grep id python3 qemu-img \
             qemu-system-x86_64 realpath rustc rustup \
             setsid sha256sum smbd stat swtpm timeout tr \
             7z wimlib-imagex xorriso \
@@ -242,13 +350,20 @@ jobs:
             echo "error: LSW_WINDOWS_ISO must be canonical and must not be a symlink" >&2
             exit 1
           fi
+          expected_generated_iso="${LSW_BUILD_ROOT%/}/media/windows.iso"
           case "$canonical_iso" in
-            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*|"$RUNNER_TEMP"|"$RUNNER_TEMP"/*|\
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*|\
             "$canonical_e2e_root"|"$canonical_e2e_root"/*)
               echo "error: Windows media must be outside all Actions and E2E working directories" >&2
               exit 1
               ;;
           esac
+          if [[ "$canonical_iso" == "$RUNNER_TEMP" || \
+                "$canonical_iso" == "$RUNNER_TEMP"/* ]] && \
+             [[ "$canonical_iso" != "$expected_generated_iso" ]]; then
+            echo "error: unexpected Windows media path below the runner temp directory" >&2
+            exit 1
+          fi
           if [[ -w "$canonical_iso" ]]; then
             echo "error: Windows media must be read-only to the runner account" >&2
             exit 1
@@ -341,7 +456,7 @@ jobs:
             echo
             echo "Validated commit: \`$GITHUB_SHA\`"
             echo
-            echo "Only redacted gate evidence was uploaded; the ISO and VM state remained local."
+            echo "Only redacted gate evidence is retained; the short-lived media request, ISO, and VM state are deleted after the run."
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Remove local build output

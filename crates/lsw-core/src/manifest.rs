@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{LswError, Result, WindowsProfile};
 
-const MANIFEST_VERSION: u32 = 7;
+const MANIFEST_VERSION: u32 = 8;
 pub const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 10 * 60;
 pub const DEFAULT_HIBERNATE_TIMEOUT_SECONDS: u64 = 5 * 60;
 pub const AGENT_CONTROL_PORT_START: u16 = 42_000;
@@ -424,6 +424,7 @@ pub struct InstanceManifest {
     pub base_image_key: Option<String>,
     pub default_user: Option<String>,
     pub default_user_role: Option<WindowsUserRole>,
+    pub scoped_live_share_credential: bool,
     pub folder_shares: Vec<FolderShare>,
 }
 
@@ -453,6 +454,7 @@ impl InstanceManifest {
             base_image_key: None,
             default_user: None,
             default_user_role: None,
+            scoped_live_share_credential: true,
             folder_shares: Vec::new(),
         })
     }
@@ -518,6 +520,7 @@ impl InstanceManifest {
                 "base_image_key={}\n",
                 "default_user={}\n",
                 "default_user_role={}\n",
+                "scoped_live_share_credential={}\n",
                 "share_count={}\n",
                 "{}"
             ),
@@ -543,6 +546,7 @@ impl InstanceManifest {
             base_image_key,
             default_user,
             default_user_role,
+            self.scoped_live_share_credential,
             self.folder_shares.len(),
             shares,
         ))
@@ -648,6 +652,11 @@ impl InstanceManifest {
         } else {
             default_user.as_ref().map(|_| WindowsUserRole::Standard)
         };
+        let scoped_live_share_credential = if version >= 8 {
+            parse_field(&fields, "scoped_live_share_credential")?
+        } else {
+            false
+        };
         let folder_shares = if version >= 5 {
             parse_folder_shares(&fields, version)?
         } else {
@@ -668,6 +677,7 @@ impl InstanceManifest {
             base_image_key,
             default_user,
             default_user_role,
+            scoped_live_share_credential,
             folder_shares,
         };
         validate_runtime_fields(&manifest)?;
@@ -1018,6 +1028,7 @@ mod tests {
                     "base_image_key=",
                     "default_user=",
                     "default_user_role=",
+                    "scoped_live_share_credential=",
                     "share_count=",
                     "share.",
                 ]
@@ -1054,7 +1065,11 @@ mod tests {
         manifest.default_user_role = Some(WindowsUserRole::Administrator);
         manifest.folder_shares.push(FolderShare {
             name: "source".to_owned(),
-            host_path: PathBuf::from("/srv/source"),
+            host_path: PathBuf::from(if cfg!(windows) {
+                "C:\\srv\\source"
+            } else {
+                "/srv/source"
+            }),
             guest_path: "C:\\Users\\desktop-user\\source".to_owned(),
             mode: FolderShareMode::ReadWrite,
             transport: FolderShareTransport::Mirror,
@@ -1307,7 +1322,7 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>()
             .join("\n")
-            .replacen("version=7", "version=5", 1);
+            .replacen("version=8", "version=5", 1);
 
         let migrated = InstanceManifest::decode(&legacy).expect("v5 manifest should migrate");
         assert_eq!(migrated.default_user.as_deref(), Some("desktop-user"));
@@ -1350,11 +1365,47 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>()
             .join("\n")
-            .replacen("version=7", "version=6", 1);
+            .replacen("version=8", "version=6", 1);
         let migrated = InstanceManifest::decode(&legacy).expect("v6 manifest should migrate");
         assert_eq!(
             migrated.folder_shares[0].transport,
             FolderShareTransport::Mirror
+        );
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn version_seven_instances_keep_the_legacy_live_share_credential() {
+        let iso = temporary_iso();
+        let manifest = InstanceManifest::new(InstanceSpec {
+            name: "version-seven".to_owned(),
+            source_iso: iso.clone(),
+            profile: WindowsProfile::Slim,
+            cpus: 2,
+            memory_mib: 4096,
+            disk_gib: 64,
+            network: NetworkMode::Nat,
+            port_forwards: Vec::new(),
+            license_accepted: true,
+            allow_unsupported_requirements: false,
+        })
+        .expect("fixture manifest should be valid");
+        let legacy = manifest
+            .encode()
+            .expect("manifest should encode")
+            .lines()
+            .filter(|line| !line.starts_with("scoped_live_share_credential="))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replacen("version=8", "version=7", 1);
+
+        let migrated = InstanceManifest::decode(&legacy).expect("v7 manifest should migrate");
+        assert!(!migrated.scoped_live_share_credential);
+        assert!(
+            InstanceManifest::new(manifest.spec)
+                .expect("new manifest should be valid")
+                .scoped_live_share_credential
         );
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }

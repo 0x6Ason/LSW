@@ -9,6 +9,7 @@ mod agent_client;
 mod arguments;
 mod completion;
 mod daemon_client;
+mod desktop_launcher;
 mod file_bench;
 mod installation;
 mod license;
@@ -24,7 +25,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::thread;
@@ -38,11 +39,11 @@ use daemon_client::DaemonClient;
 use installation::{find_windows_agent, install_instance};
 use license::{license, show_activation_notice_once};
 use lsw_core::{
-    CustomizationPlan, HostCapabilities, IdlePolicy, ImageManager, InstallSeedBuilder,
-    InstallSeedOptions, InstanceManifest, InstanceSpec, InstanceState, LaunchPhase, LswError,
-    MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage, PeImportSymbol, ProcessEnvironment,
-    Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest, StateStore, VmAccelerator,
-    WindowsProfile,
+    CustomizationPlan, FolderShareTransport, GuiStartRequest, HostCapabilities, IdlePolicy,
+    ImageManager, InstallSeedBuilder, InstallSeedOptions, InstanceManifest, InstanceSpec,
+    InstanceState, LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage,
+    PeImportSymbol, ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner, SessionKind,
+    StartRequest, StateStore, VmAccelerator, WindowsProfile,
 };
 use progress::{ProgressEvent, ProgressRenderer};
 
@@ -120,6 +121,7 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
         "plan" => plan(&store, remaining)?,
         "use" => select_default(&store, remaining)?,
         "daemon" => daemon(&store, remaining)?,
+        "app" => desktop_launcher::command(&store, remaining)?,
         "install" => install_instance(&store, remaining)?,
         "license" => license(&store, remaining)?,
         "user" => user_command(&store, remaining)?,
@@ -1250,6 +1252,30 @@ fn guest_command(
 ) -> Result<u8, Box<dyn std::error::Error>> {
     let parsed = GuestCommandArguments::parse(arguments, kind)?;
     let name = resolve_name(store, parsed.requested.as_deref())?;
+    if parsed.gui {
+        let manifest = store.load(&name)?;
+        let user_name = manifest.default_user.clone().ok_or_else(|| {
+            format!(
+                "instance {name:?} has no registered Windows desktop user; run `lsw user setup {name}`"
+            )
+        })?;
+        let mut request = parsed.request;
+        if parsed.translate_files {
+            translate_gui_file_arguments(&manifest, &mut request.argv)?;
+        }
+        let mount_live_share = manifest
+            .folder_shares
+            .iter()
+            .any(|share| share.transport == FolderShareTransport::LiveSmb);
+        let process_id = connect_agent(store, &name)?.run_gui(&GuiStartRequest {
+            user_name,
+            request,
+            environment: parsed.environment,
+            mount_live_share,
+        })?;
+        println!("Started GUI process {process_id} in {name:?}.");
+        return Ok(0);
+    }
     let client = connect_agent(store, &name)?;
     if parsed.detached {
         let process_id = client.run_detached(&parsed.request, &parsed.environment)?;
@@ -1266,6 +1292,8 @@ struct GuestCommandArguments {
     request: StartRequest,
     environment: ProcessEnvironment,
     detached: bool,
+    gui: bool,
+    translate_files: bool,
 }
 
 impl GuestCommandArguments {
@@ -1281,7 +1309,7 @@ impl GuestCommandArguments {
         let usage = format!(
             "usage: lsw {command_name} [NAME] [--cwd PATH] [--env KEY=VALUE]{} -- COMMAND [ARG ...]",
             if kind == SessionKind::Run {
-                " [--detach]"
+                " [--detach|--gui] [--translate-files]"
             } else {
                 ""
             }
@@ -1297,6 +1325,8 @@ impl GuestCommandArguments {
         let mut working_directory = None;
         let mut environment = Vec::new();
         let mut detached = false;
+        let mut gui = false;
+        let mut translate_files = false;
         let mut index = 0;
         while index < separator {
             let argument = arguments[index]
@@ -1329,6 +1359,18 @@ impl GuestCommandArguments {
                     }
                     detached = true;
                 }
+                "--gui" if kind == SessionKind::Run => {
+                    if gui {
+                        return Err("--gui was supplied more than once".into());
+                    }
+                    gui = true;
+                }
+                "--translate-files" if kind == SessionKind::Run => {
+                    if translate_files {
+                        return Err("--translate-files was supplied more than once".into());
+                    }
+                    translate_files = true;
+                }
                 _ if argument.starts_with("--cwd=") => {
                     let value = argument.trim_start_matches("--cwd=");
                     if value.is_empty() || working_directory.replace(value.to_owned()).is_some() {
@@ -1360,6 +1402,15 @@ impl GuestCommandArguments {
                     .ok_or("guest arguments must be valid UTF-8")
             })
             .collect::<Result<Vec<_>, _>>()?;
+        if detached && gui {
+            return Err("--detach and --gui are mutually exclusive".into());
+        }
+        if translate_files && !gui {
+            return Err("--translate-files requires --gui".into());
+        }
+        if gui && !argv[0].to_ascii_lowercase().ends_with(".exe") {
+            return Err("--gui requires a PROGRAM.exe command".into());
+        }
         Ok(Self {
             requested,
             request: StartRequest {
@@ -1369,8 +1420,112 @@ impl GuestCommandArguments {
             },
             environment: ProcessEnvironment::new(environment)?,
             detached,
+            gui,
+            translate_files,
         })
     }
+}
+
+fn translate_gui_file_arguments(
+    manifest: &InstanceManifest,
+    arguments: &mut [String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let live_root = manifest
+        .folder_shares
+        .iter()
+        .find(|share| share.transport == FolderShareTransport::LiveSmb)
+        .map(|share| fs::canonicalize(&share.host_path))
+        .transpose()?;
+    for argument in arguments.iter_mut().skip(1) {
+        let path = Path::new(argument);
+        if !path.is_absolute() {
+            continue;
+        }
+        if !path.exists() {
+            return Err(format!("host file {} does not exist", path.display()).into());
+        }
+        let Some(live_root) = &live_root else {
+            return Err(format!(
+                "host file {} is not available to Windows; run `lsw share` first or omit --translate-files",
+                path.display()
+            )
+            .into());
+        };
+        let canonical = fs::canonicalize(path)?;
+        let relative = canonical.strip_prefix(live_root).map_err(|_| {
+            format!(
+                "host file {} is outside the live folder {}; share a common parent before launching it",
+                path.display(),
+                live_root.display()
+            )
+        })?;
+        let components = relative
+            .components()
+            .map(|component| {
+                let component = component
+                    .as_os_str()
+                    .to_str()
+                    .ok_or("host file path is not valid UTF-8")?;
+                validate_live_windows_component(component)?;
+                Ok(component)
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        *argument = if components.is_empty() {
+            "L:\\".to_owned()
+        } else {
+            format!("L:\\{}", components.join("\\"))
+        };
+    }
+    Ok(())
+}
+
+fn validate_live_windows_component(value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if value.is_empty()
+        || value.ends_with([' ', '.'])
+        || is_reserved_windows_component(value)
+        || value
+            .chars()
+            .any(|character| character <= '\u{1f}' || "<>:\"|?*".contains(character))
+    {
+        return Err(format!(
+            "host file component {value:?} cannot be represented through Windows Linux (L:)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn is_reserved_windows_component(value: &str) -> bool {
+    let stem = value
+        .split('.')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn parse_guest_environment(value: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
@@ -1535,22 +1690,43 @@ fn profile(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn media(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    let action = arguments
-        .first()
-        .and_then(|value| value.to_str())
-        .ok_or("usage: lsw media <resolve|published-sha256> [--language LANGUAGE]")?;
+    let action = arguments.first().and_then(|value| value.to_str()).ok_or(
+        "usage: lsw media <resolve|published-sha256> [--language LANGUAGE] [--request-file PATH]",
+    )?;
     if action != "resolve" && action != "published-sha256" {
-        return Err("usage: lsw media <resolve|published-sha256> [--language LANGUAGE]".into());
+        return Err("usage: lsw media <resolve|published-sha256> [--language LANGUAGE] [--request-file PATH]".into());
     }
     let mut language = "English";
-    match &arguments[1..] {
-        [] => {}
-        [option, value] if option == "--language" => {
-            language = value.to_str().ok_or("language must be valid UTF-8")?;
+    let mut language_seen = false;
+    let mut request_file = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let option = arguments[index]
+            .to_str()
+            .ok_or("media options must be valid UTF-8")?;
+        match option {
+            "--language" if index + 1 < arguments.len() => {
+                if language_seen {
+                    return Err("--language was supplied more than once".into());
+                }
+                language_seen = true;
+                index += 1;
+                language = arguments[index]
+                    .to_str()
+                    .ok_or("language must be valid UTF-8")?;
+            }
+            "--request-file" if action == "resolve" && index + 1 < arguments.len() => {
+                index += 1;
+                let path = PathBuf::from(&arguments[index]);
+                if request_file.replace(path).is_some() {
+                    return Err("--request-file was supplied more than once".into());
+                }
+            }
+            _ => {
+                return Err("usage: lsw media <resolve|published-sha256> [--language LANGUAGE] [--request-file PATH]".into());
+            }
         }
-        _ => {
-            return Err("usage: lsw media <resolve|published-sha256> [--language LANGUAGE]".into());
-        }
+        index += 1;
     }
     let request = MicrosoftIsoRequest {
         language: language.to_owned(),
@@ -1561,6 +1737,15 @@ fn media(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let resolved = resolver.resolve(&request)?;
+    if let Some(path) = request_file {
+        write_media_request(
+            &path,
+            resolved.download_url.expose(),
+            &resolved.expected_sha256,
+            &resolved.filename,
+        )?;
+        println!("REQUEST_FILE={}", path.display());
+    }
     println!("PRODUCT_ID={}", resolved.product_id);
     println!("SKU_ID={}", resolved.sku_id);
     println!("LANGUAGE={}", resolved.language);
@@ -1569,6 +1754,46 @@ fn media(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
     println!("SHA256={}", resolved.expected_sha256);
     if let Some(expires) = resolved.expires_at {
         println!("URL_EXPIRES={expires}");
+    }
+    Ok(())
+}
+
+fn write_media_request(
+    path: &Path,
+    url: &str,
+    sha256: &str,
+    filename: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !path.is_absolute() {
+        return Err("media request file path must be absolute".into());
+    }
+    let parent = path.parent().ok_or("media request file has no parent")?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.file_type().is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err("media request file parent must be a real directory".into());
+    }
+    if [url, sha256, filename]
+        .iter()
+        .any(|value| value.is_empty() || value.contains(['\r', '\n']))
+    {
+        return Err("media request contains an invalid field".into());
+    }
+    let contents = format!(
+        "version=1\nurl={url}\nsha256={}\nfilename={filename}\n",
+        sha256.to_ascii_lowercase()
+    );
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    if let Err(error) = (|| -> std::io::Result<()> {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()
+    })() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error.into());
     }
     Ok(())
 }
@@ -2403,7 +2628,7 @@ fn print_help() {
         "  lsw bench [NAME] [--json]\n",
         "  lsw inspect FILE [--imports] [--json]\n",
         "  lsw profile PROFILE\n",
-        "  lsw media resolve [--language LANGUAGE]\n",
+        "  lsw media resolve [--language LANGUAGE] [--request-file PATH]\n",
         "  lsw path <--windows|-w|--unix|-u> PATH\n",
         "  lsw completion <bash|zsh|fish|powershell>\n",
         "  lsw create NAME --iso PATH --accept-windows-license [OPTIONS]\n",
@@ -2443,7 +2668,9 @@ fn print_help() {
         "  lsw stop [NAME] [--force]\n",
         "  lsw shell [NAME]\n",
         "  lsw exec [NAME] [--cwd PATH] [-e KEY=VALUE] -- COMMAND [ARG ...]\n",
-        "  lsw run [NAME] [--cwd PATH] [-e KEY=VALUE] [--detach] -- PROGRAM [ARG ...]\n",
+        "  lsw run [NAME] [--cwd PATH] [-e KEY=VALUE] [--detach|--gui] [--translate-files] -- PROGRAM [ARG ...]\n",
+        "  lsw app install [NAME] [--title TITLE] [--cwd PATH] [-e KEY=VALUE] -- PROGRAM.exe [ARG ...]\n",
+        "  lsw app <list|remove ID>\n",
         "  lsw cp SOURCE DESTINATION\n",
         "  lsw push [NAME] [--recursive] HOST_PATH WINDOWS_PATH\n",
         "  lsw pull [NAME] [--recursive] WINDOWS_PATH HOST_PATH\n",

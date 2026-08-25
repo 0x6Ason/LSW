@@ -12,7 +12,7 @@ guest. Host platform and accelerator selection are separated from guest
 protocols. Linux KVM capability detection is implemented; HVF and WHPX selection
 and QEMU argument generation exist as planner-level work only. There are no
 macOS or Windows host-side binaries, daemon IPC integrations, or runtime
-validation claims in the beta.7 release.
+validation claims on the beta.8 development line.
 
 ## Components
 
@@ -29,7 +29,8 @@ validation claims in the beta.7 release.
 | Image manager | Implemented | Content-addressed sealed qcow2 bases, linked overlays, and post-clone credential rotation |
 | Resource governor | Implemented; opt-in | QMP balloon targets, host-pressure response, pause, Windows hibernate, resume, TRIM, and compaction |
 | Folder-share mirror | Implemented; opt-in | Manifest-bound RO/RW roots over authenticated bulk transfer with additive change watch |
-| Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and mapped as agent-session Windows `L:` without a guest filesystem driver |
+| Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and mapped as agent-session and registered-user-session Windows `L:` without a guest filesystem driver |
+| User-session companion | Slice 3 implemented | On-demand authenticated broker launched through a SID-checked WTS token; GUI start, icon discovery, desktop `L:`, and idle exit |
 | Host compositor bridge | Future work | One guest top-level HWND per Wayland/X11 host window |
 | Fast graphics transport | Future work | Damage-aware frames, input, DPI and clipboard; optional shared-memory accelerator |
 
@@ -39,7 +40,7 @@ validation claims in the beta.7 release.
    advanced primitive. Before a new instance is created or media is downloaded,
    an interactive terminal requires `[y/N]` Windows-license confirmation and
    noninteractive use requires `--accept-windows-license`. The installer then
-   validates the requested shape and stores manifest v5 plus a random 256-bit
+   validates the requested shape and stores manifest v8 plus a random 256-bit
    per-instance agent token. Without `--iso`, it resolves the current official
    Windows 11 x64 media from Microsoft, downloads from an allowlisted HTTPS CDN
    with at most four connections, and verifies Microsoft's published SHA-256.
@@ -47,7 +48,9 @@ validation claims in the beta.7 release.
    no published ports; version 3 manifests receive the default idle-timeout;
    version 4 migrates with all beta.7 policies and shares disabled; version 5
    adds users and mirrors; version 6 adds explicit account roles; version 7
-   keeps every older share on the mirror transport.
+   keeps every older share on the mirror transport; version 8 opts fresh
+   installs into a scoped live-share credential while migrated guests retain
+   their compatible legacy scheme.
 2. The installer selects Windows 11 Pro by WIM metadata unless the user chooses
    another edition. A network-disabled WinPE microVM uses the official media's
    DISM to export and service a profile-specific WIM in a private workspace,
@@ -83,8 +86,12 @@ validation claims in the beta.7 release.
    standard without changing the guest. Automation must defer or invoke the
    stdin-only recovery path. Normal
    applications remain filtered, UAC remains enabled, and AutoLogon is never
-   enabled.
-   Visible desktop GUI work still requires the beta.8 user-session companion.
+   enabled. GUI requests ask the same fixed helper to launch the installed
+   desktop companion with the existing registered user's active WTS token. The
+   helper verifies the token SID and requires an unelevated or linked limited
+   UAC token, accepts no executable arguments, and fails closed if the user has
+   not signed in. The companion uses scoped credentials, launches GUI children
+   as that user, and exits when idle.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
    Storage retrim, Windows hibernation, the fixed non-forcing shutdown fallback,
@@ -204,11 +211,13 @@ run, the planner re-canonicalizes the live root, rejects symlinks, and adds it
 only to that instance's QEMU user-network backend. The restricted Windows agent
 uses `WNetAddConnection2W` with the fixed `L:` and private SMB path, then clears
 its mutable credential buffer. The resulting mapping belongs to the agent's
-Windows logon session and is inherited by agent-launched terminal tools; no
-LocalSystem helper or PowerShell mapping owner remains resident. Windows does
-not share drive mappings across logon sessions, so the Slice 3 interactive
-companion will establish the separately authenticated Explorer mapping.
-Authenticated unmount ownership-checks and removes only the agent mapping.
+Windows logon session and is inherited by agent-launched terminal tools. The
+Slice 3 companion performs the same operation in the registered user's active
+session, so Explorer and file dialogs receive an independent mapping. Fresh
+manifest-v8 guests use a live-share credential domain-separated from the main
+agent token; manifest-v7 and older guests retain the legacy credential expected
+by their installed agent. Authenticated unmount ownership-checks and removes
+only LSW's mapping.
 Adding or removing the root performs a graceful restart because the QEMU SMB
 root is immutable after launch.
 

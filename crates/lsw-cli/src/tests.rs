@@ -135,6 +135,78 @@ fn detach_is_run_only_and_environment_names_are_case_insensitive() {
 }
 
 #[test]
+fn gui_run_is_explicit_run_only_and_cannot_detach() {
+    let gui = ["win-dev", "--gui", "--translate-files", "--", "notepad.exe"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    let parsed =
+        GuestCommandArguments::parse(&gui, SessionKind::Run).expect("GUI run should parse");
+    assert!(parsed.gui);
+    assert!(parsed.translate_files);
+    assert!(!parsed.detached);
+    assert!(GuestCommandArguments::parse(&gui, SessionKind::Exec).is_err());
+
+    let conflicting = ["--gui", "--detach", "--", "notepad.exe"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(GuestCommandArguments::parse(&conflicting, SessionKind::Run).is_err());
+    let files_without_gui = ["--translate-files", "--", "notepad.exe"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(GuestCommandArguments::parse(&files_without_gui, SessionKind::Run).is_err());
+    let gui_without_exe = ["--gui", "--", "notepad"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    assert!(GuestCommandArguments::parse(&gui_without_exe, SessionKind::Run).is_err());
+    assert!(validate_live_windows_component("report.txt").is_ok());
+    assert!(validate_live_windows_component("bad:name.txt").is_err());
+    assert!(validate_live_windows_component("trailing.").is_err());
+    assert!(validate_live_windows_component("CON.txt").is_err());
+}
+
+#[test]
+fn media_request_is_private_and_create_only() {
+    let root = env::temp_dir().join(format!(
+        "lsw-media-request-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let request = root.join("request.lsw");
+    write_media_request(
+        &request,
+        "https://software.download.prss.microsoft.com/windows.iso?secret=token",
+        &"a".repeat(64),
+        "windows.iso",
+    )
+    .unwrap();
+    assert_eq!(
+        fs::metadata(&request).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let contents = fs::read_to_string(&request).unwrap();
+    assert!(contents.contains("url=https://software.download.prss.microsoft.com/"));
+    assert!(
+        write_media_request(&request, "https://example.com", &"a".repeat(64), "x.iso").is_err()
+    );
+    assert!(write_media_request(
+        Path::new("relative"),
+        "https://example.com",
+        &"a".repeat(64),
+        "x.iso"
+    )
+    .is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn one_shot_install_parses_the_beta_six_beginner_flow() {
     let arguments = [
         "win-dev",

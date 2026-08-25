@@ -133,7 +133,7 @@ environment. Every new tagged release must pass the guarded workflow on a
 dedicated, isolated Linux x86_64 self-hosted runner. The beta.6 run covered:
 
 - Microsoft's current published English x64 SHA must exactly match the
-  operator-provisioned read-only ISO.
+  automatically downloaded, per-run read-only ISO.
 - Real DISM execution for the network-disabled WinPE prepare/apply phases,
   completion markers, and transient workspace/seed cleanup.
 - KVM cold boot, unattended Windows 11 OOBE, removal of the one-shot setup
@@ -188,14 +188,17 @@ The broader hardware and soak matrix still includes:
   by the agent's Job. It does not turn a Session 0 process into a visible desktop
   application.
 - There is no per-HWND Wayland/X11 compositor bridge, clipboard, audio, GPU
-  acceleration, or shared-memory graphics driver. `lsw run` starts a guest
-  process but does not create a Linux-native application window.
+  acceleration, or shared-memory graphics driver. `lsw run --gui` starts an
+  EXE in the signed-in Windows user's session, but Slice 3 does not yet create
+  a Linux-native window for it.
 - Installation and recovery use private Unix-socket VNC. There is no RDP or TCP
   VNC listener.
 - Agent commands and ConPTY sessions run in Windows Session 0 as
   `NT SERVICE\LSWAgent`; they do not impersonate a desktop user. This provides a
-  CLI without login, but a service-launched GUI does not appear on the user's
-  desktop. A user-session companion is not implemented.
+  CLI without login. An authenticated on-demand companion handles only explicit
+  GUI, icon, and desktop-live-share operations as the registered user; it
+  requires an existing Windows sign-in and does not store a password or enable
+  AutoLogon.
 - Suspend/resume applies QMP `stop`/`cont`; hibernate uses Windows' hiberfile
   and powers QEMU off. There is no cross-host live migration, kernel Virtio-fs
   mount, USB passthrough, or portable image export. The live folder uses
@@ -215,9 +218,9 @@ The broader hardware and soak matrix still includes:
 
 ## Recommended hardware acceptance order
 
-1. On a dedicated Linux x86_64 KVM host, run `lsw doctor` and provision a
-   read-only Windows 11 ISO that exactly matches Microsoft's current English
-   x64 published SHA.
+1. On a dedicated Linux x86_64 KVM host, run `lsw doctor`; the guarded workflow
+   resolves, downloads, verifies, and removes Microsoft's current English x64
+   ISO for each exact candidate.
 2. Run `lsw install NAME --iso PATH --edition pro --profile slim
    --accept-windows-license`; verify both WinPE completion markers and removal
    of the workspace and seed before normal boot.
