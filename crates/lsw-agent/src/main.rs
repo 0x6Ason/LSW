@@ -20,8 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lsw_core::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     encode_process_id, read_frame, write_frame, ClientHello, DesktopLiveShareRequest,
-    FileGetRequest, FilePutRequest, Frame, FrameKind, GuiIconRequest, GuiInputEvent,
-    GuiStartRequest, GuiWindowClosed, GuiWindowDamage, GuiWindowReady, GuiWindowResize,
+    FileGetRequest, FilePutRequest, Frame, FrameKind, GuiIconRequest, GuiStartRequest,
     LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
     SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
     TerminalStartRequest, UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest,
@@ -31,7 +30,8 @@ use lsw_core::{
 };
 #[cfg(windows)]
 use lsw_core::{
-    DesktopUserRequest, TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1,
+    DesktopUserRequest, GuiInputEvent, GuiWindowClosed, GuiWindowDamage, GuiWindowReady,
+    GuiWindowResize, TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1,
     CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
     CAPABILITY_GUI_WINDOW_V1, CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
     CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
@@ -3434,6 +3434,7 @@ mod desktop_companion;
 #[cfg(windows)]
 mod windows_capture;
 
+#[cfg(any(windows, test))]
 mod gui_damage;
 
 struct Configuration {
