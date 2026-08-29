@@ -61,11 +61,12 @@ custom labels to one runner service: one contract requires no Windows desktop
 user, while the other requires one interactive Explorer and WSLg session.
 
 The job has read-only repository permission, checkout does not persist its
-credential, concurrent KVM runs are serialized, and the job has a 90-minute
-timeout. The harness itself has a shorter whole-run timeout around its 45-minute
-Setup/OOBE deadline and five-minute graceful-shutdown deadline, leaving time
-for build, evidence upload, and job cleanup. Only maintainers should be allowed
-to edit or dispatch this workflow.
+credential, concurrent KVM runs are serialized, and the job has a 180-minute
+timeout. The harness reserves two hours for the complete official-media DISM,
+Setup/OOBE, agent, ConPTY, and cold-restart validation, then adds a bounded
+twenty-minute orchestration margin and a five-minute TERM-to-KILL cleanup
+window. This leaves the job time for builds, evidence upload, and final cleanup.
+Only maintainers should be allowed to edit or dispatch this workflow.
 
 Configure the `windows-kvm-e2e` repository environment with required reviewers
 and a deployment-branch rule limited to `master`. Do not put credentials in

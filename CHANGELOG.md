@@ -14,6 +14,9 @@
   HWND for bounded reattach. Host/guest clipboard synchronization, independent
   host windows for every HWND, DPI transitions, drag-and-drop, audio, and UAC
   secure-desktop presentation remain later slices.
+- Expanded the exact Windows/KVM release gate budget so official Windows 11
+  DISM export, mount, commit, apply, Setup/OOBE, agent, ConPTY, and cold restart
+  can finish on slower dedicated disks without weakening bounded teardown.
 - Completed beta.8 Slice 3's on-demand interactive companion and GUI launch
   path. A SID-checked WTS boundary starts the scoped companion only for the
   registered signed-in Windows user, restores that user's authenticated live

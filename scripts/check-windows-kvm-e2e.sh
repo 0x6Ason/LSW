@@ -9,7 +9,7 @@ iso=${LSW_WINDOWS_ISO:-}
 edition=${LSW_WINDOWS_EDITION:-pro}
 profile=${LSW_WINDOWS_PROFILE:-slim}
 agent=${LSW_WINDOWS_AGENT:-"$workspace_root/target/x86_64-pc-windows-gnu/release/lsw-agent.exe"}
-timeout_seconds=${LSW_E2E_TIMEOUT_SECONDS:-2700}
+timeout_seconds=${LSW_E2E_TIMEOUT_SECONDS:-7200}
 # Cold Windows boots use a bounded ten-minute agent wait. Give the external
 # command guard one additional minute so it never preempts the product timeout.
 agent_boot_timeout_seconds=660
@@ -117,14 +117,16 @@ if [ -n "$expected_iso_sha256" ]; then
     fi
 fi
 # The inner process owns exact process groups and cleanup. Leave additional
-# time for dependency checks and bounded teardown around the OOBE deadline.
+# time for dependency checks and bounded teardown around the full validation
+# deadline. Official-media DISM export, mount, and commit can legitimately take
+# more than an hour on a dedicated disk without being stalled.
 if [ "${LSW_WINDOWS_KVM_E2E_TIMEOUT_ACTIVE:-0}" != 1 ]; then
     LSW_WINDOWS_KVM_E2E_TIMEOUT_ACTIVE=1
     export LSW_WINDOWS_KVM_E2E_TIMEOUT_ACTIVE
     overall_timeout=$((timeout_seconds + 1200))
     # Cleanup can include a bounded guest stop, evidence collection, and removal
     # of a large sparse disk tree. Keep five minutes between TERM and KILL while
-    # still finishing well inside the workflow's 90-minute job timeout.
+    # still finishing well inside the workflow's 180-minute job timeout.
     exec timeout --signal=TERM --kill-after=300s "${overall_timeout}s" "$0" "$@"
 fi
 
