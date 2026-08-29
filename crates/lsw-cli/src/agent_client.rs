@@ -33,6 +33,7 @@ use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const GUI_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIN_CHUNK_BYTES: usize = 32 * 1024;
 
@@ -168,6 +169,12 @@ impl AgentClient {
 
     pub fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.require_capability(CAPABILITY_MAINTENANCE_SHUTDOWN_V1)?;
+        // The guest acknowledges before shutdown.exe runs. Keep this control
+        // exchange bounded in case Windows tears down the service mid-frame.
+        self.stream
+            .set_read_timeout(Some(SHUTDOWN_RESPONSE_TIMEOUT))?;
+        self.stream
+            .set_write_timeout(Some(SHUTDOWN_RESPONSE_TIMEOUT))?;
         write_frame(
             &mut self.stream,
             &Frame::new(FrameKind::MaintenanceShutdown, Vec::new()),

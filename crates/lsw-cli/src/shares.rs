@@ -12,6 +12,7 @@ use lsw_core::{
     InstanceState, LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
 };
 
+use super::agent_client::AgentClient;
 use super::daemon_client::DaemonClient;
 use super::{
     absolute_path, connect_agent, fix_host_dependencies, resolve_name, start_named_instance,
@@ -20,7 +21,8 @@ use super::{
 
 const LIVE_SHARE_NAME: &str = "linux";
 const LIVE_SHARE_GUEST_PATH: &str = "L:\\";
-const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(180);
+const WINDOWS_EXIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const GUEST_READY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const NATIVE_SHUTDOWN_FALLBACK_DELAY: Duration = Duration::from_secs(15);
 
 pub(super) fn command(
@@ -149,7 +151,8 @@ fn add_live_path(
     }
     manifest.folder_shares.push(share.clone());
     store.update(&manifest)?;
-    let result = restart_and_configure(store, name, true);
+    let mut relaunch_attempted = false;
+    let result = restart_and_configure(store, name, true, &mut relaunch_attempted);
     if let Err(error) = result {
         let samba_diagnostic = live_samba_failure_context(store, name);
         let mut rollback = store.load(name)?;
@@ -157,9 +160,16 @@ fn add_live_path(
             !(item.name == share.name && item.transport == FolderShareTransport::LiveSmb)
         });
         store.update(&rollback)?;
-        let _ = restart_instance(store, name);
+        let rollback_error = if relaunch_attempted {
+            restart_instance(store, name).err()
+        } else {
+            None
+        };
+        let rollback_detail = rollback_error
+            .map(|rollback_error| format!("; rollback restart failed: {rollback_error}"))
+            .unwrap_or_default();
         return Err(format!(
-            "could not mount Linux (L:); the live export was rolled back: {error}{samba_diagnostic}"
+            "could not mount Linux (L:); the live export was rolled back: {error}{rollback_detail}{samba_diagnostic}"
         )
         .into());
     }
@@ -375,8 +385,9 @@ fn restart_and_configure(
     store: &StateStore,
     name: &str,
     enable: bool,
+    relaunch_attempted: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    restart_instance(store, name)?;
+    restart_instance_observed(store, name, relaunch_attempted)?;
     wait_for_agent(store, name)?;
     connect_agent(store, name)?.configure_live_share(enable)?;
     wait_for_live_mapping_state(store, name, enable)?;
@@ -448,6 +459,15 @@ fn wait_for_live_mapping_state(
 }
 
 fn restart_instance(store: &StateStore, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut relaunch_attempted = false;
+    restart_instance_observed(store, name, &mut relaunch_attempted)
+}
+
+fn restart_instance_observed(
+    store: &StateStore,
+    name: &str,
+    relaunch_attempted: &mut bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state = store.load(name)?.state;
     if state == InstanceState::Installing {
         return Err("live folders cannot change while Windows installation is active".into());
@@ -462,7 +482,7 @@ fn restart_instance(store: &StateStore, name: &str) -> Result<(), Box<dyn std::e
             println!("{line}");
         }
         let fallback_deadline = Instant::now() + NATIVE_SHUTDOWN_FALLBACK_DELAY;
-        let deadline = Instant::now() + GUEST_READY_TIMEOUT;
+        let deadline = Instant::now() + WINDOWS_EXIT_TIMEOUT;
         let mut fallback_requested = false;
         let mut fallback_error = None;
         loop {
@@ -494,6 +514,7 @@ fn restart_instance(store: &StateStore, name: &str) -> Result<(), Box<dyn std::e
             thread::sleep(Duration::from_millis(500));
         }
     }
+    *relaunch_attempted = true;
     start_named_instance(store, name, LaunchPhase::Run)
 }
 
@@ -501,7 +522,11 @@ fn request_native_windows_shutdown(
     store: &StateStore,
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    connect_agent(store, name)?.shutdown()
+    let manifest = store.load(name)?;
+    let token = store.read_agent_token(name)?;
+    // Never use connect_agent here: ACPI shutdown may already have stopped the
+    // service, and that helper would enter the normal ten-minute boot wait.
+    AgentClient::connect(&manifest, &token)?.shutdown()
 }
 
 fn wait_for_agent(store: &StateStore, name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -676,6 +701,9 @@ mod tests {
 
     #[test]
     fn live_share_restart_has_a_safe_native_shutdown_fallback() {
-        assert!(NATIVE_SHUTDOWN_FALLBACK_DELAY < GUEST_READY_TIMEOUT);
+        assert!(NATIVE_SHUTDOWN_FALLBACK_DELAY < WINDOWS_EXIT_TIMEOUT);
+        assert!(GUEST_READY_TIMEOUT <= WINDOWS_EXIT_TIMEOUT);
+        assert!(WINDOWS_EXIT_TIMEOUT >= Duration::from_secs(30 * 60));
+        assert!(GUEST_READY_TIMEOUT >= Duration::from_secs(15 * 60));
     }
 }
