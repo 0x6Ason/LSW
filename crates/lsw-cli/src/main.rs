@@ -1282,7 +1282,7 @@ fn guest_command(
         #[cfg(not(unix))]
         {
             let _ = session;
-            return Err("seamless GUI presentation requires a Wayland or X11 host".into());
+            return Err("beta.8 seamless GUI presentation requires a native Wayland host".into());
         }
     }
     let client = connect_agent(store, &name)?;

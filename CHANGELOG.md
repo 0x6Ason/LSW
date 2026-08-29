@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Completed beta.8 Slice 4's first seamless application window. `lsw run
+  --gui` now captures the exact first visible HWND through Windows Graphics
+  Capture and presents it as an undecorated native Wayland surface whose only
+  visible chrome is the captured Windows non-client area. Focus, text and key
+  input, Ctrl+C/Ctrl+V guest shortcuts, pointer buttons, wheel, menus, owned
+  dialogs, move, all resize borders, minimize, maximize/restore, close prompts,
+  host-window close, and maximized aspect-fit behavior are covered by the
+  signed-in Windows 11/WSLg matrix. Input is released on focus loss or
+  disconnect, and an abnormal presenter exit retains only the identity-checked
+  HWND for bounded reattach. Host/guest clipboard synchronization, independent
+  host windows for every HWND, DPI transitions, drag-and-drop, audio, and UAC
+  secure-desktop presentation remain later slices.
+- Completed beta.8 Slice 3's on-demand interactive companion and GUI launch
+  path. A SID-checked WTS boundary starts the scoped companion only for the
+  registered signed-in Windows user, restores that user's authenticated live
+  `L:` mapping, launches `.exe` applications with working-directory,
+  environment, and file arguments, discovers icons, manages Linux `.desktop`
+  entries, tracks child lifetime, and exits when idle. AutoLogon and stored user
+  passwords remain prohibited.
 - Completed beta.8 Slice 2's short file UX with default-instance
   `lsw share PATH`, `lsw unshare SHARE`, direction-inferred `lsw cp`, and
   machine-readable guest-local/live/mirror benchmarks. One explicitly approved
@@ -249,8 +268,8 @@
   ConPTY guest E2E remain unverified.
 - Strengthened the release reproducibility gate to compare two complete builds
   from separate clean Cargo target directories. Windows agent builds now
-  validate the MZ/PE headers and normalize the COFF TimeDateStamp to zero; the
-  bundle verifier enforces that invariant.
+  validate the MZ/PE headers and normalize the COFF TimeDateStamp and PE
+  optional-header CheckSum to zero; the bundle verifier enforces that invariant.
 
 ## 1.0.0-beta.3
 

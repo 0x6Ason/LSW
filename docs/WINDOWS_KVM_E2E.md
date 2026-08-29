@@ -36,17 +36,29 @@ The workflow dispatch and protected-environment approval are deliberately
 manual because GitHub-hosted runners do not expose KVM. Guest setup itself is
 fully headless. A successful ordinary CI run is not a substitute for this gate.
 
+beta.8 adds a second, independent job to the same exact-SHA workflow run. The
+headless KVM job keeps its no-console-user invariant. The separate signed-in
+WSLg job exercises the seamless-window matrix against a pre-provisioned
+candidate instance; neither job can substitute for the other. New release tags
+require both jobs to complete successfully in the same workflow run.
+
 ## Security boundary
 
 Use a dedicated or ephemeral runner that holds no unrelated credentials or
 workloads. Do not attach the label below to a general-purpose self-hosted
-runner. The workflow accepts only:
+runner. The headless job accepts only:
 
 - a manual dispatch from `master` in `0x6Ason/LSW`;
 - an exact, operator-entered 40-character candidate commit;
 - the protected `windows-kvm-e2e` GitHub environment; and
 - a runner with all four labels: `self-hosted`, `Linux`, `X64`, and
   `lsw-windows-kvm-e2e`.
+
+The signed-in GUI job has a separate protected `windows-seamless-e2e`
+environment and accepts only a repository-scoped runner carrying
+`self-hosted`, `Linux`, `X64`, and `lsw-windows-seamless-e2e`. Never attach both
+custom labels to one runner service: one contract requires no Windows desktop
+user, while the other requires one interactive Explorer and WSLg session.
 
 The job has read-only repository permission, checkout does not persist its
 credential, concurrent KVM runs are serialized, and the job has a 90-minute
@@ -59,6 +71,10 @@ Configure the `windows-kvm-e2e` repository environment with required reviewers
 and a deployment-branch rule limited to `master`. Do not put credentials in
 that environment. If organization runner groups are available, restrict this
 runner to this repository and, preferably, this workflow.
+
+Apply the same reviewer, branch, repository, and workflow restrictions to the
+`windows-seamless-e2e` environment and its separate runner. Neither environment
+needs a repository secret.
 
 Self-hosted workflows execute repository code. Review the candidate before
 approval, never expose the runner to pull-request workflows, and isolate its
@@ -100,8 +116,45 @@ distribution does not use one of LSW's standard OVMF paths, set both
 environment. The preflight fails before installation if no complete firmware
 pair is available.
 
-The beta.8 gate is headless. The runner may run as a background service and does
-not need `DISPLAY`, `WAYLAND_DISPLAY`, a session bus, or `remote-viewer`.
+The beta.8 headless KVM job may run as a background service and does not need
+`DISPLAY`, `WAYLAND_DISPLAY`, a session bus, or `remote-viewer`.
+
+### Signed-in WSLg runner
+
+Provision the GUI job separately on a Windows 11 host with WSLg. Sign in to the
+Windows desktop user that owns the WSL session, open an interactive WSL shell,
+and start the repository-scoped Actions runner from that shell so it inherits
+`WSL_DISTRO_NAME`, `WAYLAND_DISPLAY`, and `XDG_RUNTIME_DIR`. Do not run this
+runner as a background Windows or Linux service. Add only the custom label
+`lsw-windows-seamless-e2e` in addition to the default Linux labels.
+
+Install Rust 1.76.0 with the Windows GNU target, MinGW-w64, ImageMagick, GNU
+coreutils, and the Windows interop tools used by WSL (`powershell.exe` and
+`wslpath`). Before dispatch, provision one disposable default LSW instance with:
+
+- the registered Windows desktop user already signed in;
+- exactly one non-service Explorer session;
+- the instance already running with an agent built from the candidate commit;
+  and
+- the active `lswd` built from that same candidate commit.
+
+Build those binaries from the reviewed candidate before starting the runner.
+The workflow rebuilds them independently, hashes its Linux CLI and daemon plus
+the Windows agent, verifies `/proc/<pid>/exe` for the active daemon, and requires
+the installed `C:\Program Files\LSW\lsw-agent.exe` to match the candidate agent
+SHA-256 before it stages a fixture. A stale daemon or guest agent therefore
+fails closed instead of producing mixed-revision GUI evidence. The GUI driver
+never installs, starts, stops, creates, or removes a VM; the operator owns this
+disposable prerequisite and must remove it after the workflow.
+
+The GUI driver also writes and reads a short probe through WSLg's system-distro
+shared-memory mount before it contacts the VM. A stale VAIL mount can still
+create a RAIL proxy HWND while every submitted frame remains transparent, so a
+mount-presence check is not sufficient. If this preflight fails, first stop the
+disposable LSW instance and every other workload running in WSL, then run
+`wsl --shutdown` from Windows and restart the signed-in runner session. The
+driver deliberately never performs that host-wide restart itself because it
+would also stop unrelated distributions, containers, and background services.
 
 Provision a short, dedicated, encrypted, disk-backed state directory. Long
 Actions paths can exceed Linux's 107-byte AF_UNIX socket pathname limit after
@@ -158,10 +211,11 @@ read-only, and keeps it below the isolated per-run build root. The final
 always-run cleanup deletes the request, URL input, ISO, build output, VM disks,
 vTPM state, and agent credentials. It never uploads the ISO or caches it.
 
-The workflow retains only the harness's redacted `attestation.env`,
-`doctor.txt`, `bench.json`, and `diagnose.tar.gz` evidence for 14 days. Cargo
-and the Microsoft media path require outbound network access; pre-warm Rust
-dependencies and restrict other destinations if a tighter boundary is needed.
+The workflow retains only the headless harness's redacted `attestation.env`,
+`doctor.txt`, `bench.json`, and `diagnose.tar.gz` plus the GUI job's candidate
+hash attestation and seamless-matrix log for 14 days. Cargo and the Microsoft
+media path require outbound network access; pre-warm Rust dependencies and
+restrict other destinations if a tighter boundary is needed.
 
 ## Run the gate
 
@@ -169,9 +223,11 @@ dependencies and restrict other destinations if a tighter boundary is needed.
 2. Open **Actions > Windows/KVM release gate > Run workflow**.
 3. Select `master`, enter the exact 40-character commit, and enter
    `RUN-WINDOWS-KVM-E2E` as the confirmation.
-4. Approve the protected environment. No further operator action is required;
-   the job owns WinPE, unattended OOBE, agent verification, cold restart, and
-   cleanup.
+4. Approve both protected environments after confirming that the two dedicated
+   runners satisfy their opposite login contracts. No further input is required
+   during either job. The headless job owns WinPE, unattended OOBE, agent
+   verification, cold restart, and cleanup; the GUI job owns only its temporary
+   fixture and presenter artifacts.
 
 The gate fails unless `lsw install` waits through the specialize-to-OOBE reboot
 for the exact setup-complete marker. It then requires `LSWSetup` to be absent,
@@ -180,7 +236,8 @@ paths to be gone, and Winlogon to contain neither automatic logon nor a stored
 `DefaultPassword`. A bare `lsw` must restore an agent-backed ConPTY shell from
 the installed disk without installation media or an interactive console user.
 Before that restart, `lsw user setup --password-stdin` must create an enabled
-standard account without administrator membership or AutoLogon. The gate then
+account in the well-known local Users group without administrator membership or
+AutoLogon. The gate then
 requires promote, demote, and final promote operations to update both the native
 Administrators group and manifest v6 without exposing a password prefix in LSW
 metadata, seeds, or logs. A separately authenticated administrator must be
@@ -235,19 +292,22 @@ Session 0 remains sufficient for the command and ConPTY contract. The on-demand
 user-session companion handles GUI process launch, icon discovery, the user's
 live `L:` mapping, and the Slice 4 first-HWND capture path without changing that
 boot-time service boundary. This headless gate deliberately remains at the
-sign-in screen, so it tests fail-closed WTS selection. A signed-in-user extension
-must validate the Slice 4 Wayland/X11 window before that slice is release-gated;
-clipboard and audio remain later beta.8 work.
+sign-in screen, so it tests fail-closed WTS selection. The independent signed-in
+job validates the Slice 4 native Wayland window, guest-only chrome, focus,
+keyboard and pointer input, resize, explicit window state, close prompts,
+presenter crash recovery, and exact-HWND reattach. Clipboard and audio remain
+later beta.8 work.
 
-This workflow and harness define the required release evidence; they do not
-claim the service path has passed on real hardware. Tag beta.8 only after the
-exact candidate completes this job successfully on the dedicated KVM runner.
+This workflow and both harnesses define the required release evidence; source
+presence alone is not a runtime claim. Tag beta.8 only after the exact candidate
+completes both the headless KVM job and the independent signed-in WSLg job in one
+successful workflow run.
 
 Tag only the exact commit named in a successful run. If `master` changes, run
 the gate again for the new commit. The release workflow rejects every new tag
-after the existing beta.1–beta.4 tags unless it finds the successful real-KVM
-job for that exact SHA. The workflow summary records the validated SHA so the
-beta release decision is auditable.
+after the existing beta.1–beta.7 tags unless it finds both successful jobs for
+that exact SHA. The workflow summary records the validated SHA so the beta
+release decision is auditable.
 
 Per-run build output and guest state are deleted after either success or
 failure. The harness records the exact temporary root so the workflow can make

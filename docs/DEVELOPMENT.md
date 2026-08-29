@@ -159,7 +159,8 @@ Useful controls are:
 
 The verifier checks the SHA-256 sidecar before extraction, rejects unsafe or
 multi-root archives and links/special files, validates executable formats and
-metadata, requires the Windows agent's PE/COFF TimeDateStamp to be zero,
+metadata, requires the Windows agent's PE/COFF TimeDateStamp and optional-header
+CheckSum to be zero,
 smoke-tests the Linux binaries when possible, and rejects common OS media and
 VM disk-image formats. On Linux x86_64 it also installs into an isolated
 temporary prefix and compares the installed binaries with the bundle.
@@ -189,25 +190,31 @@ also creates a GitHub Release with `GITHUB_TOKEN`; no repository secret is
 required. Tags containing a prerelease suffix such as `-beta.4` are published
 as prereleases.
 
-`.github/workflows/windows-kvm-e2e.yml` is the separate, headless beta release
-gate. It can run only by manual dispatch from an exact `master` commit on the
-explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. Windows media is
-pre-provisioned read-only on that runner. The workflow resolves Microsoft's
-current English x64 metadata and requires the provisioned file to match both
-the configured digest and Microsoft's published SHA-256; it never downloads or
-uploads the ISO payload. It requires both WinPE completion markers and removal
+`.github/workflows/windows-kvm-e2e.yml` is the separate beta release gate. It
+can run only by manual dispatch from an exact `master` commit. Its headless job
+uses the explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. The
+authorization job resolves Microsoft's current English x64 metadata, transfers
+only a short-lived private request, and the KVM runner downloads the ISO
+directly from Microsoft, verifies the published SHA-256, and removes it after
+the run; the ISO payload is never uploaded. The job requires both WinPE
+completion markers and removal
 of token-bearing transient media. The gate requires unattended OOBE to remove
 the one-shot local account, cached answer files, SetupComplete script, and
 staging payload; it rejects a console login or automatic-logon credential. All
 agent commands run as `NT SERVICE\LSWAgent`. It also verifies WMI license status through the stopped,
 demand-start LocalSystem helper. After shutdown it requires a no-login cold
 boot, the same service SID, true ConPTY, detached installation media, and
-complete runtime cleanup. See
+complete runtime cleanup. A second, independently labeled
+`lsw-windows-seamless-e2e` runner must inherit a signed-in WSLg session and
+pre-provision one exact-candidate instance. It attests the candidate CLI, active
+daemon, and installed guest agent by SHA-256 before running the first-HWND GUI
+matrix; it neither weakens nor replaces the no-login headless contract. See
 [`WINDOWS_KVM_E2E.md`](WINDOWS_KVM_E2E.md) for runner isolation, protected
 environment, media provisioning, and operator instructions. Tagged releases
-after the existing beta.1–beta.4 tags fail closed unless this workflow has a
-successful real-KVM job for the exact tag commit; manual untagged bundle builds
-remain available without that hardware attestation.
+after the existing beta.1–beta.7 tags fail closed unless the same workflow run
+has successful headless KVM and signed-in WSLg jobs for the exact tag commit;
+manual untagged bundle builds remain available without that hardware
+attestation.
 
 Before describing a build as runtime-validated, a maintainer must separately
 run the hardware gates documented in `BETA.md` on a Linux x86_64 host with KVM,

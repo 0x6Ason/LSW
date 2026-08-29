@@ -1557,6 +1557,7 @@ fn offline_unattend(
       <TimeZone>UTC</TimeZone>
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <ProtectYourPC>3</ProtectYourPC>
@@ -2100,6 +2101,7 @@ mod tests {
         assert!(unattend.contains("<RunSynchronous>"));
         assert!(unattend.contains("C:\\ProgramData\\LSW\\setup\\install-agent.ps1"));
         assert!(!unattend.contains("FirstLogonCommands"));
+        assert!(unattend.contains("<HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>"));
         assert!(unattend.contains("<HideOnlineAccountScreens>true</HideOnlineAccountScreens>"));
         assert!(unattend.contains("<ProtectYourPC>3</ProtectYourPC>"));
         assert!(unattend.contains("<Name>LSWSetup</Name>"));

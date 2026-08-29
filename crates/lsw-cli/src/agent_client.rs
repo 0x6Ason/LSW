@@ -15,23 +15,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lsw_core::{
     decode_exit, decode_file_length, decode_process_id, encode_file_length, read_frame,
     write_frame, ClientHello, DesktopLiveShareRequest, FileGetRequest, FilePutRequest, Frame,
-    FrameKind, GuiIconRequest, GuiInputEvent, GuiStartRequest, GuiWindowClosed, GuiWindowDamage,
-    GuiWindowReady, GuiWindowResize, InstanceManifest, LiveShareConfigureRequest, LiveShareStatus,
-    ProcessEnvironment, ServerHello, SessionKind, SessionLease, SessionOptions, SessionSignal,
-    StartRequest, TerminalSize, TerminalStartRequest, UserCreateRequest, UserSetRoleRequest,
-    WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
-    CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_DETACHED_RUN_V1, CAPABILITY_GUI_ICON_V1,
-    CAPABILITY_GUI_LAUNCH_V1, CAPABILITY_GUI_WINDOW_V1, CAPABILITY_LIVE_SHARE_V1,
-    CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
-    CAPABILITY_PROCESS_ENVIRONMENT_V1, CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1,
-    CAPABILITY_SESSION_SIGNAL_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
-    CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
+    FrameKind, GuiIconRequest, GuiInputEvent, GuiStartRequest, GuiWindowAction, GuiWindowClosed,
+    GuiWindowDamage, GuiWindowDragHint, GuiWindowReady, GuiWindowResize, InstanceManifest,
+    LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
+    SessionLease, SessionOptions, SessionSignal, StartRequest, TerminalSize, TerminalStartRequest,
+    UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest, WindowsSudoStatus,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_LIVE_SHARE_V1,
+    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
+    CAPABILITY_GUI_WINDOW_V3, CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
+    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
+    CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
+    CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1,
+    CAPABILITY_WINDOWS_SUDO_V1,
 };
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const GUI_CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const STDIN_CHUNK_BYTES: usize = 32 * 1024;
 
 pub struct AgentClient {
@@ -62,6 +64,8 @@ pub struct GuiWindowWriter {
 pub enum GuiWindowEvent {
     Ready(GuiWindowReady),
     Damage(GuiWindowDamage),
+    DragHint(GuiWindowDragHint),
+    Action(GuiWindowAction),
     Closed(GuiWindowClosed),
 }
 
@@ -256,7 +260,7 @@ impl AgentClient {
         mut self,
         request: &GuiStartRequest,
     ) -> Result<GuiWindowSession, Box<dyn std::error::Error>> {
-        self.require_capability(CAPABILITY_GUI_WINDOW_V1)?;
+        self.require_capability(CAPABILITY_GUI_WINDOW_V3)?;
         write_frame(
             &mut self.stream,
             &Frame::new(FrameKind::GuiWindowOpen, request.encode()?),
@@ -735,6 +739,7 @@ impl GuiWindowSession {
     ) -> Result<(GuiWindowReady, GuiWindowReader, GuiWindowWriter), Box<dyn std::error::Error>>
     {
         let writer = self.stream.try_clone()?;
+        writer.set_write_timeout(Some(GUI_CONTROL_WRITE_TIMEOUT))?;
         Ok((
             self.ready,
             GuiWindowReader {
@@ -753,6 +758,12 @@ impl GuiWindowReader {
                 &frame.payload,
             )?)),
             FrameKind::GuiWindowDamage => Ok(GuiWindowEvent::Damage(GuiWindowDamage::decode(
+                &frame.payload,
+            )?)),
+            FrameKind::GuiWindowDragHint => Ok(GuiWindowEvent::DragHint(
+                GuiWindowDragHint::decode(&frame.payload)?,
+            )),
+            FrameKind::GuiWindowAction => Ok(GuiWindowEvent::Action(GuiWindowAction::decode(
                 &frame.payload,
             )?)),
             FrameKind::GuiWindowClosed => Ok(GuiWindowEvent::Closed(GuiWindowClosed::decode(
@@ -784,12 +795,37 @@ impl GuiWindowWriter {
         Ok(())
     }
 
+    pub fn window_action(
+        &mut self,
+        action: GuiWindowAction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !matches!(action, GuiWindowAction::Maximize | GuiWindowAction::Restore) {
+            return Err("host may send only explicit maximize or restore state".into());
+        }
+        write_frame(
+            &mut self.stream,
+            &Frame::new(FrameKind::GuiWindowAction, action.encode()),
+        )?;
+        Ok(())
+    }
+
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         write_frame(
             &mut self.stream,
             &Frame::new(FrameKind::GuiWindowClose, Vec::new()),
         )?;
         Ok(())
+    }
+}
+
+impl Drop for GuiWindowWriter {
+    fn drop(&mut self) {
+        // The reader runs on a cloned descriptor in the presenter thread. A
+        // plain descriptor drop would leave that blocking read alive after an
+        // early rendering/input error, so the guest would never observe EOF or
+        // reclaim its captured window and injected input state. Socket
+        // shutdown applies to the shared connection and wakes both endpoints.
+        let _ = self.stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -1318,6 +1354,12 @@ mod tests {
                     height: 600
                 }
             );
+            let action = read_frame(&mut stream).expect("GUI host state should arrive");
+            assert_eq!(action.kind, FrameKind::GuiWindowAction);
+            assert_eq!(
+                GuiWindowAction::decode(&action.payload).unwrap(),
+                GuiWindowAction::Maximize
+            );
             let close = read_frame(&mut stream).expect("GUI close should arrive");
             assert_eq!(close.kind, FrameKind::GuiWindowClose);
             assert!(close.payload.is_empty());
@@ -1335,6 +1377,32 @@ mod tests {
                 &Frame::new(FrameKind::GuiWindowDamage, damage.encode().unwrap()),
             )
             .unwrap();
+            let drag_hint = GuiWindowDragHint {
+                x: 12,
+                y: 34,
+                action: Some(GuiWindowAction::Move),
+            };
+            write_frame(
+                &mut stream,
+                &Frame::new(FrameKind::GuiWindowDragHint, drag_hint.encode().unwrap()),
+            )
+            .unwrap();
+            write_frame(
+                &mut stream,
+                &Frame::new(
+                    FrameKind::GuiWindowAction,
+                    GuiWindowAction::Maximize.encode(),
+                ),
+            )
+            .unwrap();
+            write_frame(
+                &mut stream,
+                &Frame::new(
+                    FrameKind::GuiWindowAction,
+                    GuiWindowAction::Restore.encode(),
+                ),
+            )
+            .unwrap();
             write_frame(
                 &mut stream,
                 &Frame::new(
@@ -1347,7 +1415,7 @@ mod tests {
         let stream = TcpStream::connect(address).expect("fixture should connect");
         let session = AgentClient {
             stream,
-            capabilities: vec![CAPABILITY_GUI_WINDOW_V1.to_owned()],
+            capabilities: vec![CAPABILITY_GUI_WINDOW_V3.to_owned()],
         }
         .open_gui_window(&GuiStartRequest {
             user_name: "desktop-user".to_owned(),
@@ -1366,6 +1434,8 @@ mod tests {
             .send_input(GuiInputEvent::Focus { focused: true })
             .unwrap();
         writer.resize(800, 600).unwrap();
+        writer.window_action(GuiWindowAction::Maximize).unwrap();
+        assert!(writer.window_action(GuiWindowAction::Move).is_err());
         writer.close().unwrap();
         assert!(matches!(
             reader.read_event().unwrap(),
@@ -1373,9 +1443,95 @@ mod tests {
         ));
         assert!(matches!(
             reader.read_event().unwrap(),
+            GuiWindowEvent::DragHint(GuiWindowDragHint {
+                x: 12,
+                y: 34,
+                action: Some(GuiWindowAction::Move)
+            })
+        ));
+        assert!(matches!(
+            reader.read_event().unwrap(),
+            GuiWindowEvent::Action(GuiWindowAction::Maximize)
+        ));
+        assert!(matches!(
+            reader.read_event().unwrap(),
+            GuiWindowEvent::Action(GuiWindowAction::Restore)
+        ));
+        assert!(matches!(
+            reader.read_event().unwrap(),
             GuiWindowEvent::Closed(GuiWindowClosed { exit_code: 17 })
         ));
         server.join().expect("fixture should not panic");
+    }
+
+    #[test]
+    fn dropping_gui_writer_shuts_the_connection_while_reader_clone_is_alive() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("server read timeout should configure");
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                stream
+                    .read(&mut byte)
+                    .expect("writer drop should yield EOF"),
+                0,
+                "the live reader clone must not keep an abandoned GUI session open"
+            );
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let session = GuiWindowSession {
+            stream,
+            ready: GuiWindowReady {
+                process_id: 42,
+                window_id: 73,
+                width: 2,
+                height: 1,
+                title: "Fixture".to_owned(),
+            },
+        };
+        let (_, reader, writer) = session.split().expect("session should split");
+        drop(writer);
+        server.join().expect("fixture should observe EOF");
+        drop(reader);
+    }
+
+    #[test]
+    fn seamless_gui_v3_rejects_a_v2_peer_before_sending_a_request() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener.local_addr().expect("listener should have address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("client should connect");
+            let mut unexpected = Vec::new();
+            stream
+                .read_to_end(&mut unexpected)
+                .expect("fixture should read until the rejected client closes");
+            unexpected
+        });
+        let stream = TcpStream::connect(address).expect("fixture should connect");
+        let result = AgentClient {
+            stream,
+            capabilities: vec!["gui-window-v2".to_owned()],
+        }
+        .open_gui_window(&GuiStartRequest {
+            user_name: "desktop-user".to_owned(),
+            request: StartRequest {
+                kind: SessionKind::Run,
+                argv: vec!["notepad.exe".to_owned()],
+                working_directory: None,
+            },
+            environment: ProcessEnvironment::default(),
+            mount_live_share: false,
+        });
+        let error = match result {
+            Ok(_) => panic!("a v2 peer must be rejected before the v3 request is sent"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(CAPABILITY_GUI_WINDOW_V3));
+        assert!(server.join().expect("fixture should not panic").is_empty());
     }
 
     #[test]

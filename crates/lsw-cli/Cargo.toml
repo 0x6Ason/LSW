@@ -16,6 +16,8 @@ lsw-core = { path = "../lsw-core" }
 signal-hook = "=0.3.17"
 
 [target.'cfg(unix)'.dependencies]
-minifb = { version = "=0.25.0", default-features = false, features = ["dlopen", "wayland", "x11"] }
-# minifb accepts any tempfile 3.x; keep the lockfile compatible with Rust 1.76.
-tempfile = "=3.8.1"
+# winit accepts newer ahash 0.8 releases whose target-only dependency graph
+# cannot be fully vendored by the project's Rust 1.76 toolchain.
+ahash = "=0.8.11"
+softbuffer = { version = "=0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
+winit = { version = "=0.29.15", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }

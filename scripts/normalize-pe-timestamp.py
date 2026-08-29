@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Validate a PE image and optionally zero its COFF TimeDateStamp."""
+"""Validate and normalize reproducibility-sensitive PE header fields."""
 
 import os
 import stat
@@ -13,7 +13,13 @@ PE_POINTER_OFFSET = 0x3C
 PE_SIGNATURE = b"PE\0\0"
 COFF_HEADER_SIZE = 20
 TIMESTAMP_OFFSET_IN_COFF_HEADER = 4
+OPTIONAL_HEADER_SIZE_OFFSET_IN_COFF_HEADER = 16
+CHECKSUM_OFFSET_IN_OPTIONAL_HEADER = 64
+MINIMUM_OPTIONAL_HEADER_SIZE = CHECKSUM_OFFSET_IN_OPTIONAL_HEADER + 4
+PE32_MAGIC = 0x10B
+PE32_PLUS_MAGIC = 0x20B
 ZERO_TIMESTAMP = struct.pack("<I", 0)
+ZERO_CHECKSUM = struct.pack("<I", 0)
 
 
 def fail(message: str) -> None:
@@ -59,6 +65,25 @@ def inspect_or_normalize(path: str, check_only: bool) -> None:
             ):
                 fail(f"PE image has no valid PE signature: {path}")
 
+            optional_header_size = struct.unpack_from(
+                "<H",
+                pe_header,
+                len(PE_SIGNATURE) + OPTIONAL_HEADER_SIZE_OFFSET_IN_COFF_HEADER,
+            )[0]
+            optional_header_offset = pe_offset + complete_header_size
+            if (
+                optional_header_size < MINIMUM_OPTIONAL_HEADER_SIZE
+                or optional_header_offset > metadata.st_size - optional_header_size
+            ):
+                fail(f"PE optional header is outside the image: {path}")
+            image.seek(optional_header_offset)
+            optional_header_prefix = image.read(MINIMUM_OPTIONAL_HEADER_SIZE)
+            if len(optional_header_prefix) != MINIMUM_OPTIONAL_HEADER_SIZE:
+                fail(f"PE optional header is truncated: {path}")
+            optional_magic = struct.unpack_from("<H", optional_header_prefix, 0)[0]
+            if optional_magic not in (PE32_MAGIC, PE32_PLUS_MAGIC):
+                fail(f"PE optional header has an unsupported magic: {path}")
+
             timestamp_offset = (
                 pe_offset + len(PE_SIGNATURE) + TIMESTAMP_OFFSET_IN_COFF_HEADER
             )
@@ -66,19 +91,32 @@ def inspect_or_normalize(path: str, check_only: bool) -> None:
             timestamp_bytes = image.read(len(ZERO_TIMESTAMP))
             if len(timestamp_bytes) != len(ZERO_TIMESTAMP):
                 fail(f"PE timestamp is outside the image: {path}")
+            checksum_offset = optional_header_offset + CHECKSUM_OFFSET_IN_OPTIONAL_HEADER
+            image.seek(checksum_offset)
+            checksum_bytes = image.read(len(ZERO_CHECKSUM))
+            if len(checksum_bytes) != len(ZERO_CHECKSUM):
+                fail(f"PE checksum is outside the image: {path}")
             if check_only:
                 if timestamp_bytes != ZERO_TIMESTAMP:
                     timestamp = struct.unpack("<I", timestamp_bytes)[0]
                     fail(f"PE TimeDateStamp is not zero ({timestamp}): {path}")
+                if checksum_bytes != ZERO_CHECKSUM:
+                    checksum = struct.unpack("<I", checksum_bytes)[0]
+                    fail(f"PE CheckSum is not zero ({checksum}): {path}")
                 return
 
             image.seek(timestamp_offset)
             image.write(ZERO_TIMESTAMP)
+            image.seek(checksum_offset)
+            image.write(ZERO_CHECKSUM)
             image.flush()
 
             image.seek(timestamp_offset)
             if image.read(len(ZERO_TIMESTAMP)) != ZERO_TIMESTAMP:
                 fail(f"failed to verify the normalized PE timestamp: {path}")
+            image.seek(checksum_offset)
+            if image.read(len(ZERO_CHECKSUM)) != ZERO_CHECKSUM:
+                fail(f"failed to verify the normalized PE checksum: {path}")
     except OSError as error:
         fail(f"cannot normalize PE image {path}: {error}")
 

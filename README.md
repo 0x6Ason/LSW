@@ -38,9 +38,10 @@ guest.
 - Runtime dependencies: QEMU, `qemu-img`, OVMF, swtpm, wimlib, xorriso, and a
   UDF-capable `7z`. `remote-viewer` is optional and used only for `--viewer` or
   `lsw view`.
-- `lsw run --gui` additionally needs an ordinary Wayland or X11 desktop session
-  and its standard client libraries; terminal-only install, exec, and recovery
-  remain headless.
+- `lsw run --gui` additionally needs a native Wayland session. The beta.8
+  release gate uses WSLg from an interactive Windows sign-in; terminal-only
+  install, exec, and recovery remain headless. X11 is a later compatibility
+  target, not a fallback in the Slice 4 correctness path.
 - LSW downloads official media directly from allowlisted Microsoft HTTPS CDNs
   and verifies Microsoft's published SHA-256. It never redistributes Windows,
   product keys, activation data, preactivated disks, or modified images.
@@ -210,9 +211,13 @@ agent retain lifecycle ownership until the process exits.
 
 `lsw run --gui [NAME] [--cwd PATH] [-e KEY=VALUE] -- PROGRAM.exe [ARG ...]`
 starts a GUI program with the registered Windows identity and presents its first
-visible top-level HWND as an ordinary Wayland window, with automatic X11
-fallback. The window carries damage-only frames and forwards focus, keyboard,
-pointer, wheel, resize, close, and guest exit state. `lsw app install`
+visible top-level HWND as an undecorated native Wayland window. The captured
+Windows non-client area supplies the only title-bar controls, so there is no
+second host title bar. The window carries damage-only frames and forwards focus,
+keyboard, pointer, wheel, all resize borders, guest-caption move/minimize/
+maximize/restore/close actions, and guest exit state. Maximized surfaces
+aspect-fit the guest frame with non-interactive black letterboxing instead of
+stretching it. `lsw app install`
 discovers the EXE icon in Windows and writes a Linux `.desktop` entry;
 `lsw app list` and `lsw app remove ID` manage those entries. Launchers accept
 dropped files through `%F` and translate existing host paths below the approved
@@ -494,7 +499,7 @@ user credential.
 The beta.8 companion is launched on demand through a fixed LocalSystem
 WTS boundary and runs as the registered, already signed-in Windows user. It can
 start GUI processes, own that user's `L:` mapping, and stream the first captured
-HWND to a native Wayland/X11 window. Clipboard, audio, multi-HWND relationships,
+HWND to a native Wayland window. Clipboard, audio, multi-HWND relationships,
 DPI transitions, drag-and-drop, and UAC presentation are not enabled yet.
 
 Controlled sessions distinguish stdin EOF, authenticated cancellation,
@@ -542,8 +547,13 @@ Windows 11/KVM hardware gate with Microsoft's published ISO SHA-256. The gate
 covers real WinPE DISM, unattended OOBE and cleanup, NetAPI user creation,
 SCM/licensing identity, ConPTY, clone-secret isolation, folder boundaries,
 balloon/TRIM/hibernate/compaction, full shutdown, no-login cold restart, and
-complete runtime cleanup. A beta.8 revision may be tagged only after that exact
-commit passes.
+complete runtime cleanup. Starting with beta.8, the same exact-SHA workflow run
+must also pass an independent signed-in WSLg job on a separately labeled
+interactive runner. That job attests the candidate CLI, active daemon, and
+installed guest agent by SHA-256 before exercising the first-HWND input,
+guest-only chrome, resize, maximize/restore, close-prompt, crash, and exact-window
+reattach matrix. The signed-in job does not weaken or replace the headless
+no-console-user gate; both are release requirements.
 
 See [the operator workflow and evidence contract](docs/WINDOWS_KVM_E2E.md) and
 [the detailed acceptance boundary](docs/BETA.md). Ordinary CI also runs bounded
@@ -598,14 +608,17 @@ targets, Zig, or operating-system media.
 ## Current limitations
 
 - Tagged releases still require the dedicated KVM-capable release host. The
-  guarded workflow resolves and verifies current official media automatically,
-  but ordinary GitHub-hosted CI cannot reproduce the KVM/Windows execution.
+  guarded workflow resolves and verifies current official media automatically.
+  beta.8 also requires a separate interactive WSLg runner with a pre-provisioned
+  exact-candidate guest; ordinary GitHub-hosted CI cannot reproduce either
+  Windows execution boundary.
 - The optional installation and recovery display uses private Unix-socket VNC
   internally; LSW opens it only when requested and does not expose TCP VNC or RDP.
 - Ordinary `lsw run` remains a Session 0 process. `lsw run --gui` starts in the
   registered user's existing Windows session and renders its first visible HWND
-  as a Wayland/X11 window. Additional top-level windows and transient/modal
-  relationships are not mapped until Slice 5.
+  as a native Wayland window. A bounded set of ordinary same-process owned
+  dialogs is composited into that surface; X11 and independent host windows for
+  additional top-level or transient HWNDs remain later-slice work.
 - Signed VirtIO drivers are not bundled or silently installed. The balloon
   device and governor are available, but useful guest reclaim depends on a
   compatible signed Windows driver; the inbox NVMe/e1000e path remains valid.

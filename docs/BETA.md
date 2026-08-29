@@ -130,7 +130,10 @@ Any beta.7 tag must point to an exact commit that passed the expanded gate.
 
 Ordinary source and GitHub-hosted runners do not provide a real Windows 11/KVM
 environment. Every new tagged release must pass the guarded workflow on a
-dedicated, isolated Linux x86_64 self-hosted runner. The beta.6 run covered:
+dedicated, isolated Linux x86_64 self-hosted runner. Starting with beta.8, the
+same exact-SHA workflow run must also pass its independent signed-in WSLg GUI job
+on the separately labeled interactive runner; this does not relax the headless
+job's no-console-user invariant. The beta.6 run covered:
 
 - Microsoft's current published English x64 SHA must exactly match the
   automatically downloaded, per-run read-only ISO.
@@ -188,9 +191,11 @@ The broader hardware and soak matrix still includes:
   by the agent's Job. It does not turn a Session 0 process into a visible desktop
   application.
 - `lsw run --gui` maps the first visible HWND from the signed-in Windows user's
-  session to a native Wayland window with X11 fallback. It does not yet map
-  additional HWNDs or modal/owner relationships, clipboard, audio, DPI changes,
-  drag-and-drop, UAC secure-desktop state, GPU acceleration, or shared memory.
+  session to an undecorated native Wayland window. X11 is not a Slice 4 fallback.
+  It composites a bounded set of ordinary same-process owned dialogs into that
+  first surface, but does not yet map additional HWNDs as independent host
+  windows. Clipboard, audio, DPI changes, drag-and-drop, UAC secure-desktop
+  state, GPU acceleration, and shared memory remain later work.
 - Installation and recovery use private Unix-socket VNC. There is no RDP or TCP
   VNC listener.
 - Agent commands and ConPTY sessions run in Windows Session 0 as

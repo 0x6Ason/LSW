@@ -338,6 +338,7 @@ fn autounattend(
       <TimeZone>UTC</TimeZone>
       <OOBE>
         <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
         <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
         <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
         <ProtectYourPC>3</ProtectYourPC>
@@ -400,8 +401,16 @@ move /y "%ProgramData%\LSW\setup-progress.marker.tmp" "%ProgramData%\LSW\setup-p
 reg.exe add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v AutoAdminLogon /t REG_SZ /d 0 /f >nul
 if errorlevel 1 exit /b 70
 for %%V in (DefaultUserName DefaultDomainName DefaultPassword) do reg.exe delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" /v %%V /f >nul 2>&1
+reg.exe add "HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE" /v DisablePrivacyExperience /t REG_DWORD /d 1 /f >nul
+if errorlevel 1 exit /b 74
+reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v LaunchUserOOBE /t REG_DWORD /d 0 /f >nul
+if errorlevel 1 exit /b 75
+reg.exe add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v DefaultAccountAction /t REG_DWORD /d 0 /f >nul
+if errorlevel 1 exit /b 76
+for %%V in (DefaultAccountSAMName DefaultAccountSID) do reg.exe delete "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE" /v %%V /f >nul 2>&1
 net.exe user "__LSW_SETUP_ACCOUNT__" /delete >nul 2>&1
 if errorlevel 1 exit /b 71
+net.exe user "defaultuser0" /delete >nul 2>&1
 del /f /q "%WINDIR%\Panther\unattend.xml" >nul 2>&1
 del /f /q "%WINDIR%\Panther\Unattend\unattend.xml" >nul 2>&1
 rd /s /q "%ProgramData%\LSW\setup" >nul 2>&1
@@ -960,6 +969,7 @@ mod tests {
         assert!(!answer.contains("ProductKey"));
         assert!(!answer.contains("SkipMachineOOBE"));
         assert!(answer.contains("<HideEULAPage>true</HideEULAPage>"));
+        assert!(answer.contains("<HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>"));
         assert!(answer.contains("<HideOnlineAccountScreens>true</HideOnlineAccountScreens>"));
         assert!(answer.contains("<ProtectYourPC>3</ProtectYourPC>"));
         assert!(answer.contains("<Name>LSWSetup</Name>"));
@@ -1049,8 +1059,13 @@ mod tests {
         assert!(installer.contains("Remove-Item -LiteralPath $TokenSource -Force"));
         assert!(installer.contains("$SetupRootFullPath.StartsWith($DataRootFullPath"));
         assert!(installer.contains("net.exe user \"LSWSetup\" /delete"));
+        assert!(installer.contains("net.exe user \"defaultuser0\" /delete"));
         assert!(installer.contains("/v AutoAdminLogon /t REG_SZ /d 0 /f"));
         assert!(installer.contains("DefaultUserName DefaultDomainName DefaultPassword"));
+        assert!(installer.contains("/v DisablePrivacyExperience /t REG_DWORD /d 1 /f"));
+        assert!(installer.contains("/v LaunchUserOOBE /t REG_DWORD /d 0 /f"));
+        assert!(installer.contains("/v DefaultAccountAction /t REG_DWORD /d 0 /f"));
+        assert!(installer.contains("DefaultAccountSAMName DefaultAccountSID"));
         assert!(installer.contains("setup-complete.marker"));
         assert!(installer.contains("LSW-SETUP-COMPLETE"));
         for stage in [

@@ -52,6 +52,17 @@ jobs:
               ;;
           esac
 
+          # beta.5-beta.7 shipped before the signed-in seamless matrix existed.
+          # New tags must prove both independent jobs in the same exact-SHA run.
+          require_seamless=1
+          case "$GITHUB_REF_NAME:$GITHUB_SHA" in
+            v1.0.0-beta.5:ee125c132a9fc07cd8065933e62a85baf31b304e|\
+            v1.0.0-beta.6:091089aca074b394e0c1934f3ec01f5fdfb7ef62|\
+            v1.0.0-beta.7:deff0d56016dbfb9661935af650454e197288824)
+              require_seamless=0
+              ;;
+          esac
+
           workflow_endpoint="repos/$GITHUB_REPOSITORY/actions/workflows/windows-kvm-e2e.yml/runs"
           candidate_runs=$(
             gh api --method GET "$workflow_endpoint" \
@@ -78,7 +89,7 @@ jobs:
             [[ "$run_branch" == master ]] || continue
             [[ "$run_event" == workflow_dispatch ]] || continue
             [[ "$run_status" == completed && "$run_conclusion" == success ]] || continue
-            matching_jobs=$(
+            matching_headless_jobs=$(
               gh api --paginate \
                 "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
                 --jq '.jobs[] |
@@ -94,16 +105,35 @@ jobs:
                   select(any(.steps[]?;
                     .name == "Run the real Windows/KVM gate" and
                     .conclusion == "success")) |
+                   .id'
+            )
+            matching_seamless_jobs=$(
+              gh api --paginate \
+                "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] |
+                  select(.name == "Windows 11 signed-in WSLg seamless GUI matrix") |
+                  select(.status == "completed" and .conclusion == "success") |
+                  select((.labels // []) | index("self-hosted")) |
+                  select((.labels // []) | index("Linux")) |
+                  select((.labels // []) | index("X64")) |
+                  select((.labels // []) | index("lsw-windows-seamless-e2e")) |
+                  select(any(.steps[]?;
+                    .name == "Verify the dedicated interactive WSLg runner" and
+                    .conclusion == "success")) |
+                  select(any(.steps[]?;
+                    .name == "Run the signed-in seamless GUI matrix" and
+                    .conclusion == "success")) |
                   .id'
             )
-            if [[ -n "$matching_jobs" ]]; then
+            if [[ -n "$matching_headless_jobs" && \
+                  ( "$require_seamless" == 0 || -n "$matching_seamless_jobs" ) ]]; then
               matched_run=$run_id
               break
             fi
           done <<<"$candidate_runs"
 
           if [[ -z "$matched_run" ]]; then
-            echo "error: successful workflow metadata exists for $GITHUB_SHA, but no completed KVM runner job passed the real gate" >&2
+            echo "error: successful workflow metadata exists for $GITHUB_SHA, but the required exact-SHA headless and signed-in GUI jobs did not both pass" >&2
             exit 1
           fi
 
@@ -112,7 +142,11 @@ jobs:
           {
             echo "## Windows/KVM release gate"
             echo
-            echo "Exact commit \`$GITHUB_SHA\` was validated by [run $matched_run]($gate_url)."
+            if [[ "$require_seamless" == 1 ]]; then
+              echo "Exact commit \`$GITHUB_SHA\` passed both the headless KVM and independent signed-in WSLg GUI jobs in [run $matched_run]($gate_url)."
+            else
+              echo "Exact legacy commit \`$GITHUB_SHA\` was validated by [run $matched_run]($gate_url)."
+            fi
           } >>"$GITHUB_STEP_SUMMARY"
       - name: Install Rust 1.76.0 and the Windows GNU target
         run: |

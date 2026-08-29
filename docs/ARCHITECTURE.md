@@ -31,7 +31,7 @@ validation claims on the beta.8 development line.
 | Folder-share mirror | Implemented; opt-in | Manifest-bound RO/RW roots over authenticated bulk transfer with additive change watch |
 | Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and mapped as agent-session and registered-user-session Windows `L:` without a guest filesystem driver |
 | User-session companion | Slice 3 implemented; Slice 4 source-gated | On-demand authenticated broker launched through a SID-checked WTS token; GUI ownership, first-HWND capture, icon discovery, desktop `L:`, and idle exit |
-| Host compositor bridge | Slice 4 source-gated | First visible HWND mapped to a native Wayland window with X11 fallback; focus, keyboard, pointer, resize, close, and crash propagation |
+| Host compositor bridge | Slice 4 source-gated | First visible HWND mapped to an undecorated native Wayland window; focus, keyboard, pointer, resize, explicit window actions, and exact-HWND crash reattach |
 | Fast graphics transport | CPU correctness path implemented | Bounded 128-pixel damage tiles over the authenticated channel; shared-memory or GPU acceleration remains optional future work |
 
 ## Lifecycle
@@ -92,9 +92,11 @@ validation claims on the beta.8 development line.
    UAC token, accepts no executable arguments, and fails closed if the user has
    not signed in. The companion uses scoped credentials, launches GUI children
    as that user, captures only the selected HWND through documented Windows
-   Graphics Capture, and exits when idle. `gui-window-v1` sends bounded BGRA
-   damage tiles to a native Wayland/X11 presenter and accepts only validated
-   focus, key, pointer, resize, and close events for that owned HWND.
+   Graphics Capture, and exits when idle. `gui-window-v3` sends bounded BGRA
+   damage tiles to an undecorated native Wayland presenter and accepts only
+   identity-checked focus, key, pointer, resize, drag-hint, and explicit window
+   actions for that owned HWND. Abnormal presenter loss releases injected input
+   and retains the exact HWND in a bounded registry for reattach.
    A separate, demand-start LocalSystem helper accepts one authenticated guest-
    loopback request, performs only bounded WMI licensing operations, and exits.
    Storage retrim, Windows hibernation, the fixed non-forcing shutdown fallback,
@@ -293,11 +295,18 @@ The seamless path remains driverless first:
 
 1. The Slice 4 user-session companion discovers the first visible top-level
    HWND and captures it through documented Windows Graphics Capture.
-2. The authenticated `gui-window-v1` channel carries window metadata and
-   bounded changed tiles; it owns the child across close, crash, and disconnect.
-3. The Linux client creates a native Wayland surface, with X11 fallback, and
-   explicitly maps focus, keyboard, pointer, resize, and close. Slice 5 expands
-   this to all eligible HWNDs and DPI behavior; Slice 6 adds clipboard and files.
+2. The authenticated `gui-window-v3` channel carries window metadata, bounded
+   changed tiles, position-bound non-client drag hints, and explicit window
+   actions. A normal close uses an acknowledgement handshake; an abnormal
+   disconnect releases input and retains only the exact selected HWND for
+   bounded reattach.
+3. The Linux client creates an undecorated native Wayland surface and explicitly
+   maps focus, keyboard, pointer, move, all resize borders, minimize, maximize,
+   restore, and close. When host and guest aspect ratios differ, it aspect-fits
+   the guest frame into a centered viewport and does not forward input through
+   the black letterbox. Slice 5 expands this to all eligible HWNDs and DPI
+   behavior; Slice 6 adds host clipboard integration and files. X11 remains a
+   later compatibility matrix.
 4. UIPI, UAC and elevated-window boundaries are reported, not weakened.
 
 An optional guest-only accelerator may later reduce copies. It cannot be a

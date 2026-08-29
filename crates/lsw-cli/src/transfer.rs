@@ -339,6 +339,17 @@ impl TransferArguments {
                 )
             }
         };
+        let (windows_path, role) = match command {
+            "pull" => (&source, "source"),
+            "push" | "sync" => (&destination, "destination"),
+            _ => return Err(format!("unknown transfer command {command}").into()),
+        };
+        if !is_absolute_windows_path(windows_path) {
+            return Err(format!(
+                "lsw {command} requires an absolute Windows {role} path (for example C:\\work\\file)"
+            )
+            .into());
+        }
         Ok(Self {
             requested,
             source,
@@ -939,6 +950,25 @@ mod tests {
         assert_eq!(parsed.requested.as_deref(), Some("win-dev"));
         assert!(parsed.recursive);
         assert_eq!(parsed.source, "src");
+    }
+
+    #[test]
+    fn explicit_transfers_reject_relative_windows_paths() {
+        assert!(
+            TransferArguments::parse(&["source".into(), "C:relative".into()], "push", true,)
+                .is_err()
+        );
+        assert!(TransferArguments::parse(
+            &["C:relative".into(), "destination".into()],
+            "pull",
+            true,
+        )
+        .is_err());
+        assert!(TransferArguments::parse_sync(&["source".into(), "relative".into()]).is_err());
+        assert!(
+            TransferArguments::parse(&["source".into(), "C:/absolute".into()], "push", true,)
+                .is_ok()
+        );
     }
 
     #[test]

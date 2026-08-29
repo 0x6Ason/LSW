@@ -349,6 +349,34 @@ impl Supervisor {
                 ])
             }
             Err(_) => {
+                let active_manifest = matches!(
+                    manifest.state,
+                    InstanceState::Running | InstanceState::Installing | InstanceState::Suspended
+                );
+                if active_manifest {
+                    let instance_dir = self.store.instance_dir(name)?;
+                    let evidence = qemu_process_evidence(
+                        &instance_dir,
+                        name,
+                        self.processes.contains_key(name),
+                    );
+                    if evidence != QemuProcessEvidence::Gone {
+                        // A QMP endpoint accepts one active control client. A
+                        // concurrent diagnostic can therefore make a healthy
+                        // owned or externally inherited QEMU temporarily
+                        // unreachable. Never unlink its live sockets or make a
+                        // second launch eligible from one failed connection.
+                        return Ok(vec![
+                            format!("STATE={}", manifest.state),
+                            "QMP=unavailable".to_owned(),
+                            match evidence {
+                                QemuProcessEvidence::Live => "ACTIVE=true".to_owned(),
+                                QemuProcessEvidence::Unknown => "ACTIVE=unknown".to_owned(),
+                                QemuProcessEvidence::Gone => unreachable!(),
+                            },
+                        ]);
+                    }
+                }
                 let state = if matches!(
                     manifest.state,
                     InstanceState::Running | InstanceState::Installing | InstanceState::Suspended
@@ -682,6 +710,153 @@ impl Supervisor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QemuProcessEvidence {
+    Live,
+    Gone,
+    Unknown,
+}
+
+fn qemu_process_evidence(
+    instance_dir: &Path,
+    name: &str,
+    owned_by_supervisor: bool,
+) -> QemuProcessEvidence {
+    if owned_by_supervisor {
+        // poll() immediately precedes this check and removes every child for
+        // which try_wait returned an exit status. Retaining the map entry is
+        // positive evidence that this supervisor still owns a live child.
+        return QemuProcessEvidence::Live;
+    }
+
+    qemu_process_evidence_with_proc(instance_dir, name, Path::new("/proc"))
+}
+
+fn qemu_process_evidence_with_proc(
+    instance_dir: &Path,
+    name: &str,
+    proc_root: &Path,
+) -> QemuProcessEvidence {
+    let pid_path = instance_dir.join("run/qemu.pid");
+    let metadata = match fs::symlink_metadata(&pid_path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            metadata
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return scan_exact_qemu_process(proc_root, instance_dir, name)
+        }
+        Ok(_) | Err(_) => return QemuProcessEvidence::Unknown,
+    };
+    if metadata.len() == 0 || metadata.len() > 32 {
+        return QemuProcessEvidence::Unknown;
+    }
+    let pid = match fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 1)
+    {
+        Some(pid) => pid,
+        None => return QemuProcessEvidence::Unknown,
+    };
+    let command_line = match fs::read(proc_root.join(pid.to_string()).join("cmdline")) {
+        Ok(command_line) if !command_line.is_empty() => command_line,
+        Ok(_) => return QemuProcessEvidence::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return QemuProcessEvidence::Gone,
+        Err(_) => return QemuProcessEvidence::Unknown,
+    };
+    if qemu_command_matches_instance(&command_line, instance_dir, name) {
+        QemuProcessEvidence::Live
+    } else {
+        // The recorded PID was reused or no longer identifies this exact QEMU.
+        QemuProcessEvidence::Gone
+    }
+}
+
+fn scan_exact_qemu_process(
+    proc_root: &Path,
+    instance_dir: &Path,
+    name: &str,
+) -> QemuProcessEvidence {
+    let entries = match fs::read_dir(proc_root) {
+        Ok(entries) => entries,
+        Err(_) => return QemuProcessEvidence::Unknown,
+    };
+    let mut inspection_failed = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                inspection_failed = true;
+                continue;
+            }
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid > 1)
+            .is_none()
+        {
+            continue;
+        }
+        match fs::read(entry.path().join("cmdline")) {
+            Ok(command_line)
+                if !command_line.is_empty()
+                    && qemu_command_matches_instance(&command_line, instance_dir, name) =>
+            {
+                return QemuProcessEvidence::Live;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => inspection_failed = true,
+        }
+    }
+    if inspection_failed {
+        QemuProcessEvidence::Unknown
+    } else {
+        QemuProcessEvidence::Gone
+    }
+}
+
+fn qemu_command_matches_instance(command_line: &[u8], instance_dir: &Path, name: &str) -> bool {
+    let arguments = command_line
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument))
+        .collect::<Vec<_>>();
+    let Some(program) = arguments.first() else {
+        return false;
+    };
+    let Some(program_name) = Path::new(program.as_ref())
+        .file_name()
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+    if !program_name.starts_with("qemu-system-") {
+        return false;
+    }
+
+    let qmp = format!(
+        "unix:{},server=on,wait=off",
+        instance_dir.join("run/qmp.sock").display()
+    );
+    let pid_file = instance_dir.join("run/qemu.pid").display().to_string();
+    command_has_exact_option(&arguments, "-name", name)
+        && command_has_exact_option(&arguments, "-qmp", &qmp)
+        && command_has_exact_option(&arguments, "-pidfile", &pid_file)
+}
+
+fn command_has_exact_option(
+    arguments: &[std::borrow::Cow<'_, str>],
+    option: &str,
+    value: &str,
+) -> bool {
+    arguments
+        .windows(2)
+        .any(|pair| pair[0].as_ref() == option && pair[1].as_ref() == value)
+}
+
 fn spawn_command(
     invocation: &CommandInvocation,
     instance_dir: &Path,
@@ -1013,6 +1188,66 @@ fn stop_helpers(helpers: &mut [Child]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_external_qemu_identity_requires_all_runtime_arguments() {
+        let instance = Path::new("/state/instances/win");
+        let exact = b"/usr/bin/qemu-system-x86_64\0-name\0win\0-qmp\0unix:/state/instances/win/run/qmp.sock,server=on,wait=off\0-pidfile\0/state/instances/win/run/qemu.pid\0";
+        assert!(qemu_command_matches_instance(exact, instance, "win"));
+
+        let wrong_name = b"/usr/bin/qemu-system-x86_64\0-name\0other\0-qmp\0unix:/state/instances/win/run/qmp.sock,server=on,wait=off\0-pidfile\0/state/instances/win/run/qemu.pid\0";
+        assert!(!qemu_command_matches_instance(wrong_name, instance, "win"));
+        let wrong_program = b"/usr/bin/sleep\0-name\0win\0-qmp\0unix:/state/instances/win/run/qmp.sock,server=on,wait=off\0-pidfile\0/state/instances/win/run/qemu.pid\0";
+        assert!(!qemu_command_matches_instance(
+            wrong_program,
+            instance,
+            "win"
+        ));
+    }
+
+    #[test]
+    fn owned_qemu_is_live_without_consuming_its_single_qmp_endpoint() {
+        assert_eq!(
+            qemu_process_evidence(Path::new("/missing"), "win", true),
+            QemuProcessEvidence::Live
+        );
+    }
+
+    #[test]
+    fn missing_pidfile_scans_for_the_exact_external_qemu() {
+        let root = std::env::temp_dir().join(format!(
+            "lsw-supervisor-proc-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("test clock should be after the Unix epoch")
+                .as_nanos()
+        ));
+        let instance = root.join("instances/win");
+        let proc_root = root.join("proc");
+        let process = proc_root.join("1234");
+        fs::create_dir_all(instance.join("run")).expect("instance fixture should be created");
+        fs::create_dir_all(&process).expect("proc fixture should be created");
+        let exact = format!(
+            "/usr/bin/qemu-system-x86_64\0-name\0win\0-qmp\0unix:{}/run/qmp.sock,server=on,wait=off\0-pidfile\0{}/run/qemu.pid\0",
+            instance.display(),
+            instance.display()
+        );
+        fs::write(process.join("cmdline"), exact.as_bytes())
+            .expect("exact process fixture should be written");
+        assert_eq!(
+            qemu_process_evidence_with_proc(&instance, "win", &proc_root),
+            QemuProcessEvidence::Live
+        );
+
+        fs::write(process.join("cmdline"), b"/usr/bin/sleep\0")
+            .expect("stale process fixture should be written");
+        assert_eq!(
+            qemu_process_evidence_with_proc(&instance, "win", &proc_root),
+            QemuProcessEvidence::Gone
+        );
+        fs::remove_dir_all(root).expect("fixture should be removed");
+    }
 
     #[test]
     fn stale_socket_cleanup_refuses_regular_files() {

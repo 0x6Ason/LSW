@@ -26,7 +26,7 @@ pub const CAPABILITY_DESKTOP_COMPANION_V1: &str = "desktop-companion-v1";
 pub const CAPABILITY_GUI_LAUNCH_V1: &str = "gui-launch-v1";
 pub const CAPABILITY_GUI_ICON_V1: &str = "gui-icon-v1";
 pub const CAPABILITY_DESKTOP_LIVE_SHARE_V1: &str = "desktop-live-share-v1";
-pub const CAPABILITY_GUI_WINDOW_V1: &str = "gui-window-v1";
+pub const CAPABILITY_GUI_WINDOW_V3: &str = "gui-window-v3";
 pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
 pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
 pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
@@ -91,6 +91,8 @@ pub enum FrameKind {
     GuiWindowResize = 51,
     GuiWindowClose = 52,
     GuiWindowClosed = 53,
+    GuiWindowAction = 54,
+    GuiWindowDragHint = 55,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -147,6 +149,8 @@ impl TryFrom<u8> for FrameKind {
             51 => Ok(Self::GuiWindowResize),
             52 => Ok(Self::GuiWindowClose),
             53 => Ok(Self::GuiWindowClosed),
+            54 => Ok(Self::GuiWindowAction),
+            55 => Ok(Self::GuiWindowDragHint),
             _ => Err(LswError::Protocol(format!("unknown frame kind {value}"))),
         }
     }
@@ -849,6 +853,136 @@ pub enum GuiPointerButton {
     Forward,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiWindowAction {
+    Move,
+    Minimize,
+    Maximize,
+    Close,
+    ResizeTopLeft,
+    ResizeTop,
+    ResizeTopRight,
+    ResizeRight,
+    ResizeBottomRight,
+    ResizeBottom,
+    ResizeBottomLeft,
+    ResizeLeft,
+    Restore,
+}
+
+impl GuiWindowAction {
+    pub fn encode(self) -> Vec<u8> {
+        vec![match self {
+            Self::Move => 1,
+            Self::Minimize => 2,
+            Self::Maximize => 3,
+            Self::Close => 4,
+            Self::ResizeTopLeft => 5,
+            Self::ResizeTop => 6,
+            Self::ResizeTopRight => 7,
+            Self::ResizeRight => 8,
+            Self::ResizeBottomRight => 9,
+            Self::ResizeBottom => 10,
+            Self::ResizeBottomLeft => 11,
+            Self::ResizeLeft => 12,
+            Self::Restore => 13,
+        }]
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        match payload {
+            [1] => Ok(Self::Move),
+            [2] => Ok(Self::Minimize),
+            [3] => Ok(Self::Maximize),
+            [4] => Ok(Self::Close),
+            [5] => Ok(Self::ResizeTopLeft),
+            [6] => Ok(Self::ResizeTop),
+            [7] => Ok(Self::ResizeTopRight),
+            [8] => Ok(Self::ResizeRight),
+            [9] => Ok(Self::ResizeBottomRight),
+            [10] => Ok(Self::ResizeBottom),
+            [11] => Ok(Self::ResizeBottomLeft),
+            [12] => Ok(Self::ResizeLeft),
+            [13] => Ok(Self::Restore),
+            _ => Err(LswError::Protocol(
+                "GUI window action must contain one known action byte".to_owned(),
+            )),
+        }
+    }
+
+    pub fn is_drag(self) -> bool {
+        matches!(
+            self,
+            Self::Move
+                | Self::ResizeTopLeft
+                | Self::ResizeTop
+                | Self::ResizeTopRight
+                | Self::ResizeRight
+                | Self::ResizeBottomRight
+                | Self::ResizeBottom
+                | Self::ResizeBottomLeft
+                | Self::ResizeLeft
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GuiWindowDragHint {
+    pub x: u32,
+    pub y: u32,
+    pub action: Option<GuiWindowAction>,
+}
+
+impl GuiWindowDragHint {
+    pub fn encode(self) -> Result<Vec<u8>> {
+        if self.x >= MAX_GUI_WINDOW_DIMENSION || self.y >= MAX_GUI_WINDOW_DIMENSION {
+            return Err(LswError::Protocol(
+                "GUI drag hint coordinates exceed the bounded window dimensions".to_owned(),
+            ));
+        }
+        if self.action.is_some_and(|action| !action.is_drag()) {
+            return Err(LswError::Protocol(
+                "GUI drag hint may contain only move or resize actions".to_owned(),
+            ));
+        }
+        let mut payload = Vec::with_capacity(9);
+        payload.push(self.action.map(|action| action.encode()[0]).unwrap_or(0));
+        payload.extend_from_slice(&self.x.to_le_bytes());
+        payload.extend_from_slice(&self.y.to_le_bytes());
+        Ok(payload)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        let [action, x0, x1, x2, x3, y0, y1, y2, y3] = payload else {
+            return Err(LswError::Protocol(
+                "GUI drag hint must contain one action byte and two coordinates".to_owned(),
+            ));
+        };
+        let action = if *action == 0 {
+            None
+        } else {
+            let action = GuiWindowAction::decode(&[*action])?;
+            if !action.is_drag() {
+                return Err(LswError::Protocol(
+                    "GUI drag hint may contain only move or resize actions".to_owned(),
+                ));
+            }
+            Some(action)
+        };
+        let hint = Self {
+            x: u32::from_le_bytes([*x0, *x1, *x2, *x3]),
+            y: u32::from_le_bytes([*y0, *y1, *y2, *y3]),
+            action,
+        };
+        if hint.x >= MAX_GUI_WINDOW_DIMENSION || hint.y >= MAX_GUI_WINDOW_DIMENSION {
+            return Err(LswError::Protocol(
+                "GUI drag hint coordinates exceed the bounded window dimensions".to_owned(),
+            ));
+        }
+        Ok(hint)
+    }
+}
+
 impl GuiPointerButton {
     fn encode(self) -> u8 {
         match self {
@@ -916,9 +1050,9 @@ impl GuiInputEvent {
                 pressed,
                 extended,
             } => {
-                if virtual_key == 0 {
+                if virtual_key == 0 || virtual_key > u16::from(u8::MAX) {
                     return Err(LswError::Protocol(
-                        "GUI virtual key must be non-zero".to_owned(),
+                        "GUI virtual key must be in the Windows byte-sized VK range".to_owned(),
                     ));
                 }
                 payload.push(2);
@@ -1954,7 +2088,8 @@ mod tests {
     }
 
     #[test]
-    fn seamless_window_protocol_is_append_only_bounded_and_strict() {
+    fn seamless_window_v3_protocol_is_append_only_bounded_and_strict() {
+        assert_eq!(CAPABILITY_GUI_WINDOW_V3, "gui-window-v3");
         assert_eq!(FrameKind::GuiWindowOpen as u8, 47);
         assert_eq!(FrameKind::GuiWindowReady as u8, 48);
         assert_eq!(FrameKind::GuiWindowDamage as u8, 49);
@@ -1962,7 +2097,9 @@ mod tests {
         assert_eq!(FrameKind::GuiWindowResize as u8, 51);
         assert_eq!(FrameKind::GuiWindowClose as u8, 52);
         assert_eq!(FrameKind::GuiWindowClosed as u8, 53);
-        for value in 47..=53 {
+        assert_eq!(FrameKind::GuiWindowAction as u8, 54);
+        assert_eq!(FrameKind::GuiWindowDragHint as u8, 55);
+        for value in 47..=55 {
             assert!(FrameKind::try_from(value).is_ok());
         }
 
@@ -2043,6 +2180,68 @@ mod tests {
         }
         .encode()
         .is_err());
+        assert!(GuiInputEvent::Key {
+            virtual_key: 0x100,
+            scan_code: 0,
+            pressed: true,
+            extended: false,
+        }
+        .encode()
+        .is_err());
+
+        for (action, encoded) in [
+            (GuiWindowAction::Move, 1),
+            (GuiWindowAction::Minimize, 2),
+            (GuiWindowAction::Maximize, 3),
+            (GuiWindowAction::Close, 4),
+            (GuiWindowAction::ResizeTopLeft, 5),
+            (GuiWindowAction::ResizeTop, 6),
+            (GuiWindowAction::ResizeTopRight, 7),
+            (GuiWindowAction::ResizeRight, 8),
+            (GuiWindowAction::ResizeBottomRight, 9),
+            (GuiWindowAction::ResizeBottom, 10),
+            (GuiWindowAction::ResizeBottomLeft, 11),
+            (GuiWindowAction::ResizeLeft, 12),
+            (GuiWindowAction::Restore, 13),
+        ] {
+            assert_eq!(action.encode(), vec![encoded]);
+            assert_eq!(GuiWindowAction::decode(&[encoded]).unwrap(), action);
+        }
+        assert!(GuiWindowAction::decode(&[]).is_err());
+        assert!(GuiWindowAction::decode(&[14]).is_err());
+        assert!(GuiWindowAction::decode(&[5, 0]).is_err());
+
+        for action in [
+            None,
+            Some(GuiWindowAction::Move),
+            Some(GuiWindowAction::ResizeBottomRight),
+        ] {
+            let hint = GuiWindowDragHint {
+                x: 12,
+                y: 34,
+                action,
+            };
+            assert_eq!(
+                GuiWindowDragHint::decode(&hint.encode().unwrap()).unwrap(),
+                hint
+            );
+        }
+        assert!(GuiWindowDragHint {
+            x: MAX_GUI_WINDOW_DIMENSION,
+            y: 0,
+            action: None,
+        }
+        .encode()
+        .is_err());
+        assert!(GuiWindowDragHint {
+            x: 0,
+            y: 0,
+            action: Some(GuiWindowAction::Close),
+        }
+        .encode()
+        .is_err());
+        assert!(GuiWindowDragHint::decode(&[0; 8]).is_err());
+        assert!(GuiWindowDragHint::decode(&[4, 0, 0, 0, 0, 0, 0, 0, 0]).is_err());
 
         let resize = GuiWindowResize {
             width: 1280,

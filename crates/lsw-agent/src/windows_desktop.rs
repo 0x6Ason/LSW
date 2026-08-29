@@ -143,6 +143,7 @@ extern "system" {
 #[link(name = "kernel32")]
 extern "system" {
     fn CloseHandle(handle: Handle) -> i32;
+    fn GetComputerNameW(buffer: *mut u16, units: *mut u32) -> i32;
 }
 
 pub(super) fn launch_companion(
@@ -252,7 +253,7 @@ fn session_user_name(session_id: u32) -> Result<String, Box<dyn std::error::Erro
 }
 
 fn local_account_sid(user_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let account = wide(&format!(r".\{user_name}"));
+    let account = local_account_name(user_name)?;
     let mut sid_bytes = 0_u32;
     let mut domain_units = 0_u32;
     let mut sid_use = 0_u32;
@@ -292,6 +293,23 @@ fn local_account_sid(user_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Err
     }
     sid.truncate(sid_bytes as usize);
     Ok(sid)
+}
+
+fn local_account_name(user_name: &str) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
+    let mut computer = vec![0_u16; 256];
+    let mut units = u32::try_from(computer.len() - 1)?;
+    // SAFETY: the writable UTF-16 buffer contains `units + 1` entries and the
+    // API updates `units` with the number of non-NUL entries written.
+    if unsafe { GetComputerNameW(computer.as_mut_ptr(), &mut units) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let units = usize::try_from(units)?;
+    if units == 0 || units >= computer.len() {
+        return Err("Windows returned an invalid local computer name".into());
+    }
+    computer.truncate(units);
+    let computer = String::from_utf16(&computer)?;
+    Ok(wide(&format!(r"{computer}\{user_name}")))
 }
 
 fn token_sid_matches(token: Handle, expected_sid: &[u8]) -> io::Result<bool> {

@@ -160,21 +160,27 @@ headless workflows working.
 ### Slice 4: first seamless application window
 
 - Launch one ordinary application in the desktop user's session, capture it
-  through documented Windows Graphics Capture, and present a damage-aware
-  Wayland window with an X11 fallback.
+  through documented Windows Graphics Capture, and present a damage-aware,
+  undecorated native Wayland window whose only visible chrome comes from the
+  captured Windows application. Keep X11 as a later compatibility matrix rather
+  than weakening the Wayland correctness path with a second presenter.
 - Implement lifecycle ownership, focus, keyboard, pointer, resize, close, and
   crash recovery for that first window without requiring RDP or public VNC.
   Shared-memory or GPU acceleration may improve performance later but cannot be
   required for correctness.
 - The Slice 4 source path is implemented on the beta.8 development line behind
-  `gui-window-v1`: the desktop companion selects the first visible top-level
+  `gui-window-v3`: the desktop companion selects the first visible top-level
   HWND, captures it through Windows Graphics Capture, emits bounded changed
-  tiles, and owns the child until close, crash, or host disconnect. The Linux
-  client prefers a native Wayland window, falls back to X11, and forwards
-  focus, keyboard, pointer, wheel, resize, and close events. Rust 1.76 protocol,
-  Windows-agent, and Linux cross-target gates pass. A signed-in-user Windows/KVM
-  run remains the exact-commit acceptance boundary before Slice 4 is declared
-  release-validated.
+  tiles, and retains the exact HWND in a bounded recovery registry after an
+  abnormal host disconnect. The native Wayland client forwards focus, keyboard,
+  pointer, wheel, resize, and explicit window actions, including guest-caption
+  move, minimize, maximize/restore, close, and all eight resize borders. A
+  maximized host surface aspect-fits the exact guest frame with non-interactive
+  black letterboxing instead of stretching it. Injected input is released on
+  focus loss or disconnect. Rust 1.76 protocol, Windows-agent, and Linux
+  cross-target gates pass. Release validation additionally requires the
+  independent exact-SHA signed-in WSLg job; the existing no-login Windows/KVM
+  job remains a separate mandatory boundary.
 
 ### Slice 5: complete HWND and display behavior
 

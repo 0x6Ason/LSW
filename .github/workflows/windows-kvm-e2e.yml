@@ -476,3 +476,154 @@ jobs:
             chmod -R u+rwX -- "$LSW_BUILD_ROOT" || true
             find "$LSW_BUILD_ROOT" -depth -delete
           fi
+
+  windows-seamless-e2e:
+    name: Windows 11 signed-in WSLg seamless GUI matrix
+    needs: authorize
+    environment: windows-seamless-e2e
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - lsw-windows-seamless-e2e
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      RUSTUP_TOOLCHAIN: "1.76.0"
+      LSW_WINDOWS_LINKER: mingw
+      LSW_SEAMLESS_E2E_TIMEOUT_SECONDS: "900"
+    steps:
+      - name: Initialize isolated GUI build paths
+        shell: bash
+        env:
+          JOB_BUILD_ROOT: ${{ runner.temp }}/lsw-windows-seamless-e2e/${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p -- "$JOB_BUILD_ROOT/artifacts"
+          chmod 700 -- "$JOB_BUILD_ROOT" "$JOB_BUILD_ROOT/artifacts"
+          {
+            printf 'LSW_GUI_BUILD_ROOT=%s\n' "$JOB_BUILD_ROOT"
+            printf 'CARGO_TARGET_DIR=%s/target\n' "$JOB_BUILD_ROOT"
+          } >>"$GITHUB_ENV"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the dedicated interactive WSLg runner
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-fA-F]{40}$ || \
+                "${EXPECTED_SHA,,}" != "$GITHUB_SHA" || \
+                "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "error: the GUI checkout must be the exact authorized candidate SHA" >&2
+            exit 1
+          fi
+          if [[ -z "${WSL_DISTRO_NAME:-}" || -z "${WAYLAND_DISPLAY:-}" || \
+                -z "${XDG_RUNTIME_DIR:-}" || "$WAYLAND_DISPLAY" == */* || \
+                ! -S "${XDG_RUNTIME_DIR%/}/$WAYLAND_DISPLAY" ]]; then
+            echo "error: start this runner from the signed-in user's interactive WSLg Wayland session" >&2
+            exit 1
+          fi
+          for command in \
+            awk base64 cargo convert git iconv identify powershell.exe readlink \
+            rustc rustup setsid sha256sum timeout tr wslpath \
+            x86_64-w64-mingw32-gcc; do
+            if ! command -v "$command" >/dev/null 2>&1; then
+              echo "error: required signed-in WSLg runner command was not found: $command" >&2
+              exit 1
+            fi
+          done
+          if ! rustup target list --installed | \
+             grep -Fx x86_64-pc-windows-gnu >/dev/null; then
+            echo "error: Rust 1.76.0 is missing x86_64-pc-windows-gnu" >&2
+            exit 1
+          fi
+          {
+            printf 'candidate_sha=%s\n' "$GITHUB_SHA"
+            printf 'runner_contract=signed-in-wslg-wayland\n'
+          } >"$LSW_GUI_BUILD_ROOT/artifacts/runner.env"
+          chmod 600 -- "$LSW_GUI_BUILD_ROOT/artifacts/runner.env"
+
+      - name: Build the exact GUI host runtime and Windows agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p lsw-cli -p lsw-daemon
+          scripts/build-windows-agent.sh
+
+      - name: Run the signed-in seamless GUI matrix
+        shell: bash
+        env:
+          LSW_E2E_LSW: ${{ env.CARGO_TARGET_DIR }}/release/lsw
+          LSW_DAEMON: ${{ env.CARGO_TARGET_DIR }}/release/lswd
+          LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
+        run: |
+          set -euo pipefail
+          candidate_agent="$LSW_WINDOWS_AGENT"
+          expected_agent_sha=$(sha256sum -- "$candidate_agent" | awk '{ print $1; exit }')
+          expected_daemon_sha=$(sha256sum -- "$LSW_DAEMON" | awk '{ print $1; exit }')
+          daemon_status=$("$LSW_E2E_LSW" daemon status)
+          daemon_pid=$(printf '%s\n' "$daemon_status" | \
+            awk -F= '$1 ~ /^[[:space:]]*PID$/ && $2 ~ /^[0-9]+$/ { print $2; exit }')
+          if [[ -z "$daemon_pid" || ! -r "/proc/$daemon_pid/exe" ]]; then
+            echo "error: the pre-provisioned instance must use one running candidate lswd" >&2
+            exit 1
+          fi
+          active_daemon_sha=$(sha256sum -- "/proc/$daemon_pid/exe" | awk '{ print $1; exit }')
+          if [[ "$active_daemon_sha" != "$expected_daemon_sha" ]]; then
+            echo "error: the active lswd does not match the exact candidate build" >&2
+            exit 1
+          fi
+          {
+            printf 'candidate_sha=%s\n' "$GITHUB_SHA"
+            printf 'linux_cli_sha256=%s\n' "$(sha256sum -- "$LSW_E2E_LSW" | awk '{ print $1; exit }')"
+            printf 'linux_daemon_sha256=%s\n' "$expected_daemon_sha"
+            printf 'windows_agent_sha256=%s\n' "$expected_agent_sha"
+          } >"$LSW_GUI_BUILD_ROOT/artifacts/attestation.env"
+          chmod 600 -- "$LSW_GUI_BUILD_ROOT/artifacts/attestation.env"
+          LSW_SEAMLESS_E2E_EXPECTED_AGENT_SHA256="$expected_agent_sha" \
+            scripts/check-windows-seamless-e2e.sh \
+            2>&1 | tee "$LSW_GUI_BUILD_ROOT/artifacts/seamless-e2e.log"
+
+      - name: Upload redacted GUI gate evidence
+        if: ${{ always() && env.LSW_GUI_BUILD_ROOT != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-seamless-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.LSW_GUI_BUILD_ROOT }}/artifacts
+          if-no-files-found: ignore
+          include-hidden-files: false
+          retention-days: 14
+
+      - name: Record the validated GUI revision
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          {
+            echo "## Signed-in WSLg seamless GUI gate passed"
+            echo
+            echo "Validated commit: \`$GITHUB_SHA\`"
+            echo
+            echo "The independent GUI job attested the candidate CLI, active daemon, and installed guest agent by SHA-256."
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Remove local GUI build output
+        if: ${{ always() && env.LSW_GUI_BUILD_ROOT != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_root="${RUNNER_TEMP%/}/lsw-windows-seamless-e2e/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if [[ "$LSW_GUI_BUILD_ROOT" != "$expected_root" ]]; then
+            echo "error: refusing cleanup of an unexpected GUI build path" >&2
+            exit 1
+          fi
+          if [[ -d "$LSW_GUI_BUILD_ROOT" ]]; then
+            chmod -R u+rwX -- "$LSW_GUI_BUILD_ROOT" || true
+            find "$LSW_GUI_BUILD_ROOT" -depth -delete
+          fi

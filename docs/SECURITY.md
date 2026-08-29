@@ -63,7 +63,8 @@ the password through a dedicated authenticated frame. The normal virtual-account
 agent starts `LSWUserHelper`, forwards the request over authenticated guest
 loopback, and the demand-start LocalSystem helper calls `NetUserAdd`. Interactive
 personal-development installation recommends administrator membership while
-retaining a standard-account choice; deferred `lsw user setup` remains standard
+retaining a standard-account choice; every created account joins the well-known
+local Users group, while deferred `lsw user setup` remains non-administrator
 unless `--administrator` is explicit. Administrator membership uses the
 well-known local Administrators SID and `NetLocalGroupAddMembers`.
 Capability-gated `lsw user promote` and `lsw user demote` use the same one-shot
@@ -98,16 +99,23 @@ child. The companion also case-insensitively binds every request to its expected
 username. It exits after 30 idle seconds when it owns no GUI child or live
 mapping; an active mapping keeps the low-resource broker available.
 
-The append-only `gui-window-v1` request selects only the first visible
+The append-only `gui-window-v3` request selects only the first visible
 top-level HWND owned by the launched process. The companion uses documented
 Windows Graphics Capture without a picker, caps complete frames at 128 MiB,
 splits output into bounded 128-pixel tiles, and validates every dimension and
 payload length at the companion, service relay, and host client. The relay
-accepts only focus, key, pointer, resize, and close frames for that session.
-Input is posted only to the selected HWND; no global `SendInput`, public VNC,
-RDP, or LAN listener is enabled. Closing the host transport reclaims the owned
-GUI process. Slice 4 does not cross UIPI or the UAC secure desktop; later slices
-must retain the private-viewer fallback instead of weakening those boundaries.
+accepts only focus, key, pointer, resize, position-bound drag-hint, and explicit
+window-action frames for that session. Before each input action, the guest
+revalidates the exact process, HWND identity, and foreground relationship; the
+controlled `SendInput` path is needed for real non-client controls, menus, and
+context menus. The presenter ignores black letterbox input and consumes each
+recent drag hint only at its exact guest coordinate. Focus loss and disconnect
+release every injected key and button. An abnormal transport loss does not
+silently kill a dirty application: it retains at most 16 exact window identities
+for authenticated reattach, while an acknowledged explicit close uses the
+normal Windows close path. No public VNC, RDP, or LAN listener is enabled. Slice
+4 does not cross UIPI or the UAC secure desktop; later slices must retain the
+private-viewer fallback instead of weakening those boundaries.
 
 Native Windows sudo is a separate capability-gated fixed operation. The normal
 agent asks `LSWMaintenanceHelper` to read the inbox binary and the documented

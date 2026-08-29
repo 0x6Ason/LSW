@@ -30,16 +30,16 @@ use lsw_core::{
 };
 #[cfg(windows)]
 use lsw_core::{
-    DesktopUserRequest, GuiInputEvent, GuiWindowClosed, GuiWindowDamage, GuiWindowReady,
-    GuiWindowResize, TerminalSize, CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1,
-    CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
-    CAPABILITY_GUI_WINDOW_V1, CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
-    CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
-    CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1, CAPABILITY_USER_ACCOUNT_ROLE_V1,
-    CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1, CLONE_IDENTITY_MARKER_FILE,
-    CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE, DESKTOP_COMPANION_CREDENTIAL_SCOPE,
-    DESKTOP_COMPANION_GUEST_PORT, LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT,
-    USER_HELPER_GUEST_PORT,
+    DesktopUserRequest, GuiInputEvent, GuiWindowAction, GuiWindowClosed, GuiWindowDamage,
+    GuiWindowDragHint, GuiWindowReady, GuiWindowResize, TerminalSize, CAPABILITY_CONPTY_V1,
+    CAPABILITY_DESKTOP_COMPANION_V1, CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1,
+    CAPABILITY_GUI_LAUNCH_V1, CAPABILITY_GUI_WINDOW_V3, CAPABILITY_LIVE_SHARE_V1,
+    CAPABILITY_MAINTENANCE_HIBERNATE_V1, CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
+    CAPABILITY_MAINTENANCE_TRIM_V1, CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_TERMINAL_RESIZE_V1,
+    CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,
+    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
+    DESKTOP_COMPANION_CREDENTIAL_SCOPE, DESKTOP_COMPANION_GUEST_PORT, LICENSE_HELPER_GUEST_PORT,
+    MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -836,18 +836,34 @@ fn apply_clone_identity(token_file: &Path) -> Result<bool, Box<dyn std::error::E
             .into_iter()
             .map(|root| root.join("lsw")),
     )?;
-    let identity = match identity {
-        Some(identity) => Some(identity),
-        None => find_clone_identity(
-            (b'D'..=b'Z')
-                .map(char::from)
-                .map(|letter| PathBuf::from(format!("{letter}:\\lsw"))),
-        )?,
-    };
+    if let Some(identity) = identity {
+        return apply_clone_identity_at(token_file, &identity);
+    }
+    apply_clone_identity_from_roots(
+        token_file,
+        (b'D'..=b'Z')
+            .map(char::from)
+            .map(|letter| PathBuf::from(format!("{letter}:\\lsw"))),
+    )
+}
+
+#[cfg(windows)]
+fn apply_clone_identity_from_roots(
+    token_file: &Path,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let identity = find_clone_identity(roots)?;
     let Some(identity) = identity else {
         return Ok(false);
     };
+    apply_clone_identity_at(token_file, &identity)
+}
 
+#[cfg(windows)]
+fn apply_clone_identity_at(
+    token_file: &Path,
+    identity: &Path,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let name = fs::read_to_string(identity.join(CLONE_IDENTITY_NAME_FILE))?
         .trim()
         .to_owned();
@@ -913,18 +929,23 @@ fn watch_for_clone_identity(
         IDENTITY_DISCOVERY_FAST_TIMEOUT,
         IDENTITY_DISCOVERY_INTERVAL,
         IDENTITY_DISCOVERY_SLOW_INTERVAL,
+        apply_clone_identity,
     )
 }
 
 #[cfg(windows)]
-fn watch_for_clone_identity_with_timing(
+fn watch_for_clone_identity_with_timing<ApplyIdentity>(
     token_file: PathBuf,
     token: Weak<Mutex<String>>,
     discovery_timeout: Duration,
     fast_timeout: Duration,
     fast_interval: Duration,
     slow_interval: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+    apply_identity: ApplyIdentity,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    ApplyIdentity: Fn(&Path) -> Result<bool, Box<dyn std::error::Error>> + Send + 'static,
+{
     thread::Builder::new()
         .name("lsw-identity-watch".to_owned())
         .spawn(move || {
@@ -935,7 +956,7 @@ fn watch_for_clone_identity_with_timing(
                 let Some(token) = token.upgrade() else {
                     return;
                 };
-                match apply_clone_identity(&token_file) {
+                match apply_identity(&token_file) {
                     Ok(true) => match read_token(&token_file) {
                         Ok(replacement) => match token.lock() {
                             Ok(mut current) => {
@@ -1374,7 +1395,7 @@ fn agent_capabilities() -> Vec<String> {
         capabilities.push(CAPABILITY_LIVE_SHARE_V1.to_owned());
         capabilities.push(CAPABILITY_GUI_LAUNCH_V1.to_owned());
         capabilities.push(CAPABILITY_GUI_ICON_V1.to_owned());
-        capabilities.push(CAPABILITY_GUI_WINDOW_V1.to_owned());
+        capabilities.push(CAPABILITY_GUI_WINDOW_V3.to_owned());
         capabilities.push(CAPABILITY_DESKTOP_LIVE_SHARE_V1.to_owned());
         capabilities
     };
@@ -1716,7 +1737,12 @@ fn gui_window(
     };
     #[cfg(windows)]
     {
-        forward_gui_window(stream, &request, expected_token)
+        let result = forward_gui_window(&mut stream, &request, expected_token);
+        if let Err(error) = result {
+            let _ = send_error(&mut stream, &error.to_string());
+            return Err(error);
+        }
+        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -1792,14 +1818,14 @@ fn desktop_live_share_configure(
 
 #[cfg(windows)]
 fn forward_gui_window(
-    mut host: TcpStream,
+    host: &mut TcpStream,
     request: &GuiStartRequest,
     expected_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut desktop = connect_or_start_desktop_companion(
         &request.user_name,
         expected_token,
-        CAPABILITY_GUI_WINDOW_V1,
+        CAPABILITY_GUI_WINDOW_V3,
     )?;
     desktop.set_read_timeout(None)?;
     desktop.set_write_timeout(None)?;
@@ -1809,18 +1835,8 @@ fn forward_gui_window(
     )?;
 
     let mut host_reader = host.try_clone()?;
-    let mut desktop_writer = desktop.try_clone()?;
-    let input_relay = thread::spawn(move || -> Result<(), String> {
-        loop {
-            let frame = read_frame(&mut host_reader).map_err(|error| error.to_string())?;
-            validate_gui_control_frame(&frame).map_err(|error| error.to_string())?;
-            let terminal = frame.kind == FrameKind::GuiWindowClose;
-            write_frame(&mut desktop_writer, &frame).map_err(|error| error.to_string())?;
-            if terminal {
-                return Ok(());
-            }
-        }
-    });
+    let desktop_writer = desktop.try_clone()?;
+    let input_relay = thread::spawn(move || relay_gui_controls(&mut host_reader, desktop_writer));
 
     let relay_result = loop {
         let frame = match read_frame(&mut desktop) {
@@ -1831,7 +1847,7 @@ fn forward_gui_window(
             break Err(error);
         }
         let terminal = matches!(frame.kind, FrameKind::GuiWindowClosed | FrameKind::Error);
-        if let Err(error) = write_frame(&mut host, &frame) {
+        if let Err(error) = write_frame(host, &frame) {
             break Err(error.into());
         }
         if terminal {
@@ -1853,6 +1869,27 @@ fn forward_gui_window(
 }
 
 #[cfg(windows)]
+fn relay_gui_controls(
+    host_reader: &mut TcpStream,
+    mut desktop_writer: TcpStream,
+) -> Result<(), String> {
+    let result: Result<(), String> = (|| loop {
+        let frame = read_frame(host_reader).map_err(|error| error.to_string())?;
+        validate_gui_control_frame(&frame).map_err(|error| error.to_string())?;
+        write_frame(&mut desktop_writer, &frame).map_err(|error| error.to_string())?;
+    })();
+    if result.is_err() {
+        // Host EOF, protocol rejection, or a failed forward means no explicit
+        // GUI_WINDOW_CLOSE/ack handshake can complete. Wake the companion's
+        // reader immediately so it releases injected input and detaches the
+        // presenter while leaving the guest window alive for a bounded exact
+        // PID/HWND reattach.
+        let _ = desktop_writer.shutdown(Shutdown::Both);
+    }
+    result
+}
+
+#[cfg(windows)]
 fn validate_gui_control_frame(frame: &Frame) -> Result<(), Box<dyn std::error::Error>> {
     match frame.kind {
         FrameKind::GuiWindowInput => {
@@ -1860,6 +1897,12 @@ fn validate_gui_control_frame(frame: &Frame) -> Result<(), Box<dyn std::error::E
         }
         FrameKind::GuiWindowResize => {
             GuiWindowResize::decode(&frame.payload)?;
+        }
+        FrameKind::GuiWindowAction => {
+            let action = GuiWindowAction::decode(&frame.payload)?;
+            if !matches!(action, GuiWindowAction::Maximize | GuiWindowAction::Restore) {
+                return Err("host may send only explicit maximize or restore state".into());
+            }
         }
         FrameKind::GuiWindowClose if frame.payload.is_empty() => {}
         FrameKind::GuiWindowClose => return Err("GUI_WINDOW_CLOSE payload must be empty".into()),
@@ -1877,8 +1920,14 @@ fn validate_gui_event_frame(frame: &Frame) -> Result<(), Box<dyn std::error::Err
         FrameKind::GuiWindowDamage => {
             GuiWindowDamage::decode(&frame.payload)?;
         }
+        FrameKind::GuiWindowDragHint => {
+            GuiWindowDragHint::decode(&frame.payload)?;
+        }
         FrameKind::GuiWindowClosed => {
             GuiWindowClosed::decode(&frame.payload)?;
+        }
+        FrameKind::GuiWindowAction => {
+            GuiWindowAction::decode(&frame.payload)?;
         }
         FrameKind::Error => {}
         _ => return Err("invalid desktop-companion frame in a seamless GUI session".into()),
@@ -2304,6 +2353,14 @@ fn receive_file(mut stream: TcpStream, payload: &[u8]) -> Result<(), Box<dyn std
 
     let temporary = upload_temporary_path(&destination)?;
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        #[cfg(windows)]
+        let mut file = windows_path::UploadFile::create(&temporary).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not create the atomic upload staging file: {error}"),
+            )
+        })?;
+        #[cfg(not(windows))]
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -2332,10 +2389,25 @@ fn receive_file(mut stream: TcpStream, payload: &[u8]) -> Result<(), Box<dyn std
                         .into());
                     }
                     file.flush()?;
-                    file.sync_all()?;
-                    drop(file);
-                    fs::hard_link(&temporary, &destination)?;
-                    fs::remove_file(&temporary)?;
+                    file.sync_all().map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("could not flush the atomic upload staging file: {error}"),
+                        )
+                    })?;
+                    #[cfg(windows)]
+                    file.publish_new(&destination).map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("could not publish the atomic upload: {error}"),
+                        )
+                    })?;
+                    #[cfg(not(windows))]
+                    {
+                        drop(file);
+                        fs::hard_link(&temporary, &destination)?;
+                        fs::remove_file(&temporary)?;
+                    }
                     write_frame(
                         &mut stream,
                         &Frame::new(FrameKind::FileDone, encode_file_length(received)),

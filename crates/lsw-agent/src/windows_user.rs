@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Narrow bindings for creating a local Windows account and changing its local
-//! Administrators membership without putting a password in a child process,
-//! command line, environment block, or file.
+//! Narrow bindings for creating a usable local Windows account and changing
+//! its local Administrators membership without putting a password in a child
+//! process, command line, environment block, or file.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -18,6 +18,7 @@ const NERR_USER_EXISTS: u32 = 2224;
 const ERROR_MEMBER_NOT_IN_ALIAS: u32 = 1377;
 const ERROR_MEMBER_IN_ALIAS: u32 = 1378;
 const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
+const WIN_BUILTIN_USERS_SID: i32 = 27;
 const LOGON32_LOGON_NETWORK: u32 = 3;
 const LOGON32_PROVIDER_DEFAULT: u32 = 0;
 
@@ -147,11 +148,13 @@ pub(super) fn create_local_user(
         .into());
     }
 
-    let role_result = if administrator {
-        add_to_administrators(&mut user_name)
-    } else {
-        remove_from_administrators(&mut user_name)
-    };
+    let role_result = add_to_users(&mut user_name).and_then(|()| {
+        if administrator {
+            add_to_administrators(&mut user_name)
+        } else {
+            remove_from_administrators(&mut user_name)
+        }
+    });
     if let Err(error) = role_result {
         if created {
             // SAFETY: user_name remains a live, NUL-terminated UTF-16 string.
@@ -172,6 +175,7 @@ pub(super) fn set_local_user_role(
 ) -> Result<(), Box<dyn std::error::Error>> {
     lsw_core::validate_windows_user_name(user_name)?;
     let mut user_name = wide(user_name);
+    add_to_users(&mut user_name)?;
     match role {
         lsw_core::WindowsUserRole::Standard => remove_from_administrators(&mut user_name),
         lsw_core::WindowsUserRole::Administrator => add_to_administrators(&mut user_name),
@@ -208,7 +212,19 @@ fn verify_existing_password(
 }
 
 fn add_to_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::error::Error>> {
-    let group_name = administrators_group_name()?;
+    let group_name = builtin_group_name(WIN_BUILTIN_ADMINISTRATORS_SID, "Administrators")?;
+    add_to_local_group(user_name, &group_name)
+}
+
+fn add_to_users(user_name: &mut [u16]) -> Result<(), Box<dyn std::error::Error>> {
+    let group_name = builtin_group_name(WIN_BUILTIN_USERS_SID, "Users")?;
+    add_to_local_group(user_name, &group_name)
+}
+
+fn add_to_local_group(
+    user_name: &mut [u16],
+    group_name: &[u16],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut member = LocalGroupMembersInfo3 {
         domain_and_name: user_name.as_mut_ptr(),
     };
@@ -230,7 +246,7 @@ fn add_to_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::error
 }
 
 fn remove_from_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::error::Error>> {
-    let group_name = administrators_group_name()?;
+    let group_name = builtin_group_name(WIN_BUILTIN_ADMINISTRATORS_SID, "Administrators")?;
     let mut member = LocalGroupMembersInfo3 {
         domain_and_name: user_name.as_mut_ptr(),
     };
@@ -251,14 +267,17 @@ fn remove_from_administrators(user_name: &mut [u16]) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn administrators_group_name() -> Result<[u16; 256], Box<dyn std::error::Error>> {
+fn builtin_group_name(
+    sid_type: i32,
+    display_name: &str,
+) -> Result<[u16; 256], Box<dyn std::error::Error>> {
     let mut sid = [0_u8; 68];
     let mut sid_bytes = u32::try_from(sid.len()).expect("SID buffer length fits in u32");
     // SAFETY: sid is a writable SECURITY_MAX_SID_SIZE buffer and sid_bytes
     // describes its exact length.
     if unsafe {
         CreateWellKnownSid(
-            WIN_BUILTIN_ADMINISTRATORS_SID,
+            sid_type,
             std::ptr::null(),
             sid.as_mut_ptr().cast(),
             &mut sid_bytes,
@@ -292,7 +311,7 @@ fn administrators_group_name() -> Result<[u16; 256], Box<dyn std::error::Error>>
     }
     let terminator = usize::try_from(group_characters).map_err(|_| "invalid group-name length")?;
     if terminator >= group_name.len() {
-        return Err("localized Administrators group name is too long".into());
+        return Err(format!("localized {display_name} group name is too long").into());
     }
     group_name[terminator] = 0;
     Ok(group_name)
