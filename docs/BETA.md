@@ -163,7 +163,8 @@ The broader hardware and soak matrix still includes:
   behavior. QMP `stop`/`cont`/`quit` is covered against real QEMU, and the CI
   lifecycle gate checks `lswd` through a filesystem QMP socket.
 - Extended ConPTY Unicode, resize, disconnect, and long interactive use.
-- Optional private Unix-socket VNC viewer compatibility.
+- Optional recovery-viewer compatibility through a private Unix VNC socket and
+  a single-connection ephemeral loopback bridge.
 - Executables, paths, firmware, daemon IPC, and complete lifecycle behavior on
   macOS HVF and Windows WHPX hosts.
 

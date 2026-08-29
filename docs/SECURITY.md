@@ -117,6 +117,14 @@ normal Windows close path. No public VNC, RDP, or LAN listener is enabled. Slice
 4 does not cross UIPI or the UAC secure desktop; later slices must retain the
 private-viewer fallback instead of weakening those boundaries.
 
+The recovery viewer keeps QEMU's VNC endpoint on a per-instance Unix socket.
+Since `remote-viewer` cannot consume a Unix socket for VNC, `lsw view` exposes
+it only through a random `127.0.0.1` port while launching the viewer. The
+listener accepts one loopback connection and closes before relaying; it is not
+a persistent or externally reachable display service. Connection and launch
+status files are private regular files, and the CLI does not claim success
+until the viewer has connected.
+
 Native Windows sudo is a separate capability-gated fixed operation. The normal
 agent asks `LSWMaintenanceHelper` to read the inbox binary and the documented
 local and policy registry values. LSW can set only disabled or new-window mode,

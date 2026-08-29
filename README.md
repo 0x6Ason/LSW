@@ -154,6 +154,11 @@ is available, or reopen the display later without handling a socket path:
 lsw view win-dev
 ```
 
+QEMU keeps that recovery display on a private Unix socket. Because
+`remote-viewer` accepts VNC over TCP, `lsw view` creates a single-use listener
+on a random `127.0.0.1` port, closes it as soon as the viewer connects, and
+reports success only after the connection is established.
+
 After `lsw install` returns:
 
 ```bash

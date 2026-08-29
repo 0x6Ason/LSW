@@ -20,6 +20,7 @@ mod progress;
 mod shares;
 mod transfer;
 mod user_setup;
+mod viewer;
 mod windows_sudo;
 
 use std::env;
@@ -29,7 +30,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +101,7 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
             completion::command(remaining)?;
             return Ok(0);
         }
+        "__viewer-bridge" => return viewer::bridge_command(remaining),
         _ => {}
     }
 
@@ -1003,59 +1005,7 @@ fn launch_viewer(
     name: &str,
     explicit: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if env::var_os("DISPLAY").is_none() && env::var_os("WAYLAND_DISPLAY").is_none() {
-        let message = format!(
-            "no graphical desktop was detected; run `lsw view {name}` from a graphical session"
-        );
-        if explicit {
-            return Err(message.into());
-        }
-        println!("Viewer not opened: {message}.");
-        return Ok(());
-    }
-
-    let capabilities = HostCapabilities::detect();
-    let viewer = env::var_os("LSW_INSTALL_VIEWER")
-        .map(PathBuf::from)
-        .or(capabilities.remote_viewer);
-    let Some(viewer) = viewer else {
-        let message = "remote-viewer was not found; install the optional virt-viewer package";
-        if explicit {
-            return Err(message.into());
-        }
-        println!("Viewer not opened: {message}.");
-        return Ok(());
-    };
-
-    let instance_dir = store.instance_dir(name)?;
-    let socket = instance_dir.join("run/recovery-vnc.sock");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(50));
-    }
-    if !socket.exists() {
-        return Err(format!("the installation display for {name:?} is not ready").into());
-    }
-    let socket_text = socket
-        .to_str()
-        .filter(|value| !value.contains(['\r', '\n']))
-        .ok_or("the installation display path cannot be represented safely")?;
-    let connection = instance_dir.join("run/installation-viewer.vv");
-    fs::write(
-        &connection,
-        format!(
-            "[virt-viewer]\ntype=vnc\nunix-path={socket_text}\ntitle=LSW installation - {name}\n"
-        ),
-    )?;
-    fs::set_permissions(&connection, fs::Permissions::from_mode(0o600))?;
-    Command::new(viewer)
-        .arg(&connection)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    println!("Opened the LSW installation viewer for {name:?}.");
-    Ok(())
+    viewer::launch(store, name, explicit)
 }
 
 fn status(store: &StateStore, arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
