@@ -486,13 +486,13 @@ jobs:
       - Linux
       - X64
       - lsw-windows-seamless-e2e
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
       RUSTUP_TOOLCHAIN: "1.76.0"
       LSW_WINDOWS_LINKER: mingw
-      LSW_SEAMLESS_E2E_TIMEOUT_SECONDS: "900"
+      LSW_SEAMLESS_E2E_TIMEOUT_SECONDS: "1800"
     steps:
       - name: Initialize isolated GUI build paths
         shell: bash

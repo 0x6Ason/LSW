@@ -299,6 +299,11 @@ keyboard and pointer input, resize, explicit window state, close prompts,
 presenter crash recovery, and exact-HWND reattach. Clipboard and audio remain
 later beta.8 work.
 
+The signed-in matrix has a 30-minute harness budget inside a 45-minute job.
+Each guest, presenter, and Windows-host operation retains its shorter bounded
+timeout; the outer budget only allows the complete sequential matrix and
+cleanup to finish on slower interactive runners.
+
 This workflow and both harnesses define the required release evidence; source
 presence alone is not a runtime claim. Tag beta.8 only after the exact candidate
 completes both the headless KVM job and the independent signed-in WSLg job in one

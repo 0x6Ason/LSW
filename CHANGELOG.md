@@ -17,6 +17,9 @@
 - Expanded the exact Windows/KVM release gate budget so official Windows 11
   DISM export, mount, commit, apply, Setup/OOBE, agent, ConPTY, and cold restart
   can finish on slower dedicated disks without weakening bounded teardown.
+- Expanded the signed-in WSLg matrix budget to cover the complete resize,
+  crash/reattach, animation, close-prompt, host-close, and initial-maximize
+  sequence. Individual operations remain independently bounded.
 - Completed beta.8 Slice 3's on-demand interactive companion and GUI launch
   path. A SID-checked WTS boundary starts the scoped companion only for the
   registered signed-in Windows user, restores that user's authenticated live

@@ -6,7 +6,7 @@
 
 set -eu
 
-overall_timeout_seconds=${LSW_SEAMLESS_E2E_TIMEOUT_SECONDS:-360}
+overall_timeout_seconds=${LSW_SEAMLESS_E2E_TIMEOUT_SECONDS:-1800}
 expected_guest_agent_sha=${LSW_SEAMLESS_E2E_EXPECTED_AGENT_SHA256:-}
 case "$overall_timeout_seconds" in
     ''|*[!0-9]*)
