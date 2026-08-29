@@ -36,7 +36,11 @@ pub const WINPE_PREPARED_IMAGE_NAME: &str = "lsw-prepared.wim";
 /// Disk number assigned to the LSW-owned instance target during apply.
 pub const WINPE_TARGET_DISK_ID: u32 = 1;
 /// Maximum wall-clock duration of either WinPE microVM phase.
-pub const WINPE_VM_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+///
+/// Microsoft DISM can spend more than two hours finalizing a max-compressed
+/// export on slower storage while both guest CPUs remain busy. Keep a hard
+/// bound, but do not abort that healthy work before it can finish.
+pub const WINPE_VM_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 
 const WINPE_WORKSPACE_DRIVE: &str = "W:";
 const WINPE_SCRIPT_FILE: &str = "lsw/winpe-dism.cmd";

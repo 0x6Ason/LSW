@@ -98,7 +98,7 @@ jobs:
       - Linux
       - X64
       - lsw-windows-kvm-e2e
-    timeout-minutes: 180
+    timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
       RUST_BACKTRACE: "1"
@@ -106,7 +106,7 @@ jobs:
       LSW_WINDOWS_LINKER: mingw
       LSW_WINDOWS_EDITION: pro
       LSW_WINDOWS_PROFILE: slim
-      LSW_E2E_TIMEOUT_SECONDS: "7200"
+      LSW_E2E_TIMEOUT_SECONDS: "18000"
       LSW_E2E_NO_VIEWER: "1"
       LSW_E2E_KEEP_STATE: "0"
       LSW_E2E_MIN_FREE_GIB: "160"

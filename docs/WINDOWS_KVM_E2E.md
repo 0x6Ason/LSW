@@ -61,8 +61,8 @@ custom labels to one runner service: one contract requires no Windows desktop
 user, while the other requires one interactive Explorer and WSLg session.
 
 The job has read-only repository permission, checkout does not persist its
-credential, concurrent KVM runs are serialized, and the job has a 180-minute
-timeout. The harness reserves two hours for the complete official-media DISM,
+credential, concurrent KVM runs are serialized, and the job has a 360-minute
+timeout. The harness reserves five hours for the complete official-media DISM,
 Setup/OOBE, agent, ConPTY, and cold-restart validation, then adds a bounded
 twenty-minute orchestration margin and a five-minute TERM-to-KILL cleanup
 window. This leaves the job time for builds, evidence upload, and final cleanup.
