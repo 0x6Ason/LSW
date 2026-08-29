@@ -879,6 +879,23 @@ click_at() {
     # Wayland events. Prove the Windows cursor landed in the exact proxy first,
     # then leave a bounded settling interval before sending explicit edges.
     # The later Burst gate still exercises rapid pairs without this interval.
+    click_attempt=0
+    while [ "$click_attempt" -lt 3 ]; do
+        if run_fixture_host 8 PointerButton -Hwnd "$click_window" \
+            -X "$click_x" -Y "$click_y" -Button Left -DelayMilliseconds 50 \
+            2>/dev/null
+        then
+            return 0
+        fi
+        click_attempt=$((click_attempt + 1))
+        # A non-activating Explorer popup can cover an otherwise foreground
+        # WSLg proxy after a taskbar restore. The failed PointerButton sends no
+        # edge until both identity checks pass, so dismiss and retry safely.
+        run_fixture_host 8 PointerAway -Hwnd "$click_window" >/dev/null 2>&1 \
+            || break
+        sleep 0.4
+        activate_window "$click_window"
+    done
     run_fixture_host 8 PointerButton -Hwnd "$click_window" \
         -X "$click_x" -Y "$click_y" -Button Left -DelayMilliseconds 50 \
         || fail "could not click the identity-checked seamless host HWND"
