@@ -31,6 +31,11 @@ use super::{
     resolve_port_forwards, show_activation_notice_once, start_named_instance, InstallArguments,
 };
 
+// Default-sized KVM guests can spend well over fifteen minutes in the first
+// Windows 11 specialize/OOBE pass. This is a safety bound, not an estimate:
+// the wait returns as soon as the agent and setup cleanup marker are ready.
+const UNATTENDED_SETUP_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 pub(super) fn install_instance(
     store: &StateStore,
     arguments: &[OsString],
@@ -169,14 +174,7 @@ pub(super) fn install_instance(
         launch_installation_viewer(store, &name)?;
     }
     if verify_agent {
-        wait_for_unattended_setup(
-            store,
-            &name,
-            Duration::from_secs(60 * 60),
-            &mut progress,
-            2,
-            2,
-        )?;
+        wait_for_unattended_setup(store, &name, UNATTENDED_SETUP_TIMEOUT, &mut progress, 2, 2)?;
         progress.finish();
         show_activation_notice_once(store, &name);
         crate::user_setup::after_install(store, &name, parsed.defer_user_setup)?;
@@ -220,7 +218,7 @@ fn resume_winpe_installation(
         progress.finish();
         println!("Windows is running without the LSW agent; shell verification was skipped.");
     } else {
-        wait_for_unattended_setup(store, name, Duration::from_secs(15 * 60), progress, 1, 2)?;
+        wait_for_unattended_setup(store, name, UNATTENDED_SETUP_TIMEOUT, progress, 1, 2)?;
         progress.update(ProgressEvent::measured(
             2,
             2,
@@ -371,7 +369,7 @@ fn install_new_instance(
         launch_installation_viewer(store, name)?;
     }
     if !parsed.without_agent {
-        wait_for_unattended_setup(store, name, Duration::from_secs(15 * 60), progress, 7, 8)?;
+        wait_for_unattended_setup(store, name, UNATTENDED_SETUP_TIMEOUT, progress, 7, 8)?;
         progress.update(ProgressEvent::measured(
             8,
             8,
@@ -974,6 +972,11 @@ mod tests {
             8,
         );
         assert_eq!((measured.completed, measured.total), (Some(73), Some(100)));
+    }
+
+    #[test]
+    fn unattended_setup_wait_covers_slow_default_kvm_first_boot() {
+        assert!(UNATTENDED_SETUP_TIMEOUT >= Duration::from_secs(30 * 60));
     }
 
     #[test]
