@@ -1921,9 +1921,11 @@ run_fixture_host 8 PointerAway -Hwnd "$window_id" \
 sleep 0.7
 # Current WSLg rebuilds the outer RAIL proxy on the first synthetic re-entry
 # and its Weston pointer seat on the next leave/enter. Use an inert fixture
-# background click for the first epoch; no product behavior is asserted from
-# that click, and the following caption action remains the input proof.
-click_percent "$window_id" 50 75
+# background click for the first epoch; keep it in the center of the client so
+# a guest-caption move cannot place the probe behind an always-on-top taskbar.
+# No product behavior is asserted from that click, and the following caption
+# action remains the input proof.
+click_percent "$window_id" 50 50
 run_fixture_host 8 PointerAway -Hwnd "$window_id" \
     || fail "could not complete the restored-proxy pointer re-entry"
 sleep 0.7
