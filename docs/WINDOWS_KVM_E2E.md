@@ -236,6 +236,11 @@ for the exact setup-complete marker. It then requires `LSWSetup` to be absent,
 paths to be gone, and Winlogon to contain neither automatic logon nor a stored
 `DefaultPassword`. A bare `lsw` must restore an agent-backed ConPTY shell from
 the installed disk without installation media or an interactive console user.
+The harness keeps its one explicitly attested daemon active every five minutes
+during direct WinPE preparation and apply, which can exceed the daemon's
+one-hour configurable idle ceiling on slower disks. Autospawn stays disabled,
+and the keepalive process group is removed before the independent bare-`lsw`
+cold-start check.
 Before that restart, `lsw user setup --password-stdin` must create an enabled
 account in the well-known local Users group without administrator membership or
 AutoLogon. The gate then

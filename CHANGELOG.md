@@ -16,7 +16,9 @@
   secure-desktop presentation remain later slices.
 - Expanded the exact Windows/KVM release gate budget so official Windows 11
   DISM export, mount, commit, apply, Setup/OOBE, agent, ConPTY, and cold restart
-  can finish on slower dedicated disks without weakening bounded teardown.
+  can finish on slower dedicated disks without weakening bounded teardown. A
+  private five-minute keepalive retains the gate's single attested daemon
+  across long direct WinPE phases while autospawn remains disabled.
 - Expanded the signed-in WSLg matrix budget to cover the complete resize,
   crash/reattach, animation, close-prompt, host-close, and initial-maximize
   sequence. Individual operations remain independently bounded.

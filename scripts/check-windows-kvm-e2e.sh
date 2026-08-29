@@ -157,6 +157,7 @@ autospawn_blocker="$e2e_root/lswd-autospawn-disabled"
 cold_daemon_pid_file="$e2e_root/cold-daemon.pid"
 export LSW_DAEMON="$autospawn_blocker"
 daemon_pid=
+daemon_keepalive_pid=
 viewer_pid=
 sync_pid=
 artifacts_collected=0
@@ -392,6 +393,10 @@ collect_e2e_artifacts() {
         tail -c 131072 "$LSW_STATE_DIR/lswd.log" >"$artifact_dir/lswd-autospawn.log"
         chmod 600 "$artifact_dir/lswd-autospawn.log"
     fi
+    if [ -f "$e2e_root/lswd-keepalive.log" ]; then
+        tail -c 131072 "$e2e_root/lswd-keepalive.log" >"$artifact_dir/lswd-keepalive.log"
+        chmod 600 "$artifact_dir/lswd-keepalive.log"
+    fi
     artifacts_collected=1
 }
 
@@ -467,7 +472,46 @@ assert_daemon_alive() {
     fi
 }
 
+assert_daemon_keepalive_alive() {
+    case "$daemon_keepalive_pid" in
+        ''|*[!0-9]*)
+            echo "error: the tracked lswd keepalive PID is unavailable" >&2
+            return 1
+            ;;
+    esac
+    if ! kill -0 "-$daemon_keepalive_pid" 2>/dev/null; then
+        echo "error: tracked lswd keepalive process group $daemon_keepalive_pid exited during the gate" >&2
+        return 1
+    fi
+}
+
+terminate_daemon_keepalive() {
+    case "$daemon_keepalive_pid" in
+        ''|*[!0-9]*)
+            daemon_keepalive_pid=
+            return 0
+            ;;
+    esac
+
+    kill -TERM "-$daemon_keepalive_pid" 2>/dev/null \
+        || kill -TERM "$daemon_keepalive_pid" 2>/dev/null \
+        || :
+    keepalive_attempt=0
+    while kill -0 "-$daemon_keepalive_pid" 2>/dev/null \
+        && [ "$keepalive_attempt" -lt 50 ]
+    do
+        keepalive_attempt=$((keepalive_attempt + 1))
+        sleep 0.1
+    done
+    if kill -0 "-$daemon_keepalive_pid" 2>/dev/null; then
+        kill -KILL "-$daemon_keepalive_pid" 2>/dev/null || :
+    fi
+    wait "$daemon_keepalive_pid" 2>/dev/null || :
+    daemon_keepalive_pid=
+}
+
 terminate_daemon() {
+    terminate_daemon_keepalive
     case "$daemon_pid" in
         ''|*[!0-9]*)
             daemon_pid=
@@ -732,6 +776,27 @@ if [ "$daemon_ready" -ne 1 ]; then
     exit 1
 fi
 
+# Preparing and applying an official image can legitimately exceed lswd's
+# one-hour configurable idle ceiling on slower disks. Keep the one explicitly
+# tracked exact-candidate daemon active without enabling autospawn; teardown
+# stops this private process group before the cold-start daemon test.
+daemon_keepalive="$e2e_root/daemon-keepalive.sh"
+# The variables are intentionally expanded later by the generated helper.
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'while kill -0 "$LSW_E2E_DAEMON_PID" 2>/dev/null; do' \
+    '    sleep 300' \
+    '    kill -0 "$LSW_E2E_DAEMON_PID" 2>/dev/null || exit 1' \
+    '    "$LSW_E2E_LSW" daemon status >/dev/null' \
+    'done' \
+    >"$daemon_keepalive"
+chmod 700 "$daemon_keepalive"
+export LSW_E2E_DAEMON_PID="$daemon_pid"
+setsid "$daemon_keepalive" >"$e2e_root/lswd-keepalive.log" 2>&1 &
+daemon_keepalive_pid=$!
+
 viewer_option=
 if [ "$e2e_no_viewer" != 1 ]; then
     viewer_option=--viewer
@@ -807,6 +872,8 @@ else
         exit 1
     fi
 fi
+assert_daemon_alive
+assert_daemon_keepalive_alive
 
 for removed_transient in \
     seed \
