@@ -485,9 +485,20 @@ pass fixture_staged
 
 guest_marker_text() {
     marker_read_path=$1
-    marker_read_raw=$(run_lsw 3 exec "$instance" -- cmd.exe /d /c type "$marker_read_path" \
-        </dev/null 2>/dev/null) || return 1
-    printf '%s\n' "$marker_read_raw" | tr -d '\r'
+    marker_read_attempt=1
+    while [ "$marker_read_attempt" -le 3 ]; do
+        if marker_read_raw=$(run_lsw 3 exec "$instance" -- \
+            cmd.exe /d /c type "$marker_read_path" </dev/null 2>/dev/null)
+        then
+            printf '%s\n' "$marker_read_raw" | tr -d '\r'
+            return 0
+        fi
+        marker_read_attempt=$((marker_read_attempt + 1))
+        if [ "$marker_read_attempt" -le 3 ]; then
+            sleep 0.2
+        fi
+    done
+    return 1
 }
 
 marker_has_exact() {

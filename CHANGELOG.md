@@ -21,7 +21,9 @@
   across long direct WinPE phases while autospawn remains disabled.
 - Expanded the signed-in WSLg matrix budget to cover the complete resize,
   crash/reattach, animation, close-prompt, host-close, and initial-maximize
-  sequence. Individual operations remain independently bounded.
+  sequence. Individual operations remain independently bounded, and read-only
+  guest marker snapshots now retry a transient agent or file-sharing race up to
+  three times without weakening their exact content assertions.
 - Completed beta.8 Slice 3's on-demand interactive companion and GUI launch
   path. A SID-checked WTS boundary starts the scoped companion only for the
   registered signed-in Windows user, restores that user's authenticated live
