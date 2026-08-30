@@ -36,13 +36,13 @@ The workflow dispatch and protected-environment approval are deliberately
 manual because GitHub-hosted runners do not expose KVM. Guest setup itself is
 fully headless. A successful ordinary CI run is not a substitute for this gate.
 
-beta.8 adds an ordered final GUI stage to the same exact-SHA workflow run. The
-headless KVM job keeps its no-console-user invariant and must pass first. The
-current opt-in compatibility stage downloads that job's redacted success and
-exact-media attestation before exercising a separately provisioned real LSW
-instance. Its driver uses WSLg only because the development workstation is
-Windows plus WSL. The final release stage instead uses the stopped real-install
-handoff on native Linux Wayland; that is LSW's product contract.
+beta.8 adds a native mode to the same exact-SHA workflow. One native Linux/KVM
+job first keeps the complete no-console-user headless invariant, then creates a
+stopped linked clone from the sealed real install and consumes it in the final
+GUI matrix. That matrix starts a private headless Sway compositor and does not
+inherit a host display session. The opt-in WSLg job remains a separately
+provisioned Windows-hosted development adapter; it is not release evidence or a
+user prerequisite.
 
 ## Security boundary
 
@@ -53,16 +53,17 @@ runner. The headless job accepts only:
 - a manual dispatch from `master` in `0x6Ason/LSW`;
 - an exact, operator-entered 40-character candidate commit;
 - the protected `windows-kvm-e2e` GitHub environment; and
-- a runner with all four labels: `self-hosted`, `Linux`, `X64`, and
-  `lsw-windows-kvm-e2e`.
+- an ordinary headless runner with `self-hosted`, `Linux`, `X64`, and
+  `lsw-windows-kvm-e2e`, or a native final-gate runner with the first three
+  labels plus `lsw-windows-kvm-gui-e2e`.
 
 The signed-in GUI job has a separate protected `windows-seamless-e2e`
 environment and accepts only a repository-scoped runner carrying
-`self-hosted`, `Linux`, `X64`, and `lsw-windows-seamless-e2e`. Never attach both
-custom labels to one runner service: one contract requires no Windows desktop
-user, while the current development adapter requires one interactive Explorer
-and WSLg session. A future native Wayland runner keeps the same isolation
-without requiring any Windows-host tooling.
+`self-hosted`, `Linux`, `X64`, and `lsw-windows-seamless-e2e`. Never attach the
+WSLg custom label to either KVM runner service: the development adapter requires
+one interactive Windows Explorer and WSLg session, while both KVM contracts are
+native Linux services with no Windows-host tooling. The final-gate runner uses
+only its private compositor and the Windows VM it creates in that job.
 
 The job has read-only repository permission, checkout does not persist its
 credential, concurrent KVM runs are serialized, and the job has a 360-minute
@@ -124,6 +125,24 @@ pair is available.
 The beta.8 headless KVM job may run as a background service and does not need
 `DISPLAY`, `WAYLAND_DISPLAY`, a session bus, or `remote-viewer`.
 
+### Native beta.8 final-gate runner
+
+Provision a repository-scoped native Linux runner with
+`lsw-windows-kvm-gui-e2e` instead of `lsw-windows-kvm-e2e`. It needs every
+headless dependency above plus Sway/wlroots, `grim`, `wtype`, `jq`, and
+ImageMagick's `convert` and `identify`. On Debian or Ubuntu, add:
+
+```sh
+sudo apt-get install grim imagemagick jq sway wtype
+```
+
+The runner may remain an unprivileged background service. Do not export a host
+`DISPLAY` or `WAYLAND_DISPLAY`; the matrix sets `WLR_BACKENDS=headless`, creates
+one private mode-0700 runtime directory, and launches its own Sway output. WSL,
+WSLg, a signed-in Linux desktop, X11, RDP, and a public VNC listener are all
+rejected or unnecessary. Use the same protected `windows-kvm-e2e` environment
+and short disk-backed `LSW_E2E_ROOT_BASE` contract as the headless runner.
+
 ### Current WSLg development adapter
 
 This section describes test infrastructure, not an LSW user prerequisite.
@@ -149,12 +168,13 @@ The workflow rebuilds them independently, hashes its Linux CLI and daemon plus
 the Windows agent, verifies `/proc/<pid>/exe` for the active daemon, and requires
 the installed `C:\Program Files\LSW\lsw-agent.exe` to match the candidate agent
 SHA-256 before it stages a fixture. A stale daemon or guest agent therefore
-fails closed instead of producing mixed-revision GUI evidence. The GUI driver
-never installs, starts, stops, creates, or removes a VM; the operator owns this
-disposable prerequisite and must remove it after the workflow. This
-pre-provisioned path is development evidence only. The final native Linux gate
-will consume a stopped linked clone handed off from the ordinary headless
-install and will own its removal.
+fails closed instead of producing mixed-revision GUI evidence. The WSLg GUI
+driver never installs, starts, stops, creates, or removes a VM; the operator owns
+this disposable prerequisite and must remove it after the workflow. This
+pre-provisioned path is development evidence only. The native gate instead
+consumes the stopped linked clone handed off from its own ordinary headless
+install and owns its shutdown, removal, private login secret, and same-host
+state cleanup.
 
 The GUI driver also writes and reads a short probe through WSLg's system-distro
 shared-memory mount before it contacts the VM. A stale VAIL mount can still
@@ -220,11 +240,14 @@ read-only, and keeps it below the isolated per-run build root. The final
 always-run cleanup deletes the request, URL input, ISO, build output, VM disks,
 vTPM state, and agent credentials. It never uploads the ISO or caches it.
 
-The workflow retains only the headless harness's redacted `attestation.env`,
-`doctor.txt`, `bench.json`, and `diagnose.tar.gz` plus the GUI job's candidate
-hash attestation and seamless-matrix log for 14 days. Cargo and the Microsoft
-media path require outbound network access; pre-warm Rust dependencies and
-restrict other destinations if a tighter boundary is needed.
+The workflow retains only redacted evidence for 14 days: the headless
+`attestation.env`, `doctor.txt`, `bench.json`, and `diagnose.tar.gz`; native mode
+also adds its Sway/presenter logs and test-fixture screenshots. The one-shot
+Windows password, VM disks, ISO, and state never enter the artifact. The
+development-only WSLg job retains its candidate hash attestation and matrix log.
+Cargo and the Microsoft media path require outbound network access; pre-warm
+Rust dependencies and restrict other destinations if a tighter boundary is
+needed.
 
 ## Run the gate
 
@@ -232,12 +255,12 @@ restrict other destinations if a tighter boundary is needed.
 2. Open **Actions > Windows/KVM release gate > Run workflow**.
 3. Select `master`, enter the exact 40-character commit, and enter
    `RUN-WINDOWS-KVM-E2E` as the confirmation.
-4. Leave the optional WSLg compatibility input disabled for a headless-only
-   run, or enable it when developing the Windows-hosted adapter. Approve the
-   headless environment and run its full KVM gate. When selected, the separately
-   isolated compatibility job becomes eligible only after headless success,
-   first verifies the downloaded attestation, and then owns only its temporary
-   fixture and presenter artifacts.
+4. For beta.8 release evidence, enable **Run the final real-install GUI matrix
+   on native Linux Wayland** and leave WSLg compatibility disabled. The full
+   install and final GUI stages then run on `lsw-windows-kvm-gui-e2e` in one job.
+   For a headless-only check, leave both options disabled. Enable only WSLg when
+   developing the Windows-hosted adapter; the two GUI options are intentionally
+   mutually exclusive.
 
 The gate fails unless `lsw install` waits through the specialize-to-OOBE reboot
 for the exact setup-complete marker. It then requires `LSWSetup` to be absent,
@@ -307,30 +330,31 @@ Session 0 remains sufficient for the command and ConPTY contract. The on-demand
 user-session companion handles GUI process launch, icon discovery, the user's
 live `L:` mapping, and the Slice 4 first-HWND capture path without changing that
 boot-time service boundary. This headless gate deliberately remains at the
-sign-in screen, so it tests fail-closed WTS selection. Only after those checks
-pass does the ordered signed-in GUI stage validate the Slice 4 native Wayland
-window, guest-only chrome, focus, keyboard and pointer input, resize, explicit
-window state, close prompts, presenter crash recovery, and exact-HWND reattach.
-Clipboard and audio remain later beta.8 work.
+sign-in screen, so it tests fail-closed WTS selection. In native mode only after
+those checks pass does the same job create and sign in to its stopped linked
+clone, then validate the Slice 4 native Wayland window, guest-only chrome,
+focus, keyboard and pointer input, resize, explicit window state, host close,
+presenter crash recovery, and exact-HWND reattach. Clipboard synchronization
+and audio remain later beta.8 work.
 
-The signed-in matrix has a 30-minute harness budget inside a 45-minute job.
-Each guest, presenter, and Windows-host operation retains its shorter bounded
-timeout; the outer budget only allows the complete sequential matrix and
-cleanup to finish on slower interactive runners.
+The WSLg compatibility matrix has a 30-minute harness budget inside a 45-minute
+job. The native matrix has a 40-minute inner budget inside the existing
+six-hour real-install job. Each login, guest, presenter, compositor, and cleanup
+operation retains a shorter independent bound.
 
-This workflow and both harnesses currently define development evidence; source
-presence alone is not a runtime claim. Tag beta.8 only after the exact candidate
-completes the headless KVM gate followed by the native Linux Wayland GUI gate,
-using the stopped real-install handoff described in the roadmap. The WSLg
-adapter remains a compatibility smoke test and does not satisfy that final gate.
+This workflow and its harnesses define the acceptance mechanism; source presence
+alone is not a runtime claim. Tag beta.8 only after the exact candidate completes
+one successful `Final native Linux Wayland GUI gate` job containing the trusted
+runner, real Windows/KVM, handoff-verification, and real-install GUI steps. The
+WSLg adapter remains a compatibility smoke test and does not satisfy that gate.
 
 Tag only the exact commit named in a successful run. If `master` changes, run
 the gate again for the new commit. The release workflow rejects every new tag
-after the existing beta.1–beta.7 tags unless it finds the successful ordered
-headless and native Linux Wayland jobs for that exact SHA. Until the native
-runner driver and real-install handoff land, this intentionally blocks a
-beta.8 tag even when the WSLg compatibility matrix passes. The workflow summary
-records the validated SHA so the beta release decision is auditable.
+after the existing beta.1–beta.7 tags unless it finds that successful native job
+for the exact SHA. Until an exact candidate passes the provisioned native
+runner, this intentionally blocks a beta.8 tag even when the WSLg compatibility
+matrix passes. The workflow summary records the validated SHA so the beta
+release decision is auditable.
 
 Per-run build output and guest state are deleted after either success or
 failure. The harness records the exact temporary root so the workflow can make

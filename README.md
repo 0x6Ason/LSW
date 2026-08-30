@@ -553,14 +553,14 @@ Windows 11/KVM hardware gate with Microsoft's published ISO SHA-256. The gate
 covers real WinPE DISM, unattended OOBE and cleanup, NetAPI user creation,
 SCM/licensing identity, ConPTY, clone-secret isolation, folder boundaries,
 balloon/TRIM/hibernate/compaction, full shutdown, no-login cold restart, and
-complete runtime cleanup. The GUI matrix is an ordered final stage: it cannot
-start until that full headless KVM job succeeds and it consumes the accepted
-headless evidence from the same exact-SHA run. The current optional development
-adapter uses WSLg because development is taking place on Windows with WSL, but
-the runtime contract is native Wayland. Before beta.8 is released, the final
-matrix must run on a native Linux desktop against an instance handed off from
-the ordinary LSW install path rather than treating a manually provisioned VM as
-the final release boundary.
+complete runtime cleanup. The final GUI matrix runs after those checks in the
+same exact-SHA native Linux/KVM job. The headless phase creates a stopped linked
+clone from its sealed real install; a private headless Sway compositor then
+drives login, window, input, screenshot, crash/reattach, and cleanup checks
+without inheriting WSLg or a signed-in host desktop. The optional Windows-hosted
+WSLg adapter remains development-only. Before beta.8 is released, the exact
+candidate must pass the provisioned native runner; source presence alone is not
+runtime evidence.
 
 See [the operator workflow and evidence contract](docs/WINDOWS_KVM_E2E.md) and
 [the detailed acceptance boundary](docs/BETA.md). Ordinary CI also runs bounded
@@ -614,12 +614,12 @@ targets, Zig, or operating-system media.
 
 ## Current limitations
 
-- Tagged releases still require the dedicated KVM-capable release host. The
+- Tagged releases still require a dedicated KVM-capable release host. The
   guarded workflow resolves and verifies current official media automatically.
-  The optional current beta.8 development matrix uses a separate interactive
-  WSLg adapter with a pre-provisioned exact-candidate guest. Native Linux
-  Wayland coverage and direct handoff from the accepted install are still
-  required before beta.8 release; ordinary GitHub-hosted CI cannot reproduce
+  Its native beta.8 mode and direct real-install linked-clone handoff are
+  implemented but still require a successful exact-candidate run on the
+  `lsw-windows-kvm-gui-e2e` runner. The separate interactive WSLg adapter is
+  optional development evidence; ordinary GitHub-hosted CI cannot reproduce
   either Windows execution boundary.
 - The optional installation and recovery display uses private Unix-socket VNC
   internally; LSW opens it only when requested and does not expose TCP VNC or RDP.

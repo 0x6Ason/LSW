@@ -191,10 +191,12 @@ required. Tags containing a prerelease suffix such as `-beta.4` are published
 as prereleases.
 
 `.github/workflows/windows-kvm-e2e.yml` is the separate beta release gate. It
-can run only by manual dispatch from an exact `master` commit. Its headless job
-uses the explicitly labeled `lsw-windows-kvm-e2e` self-hosted runner. The
-authorization job resolves Microsoft's current English x64 metadata, transfers
-only a short-lived private request, and the KVM runner downloads the ISO
+can run only by manual dispatch from an exact `master` commit. Its ordinary
+headless mode uses the explicitly labeled `lsw-windows-kvm-e2e` self-hosted
+runner. Its beta.8 native mode uses `lsw-windows-kvm-gui-e2e` and runs the same
+headless install followed by the real-install linked-clone GUI matrix in one
+job. The authorization job resolves Microsoft's current English x64 metadata,
+transfers only a short-lived private request, and the KVM runner downloads the ISO
 directly from Microsoft, verifies the published SHA-256, and removes it after
 the run; the ISO payload is never uploaded. The job requires both WinPE
 completion markers and removal
@@ -213,11 +215,13 @@ daemon, and installed guest agent by SHA-256 before the first-HWND matrix. It
 neither weakens nor replaces the no-login contract. See
 [`WINDOWS_KVM_E2E.md`](WINDOWS_KVM_E2E.md) for runner isolation, protected
 environment, media provisioning, and operator instructions. Tagged releases
-after the existing beta.1–beta.7 tags fail closed unless the same workflow run
-has successful ordered headless and native Linux Wayland GUI jobs for the exact
-tag commit. The current release checker intentionally does not accept the WSLg
-compatibility job. WSLg is test infrastructure, not a runtime dependency;
-native Linux Wayland and direct real-install handoff remain beta.8 release work.
+after the existing beta.1–beta.7 tags fail closed unless one successful
+exact-SHA native-runner job contains the trusted-runner check, real Windows
+install, real-install handoff, and native Linux Wayland GUI steps. The current
+release checker intentionally does not accept the WSLg compatibility job. WSLg
+is test infrastructure, not a runtime dependency. The native driver and handoff
+are source-complete but remain runtime-unaccepted until that runner passes the
+exact candidate.
 Manual untagged bundle builds remain available without that hardware
 attestation.
 

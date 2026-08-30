@@ -130,12 +130,13 @@ Any beta.7 tag must point to an exact commit that passed the expanded gate.
 
 Ordinary source and GitHub-hosted runners do not provide a real Windows 11/KVM
 environment. Every new tagged release must pass the guarded workflow on a
-dedicated, isolated Linux x86_64 self-hosted runner. In beta.8 the GUI matrix is
-ordered after the headless KVM job and consumes that job's accepted evidence;
-this does not relax the no-console-user invariant. WSLg is only the current
-opt-in Windows-hosted development adapter. Final beta.8 acceptance additionally
-needs native Linux Wayland coverage and a GUI instance derived from the
-ordinary accepted install path. The beta.6 run covered:
+dedicated, isolated Linux x86_64 self-hosted runner. In beta.8 the native mode
+runs the headless KVM contract first, creates a stopped linked clone from that
+sealed real install, and consumes it in the final native Wayland matrix in the
+same job; this does not relax the no-console-user cold-restart invariant. WSLg
+is only an opt-in Windows-hosted development adapter and is not accepted by the
+release checker. The driver and handoff are implemented, but final beta.8
+acceptance still needs an exact-candidate runtime pass. The beta.6 run covered:
 
 - Microsoft's current published English x64 SHA must exactly match the
   automatically downloaded, per-run read-only ISO.

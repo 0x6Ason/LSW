@@ -53,9 +53,9 @@ jobs:
           esac
 
           # beta.5-beta.7 shipped before the native Linux seamless gate existed.
-          # New tags must prove the ordered headless and native GUI jobs in the
-          # same exact-SHA run. The Windows-hosted WSLg compatibility matrix is
-          # deliberately not accepted as release evidence.
+          # New tags must prove the headless installation and native GUI stages
+          # in one exact-SHA native-runner job. The Windows-hosted WSLg
+          # compatibility matrix is deliberately not accepted as release evidence.
           require_native_gui=1
           case "$GITHUB_REF_NAME:$GITHUB_SHA" in
             v1.0.0-beta.5:ee125c132a9fc07cd8065933e62a85baf31b304e|\
@@ -120,6 +120,12 @@ jobs:
                   select((.labels // []) | index("X64")) |
                   select((.labels // []) | index("lsw-windows-kvm-gui-e2e")) |
                   select(any(.steps[]?;
+                    .name == "Verify the trusted runner and release candidate" and
+                    .conclusion == "success")) |
+                  select(any(.steps[]?;
+                    .name == "Run the real Windows/KVM gate" and
+                    .conclusion == "success")) |
+                  select(any(.steps[]?;
                     .name == "Verify the native Linux Wayland runner and real-install handoff" and
                     .conclusion == "success")) |
                   select(any(.steps[]?;
@@ -127,16 +133,17 @@ jobs:
                     .conclusion == "success")) |
                   .id'
             )
-            if [[ -n "$matching_headless_jobs" && \
-                  ( "$require_native_gui" == 0 || -n "$matching_native_gui_jobs" ) ]]; then
+            if [[ ( "$require_native_gui" == 0 && -n "$matching_headless_jobs" ) || \
+                  ( "$require_native_gui" == 1 && -n "$matching_native_gui_jobs" ) ]]; then
               matched_run=$run_id
               break
             fi
           done <<<"$candidate_runs"
 
           if [[ -z "$matched_run" ]]; then
-            echo "error: completed workflow metadata exists for $GITHUB_SHA, but the required ordered exact-SHA headless and native Linux Wayland GUI jobs did not both pass" >&2
+            echo "error: completed workflow metadata exists for $GITHUB_SHA, but its required exact-SHA Windows/KVM gate did not pass" >&2
             if [[ "$require_native_gui" == 1 ]]; then
+              echo "error: beta.8 requires one native-runner job containing both the real install and final native Wayland GUI stages" >&2
               echo "error: the Windows-hosted WSLg compatibility matrix is development evidence and cannot release beta.8" >&2
             fi
             exit 1
@@ -148,7 +155,7 @@ jobs:
             echo "## Windows/KVM release gate"
             echo
             if [[ "$require_native_gui" == 1 ]]; then
-              echo "Exact commit \`$GITHUB_SHA\` passed the ordered headless KVM and final native Linux Wayland GUI jobs in [run $matched_run]($gate_url)."
+              echo "Exact commit \`$GITHUB_SHA\` passed the real-install KVM and final native Linux Wayland stages in one job in [run $matched_run]($gate_url)."
             else
               echo "Exact legacy commit \`$GITHUB_SHA\` was validated by [run $matched_run]($gate_url)."
             fi

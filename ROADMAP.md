@@ -178,11 +178,15 @@ headless workflows working.
   maximized host surface aspect-fits the exact guest frame with non-interactive
   black letterboxing instead of stretching it. Injected input is released on
   focus loss or disconnect. Rust 1.76 protocol, Windows-agent, and Linux
-  cross-target gates pass. The current signed-in WSLg matrix is an opt-in
+  cross-target gates pass. The final-gate source now runs the complete headless
+  install and GUI matrix in one native Linux/KVM job: the headless phase creates
+  a stopped linked clone from its sealed real install, registers a private test
+  administrator without AutoLogon, and hands that clone to a private headless
+  Sway compositor for login, input, window-state, screenshot, crash/reattach,
+  close, and cleanup checks. The current signed-in WSLg matrix remains an opt-in
   development adapter for the Windows plus WSL workstation, not a user
-  requirement or the final Linux desktop claim. Release validation must run
-  the no-login Windows/KVM job first and the native Linux Wayland GUI matrix
-  last.
+  requirement or the final Linux desktop claim. Slice 4 release acceptance
+  remains open until an exact candidate passes that native runner at runtime.
 
 ### Slice 5: complete HWND and display behavior
 
@@ -224,14 +228,16 @@ headless workflows working.
 - Measure idle companion memory, frame latency, input latency, live-share
   throughput, drag-and-drop resume, and audio stability. Finish the Wayland and
   X11 application matrix and the exact-commit Windows/KVM release gate.
-- Make the GUI matrix the final stage after the complete headless install,
-  OOBE, agent, cold-restart, and cleanup assertions pass. Hand a stopped linked
-  clone of that ordinary LSW-installed image to the GUI stage through a
-  same-host, mode-0700 state boundary; do not use a manually provisioned VM as
-  final release evidence. The GUI stage owns and removes the clone.
-- Add a native Linux Wayland runner and compositor/input/screenshot driver.
-  Keep WSLg as a useful Windows-hosted compatibility smoke test, but never make
-  WSLg, `powershell.exe`, `wsl.exe`, or an `msrdc` HWND a product prerequisite.
+- The final-gate source makes the GUI matrix the last stage after the complete
+  headless install, OOBE, agent, and cold-restart assertions. It hands a stopped
+  linked clone of that ordinary LSW-installed image through a same-host,
+  mode-0700 boundary; the GUI stage owns and removes the clone and its one-shot
+  login secret on every bounded exit path.
+- The native Linux runner contract and private headless-Sway
+  compositor/input/screenshot driver are implemented. Provision and pass the
+  `lsw-windows-kvm-gui-e2e` runner before beta.8 acceptance. Keep WSLg as a
+  useful Windows-hosted compatibility smoke test, but never make WSLg,
+  `powershell.exe`, `wsl.exe`, or an `msrdc` HWND a product prerequisite.
 
 Acceptance requires common development applications, administrator and standard
 account flows, native-sudo detection, real UAC consent and credential prompts,

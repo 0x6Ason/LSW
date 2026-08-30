@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Added the fail-closed beta.8 native GUI release path. One
+  `lsw-windows-kvm-gui-e2e` job now performs the complete real Windows install,
+  creates a stopped linked clone with an ephemeral administrator and no
+  AutoLogon, signs in through QEMU's private Unix-socket recovery display, and
+  drives the first-HWND matrix under a private native headless Sway compositor.
+  It verifies rendering, left/right/middle pointer input, File and context menus,
+  an owned modal, keyboard shortcuts, focus, guest-caption move, resize,
+  maximize/restore, host close, and exact-HWND presenter reattach, then removes
+  the guest fixture, login secret, VM, and state. The release checker
+  requires all headless and native steps in that one exact-SHA job; a runtime
+  pass is still required before beta.8 can be tagged.
 - Made native Linux Wayland the seamless-GUI product contract. The
   Windows-hosted WSLg matrix is now an explicitly development-only
   compatibility stage ordered after the complete headless Windows/KVM gate;

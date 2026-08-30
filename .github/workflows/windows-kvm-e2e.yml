@@ -14,6 +14,11 @@ on:
         description: Type RUN-WINDOWS-KVM-E2E to use the dedicated runner
         required: true
         type: string
+      run_native_wayland_gate:
+        description: Run the final real-install GUI matrix on native Linux Wayland
+        required: false
+        default: false
+        type: boolean
       run_wslg_compatibility:
         description: Also run the Windows-hosted WSLg development matrix after KVM
         required: false
@@ -38,6 +43,8 @@ jobs:
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
           CONFIRMATION: ${{ inputs.confirmation }}
+          RUN_NATIVE_WAYLAND_GATE: ${{ inputs.run_native_wayland_gate }}
+          RUN_WSLG_COMPATIBILITY: ${{ inputs.run_wslg_compatibility }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REPOSITORY,,}" != 0x6ason/lsw ]]; then
@@ -55,6 +62,11 @@ jobs:
           if [[ ! "$CANDIDATE_SHA" =~ ^[0-9a-fA-F]{40}$ || \
                 "${CANDIDATE_SHA,,}" != "$GITHUB_SHA" ]]; then
             echo "error: candidate_sha must exactly match the selected master revision" >&2
+            exit 1
+          fi
+          if [[ "$RUN_NATIVE_WAYLAND_GATE" == true && \
+                "$RUN_WSLG_COMPATIBILITY" == true ]]; then
+            echo "error: the final native gate and development-only WSLg matrix are mutually exclusive" >&2
             exit 1
           fi
 
@@ -120,14 +132,14 @@ jobs:
           retention-days: 1
 
   windows-kvm-e2e:
-    name: Windows 11 headless WinPE, agent, ConPTY, and cold restart
+    name: ${{ inputs.run_native_wayland_gate && 'Final native Linux Wayland GUI gate' || 'Windows 11 headless WinPE, agent, ConPTY, and cold restart' }}
     needs: [authorize, resolve-media]
     environment: windows-kvm-e2e
     runs-on:
       - self-hosted
       - Linux
       - X64
-      - lsw-windows-kvm-e2e
+      - ${{ inputs.run_native_wayland_gate && 'lsw-windows-kvm-gui-e2e' || 'lsw-windows-kvm-e2e' }}
     timeout-minutes: 360
     env:
       CARGO_TERM_COLOR: always
@@ -139,7 +151,10 @@ jobs:
       LSW_E2E_TIMEOUT_SECONDS: "18000"
       LSW_E2E_NO_VIEWER: "1"
       LSW_E2E_KEEP_STATE: "0"
+      LSW_E2E_GUI_HANDOFF: ${{ inputs.run_native_wayland_gate && '1' || '0' }}
+      LSW_E2E_CANDIDATE_SHA: ${{ github.sha }}
       LSW_E2E_MIN_FREE_GIB: "160"
+      LSW_NATIVE_GUI_E2E_TIMEOUT_SECONDS: "2400"
     steps:
       - name: Initialize isolated build paths
         shell: bash
@@ -233,6 +248,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_SHA: ${{ inputs.candidate_sha }}
+          RUN_NATIVE_WAYLAND_GATE: ${{ inputs.run_native_wayland_gate }}
         run: |
           set -euo pipefail
 
@@ -264,6 +280,19 @@ jobs:
               exit 1
             fi
           done
+          if [[ "$RUN_NATIVE_WAYLAND_GATE" == true ]]; then
+            if grep -qi microsoft /proc/sys/kernel/osrelease || \
+               [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+              echo "error: the final GUI gate must run on native Linux, not WSLg" >&2
+              exit 1
+            fi
+            for command in convert grim identify jq sway swaymsg wtype; do
+              if ! command -v "$command" >/dev/null 2>&1; then
+                echo "error: required native Wayland runner command was not found: $command" >&2
+                exit 1
+              fi
+            done
+          fi
           if ! rustup target list --installed | \
              grep -Fx x86_64-pc-windows-gnu >/dev/null; then
             echo "error: Rust 1.76.0 is missing x86_64-pc-windows-gnu" >&2
@@ -433,6 +462,64 @@ jobs:
           LSW_E2E_ACTIVE_ROOT_FILE: ${{ env.LSW_BUILD_ROOT }}/active-e2e-root
         run: scripts/check-windows-kvm-e2e.sh
 
+      - name: Verify the native Linux Wayland runner and real-install handoff
+        if: ${{ inputs.run_native_wayland_gate }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -qi microsoft /proc/sys/kernel/osrelease || \
+             [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+            echo "error: WSLg compatibility evidence cannot satisfy the final GUI gate" >&2
+            exit 1
+          fi
+          attestation="$LSW_BUILD_ROOT/artifacts/attestation.env"
+          active_root_file="$LSW_BUILD_ROOT/active-e2e-root"
+          if [[ -L "$attestation" || ! -f "$attestation" || \
+                "$(stat -c %s -- "$attestation")" -gt 16384 ]]; then
+            echo "error: the native stage requires bounded headless evidence from this job" >&2
+            exit 1
+          fi
+          field() {
+            local key=$1
+            awk -F= -v key="$key" '
+              $1 == key { count++; value=substr($0, length($1) + 2) }
+              END { if (count == 1 && value != "") print value; else exit 1 }
+            ' "$attestation"
+          }
+          [[ "$(field result)" == success && \
+              "$(field commit)" == "$GITHUB_SHA" && \
+              "$(field gui_handoff_requested)" == 1 && \
+              "$(field gui_handoff_ready)" == 1 ]] || {
+            echo "error: headless KVM did not produce the exact stopped GUI handoff" >&2
+            exit 1
+          }
+          if [[ -L "$active_root_file" || ! -f "$active_root_file" || \
+                "$(stat -c %a -- "$active_root_file")" != 600 || \
+                "$(awk 'END { print NR }' "$active_root_file")" != 1 ]]; then
+            echo "error: the GUI handoff root record is not one private regular file" >&2
+            exit 1
+          fi
+          handoff_root=$(awk 'NR == 1 { print; exit }' "$active_root_file")
+          if [[ ! -f "$handoff_root/gui-handoff.env" || \
+                "$(stat -c %a -- "$handoff_root/gui-handoff.env")" != 600 ]]; then
+            echo "error: the real-install linked-clone handoff metadata is missing" >&2
+            exit 1
+          fi
+
+      - name: Run the real-install seamless GUI matrix
+        if: ${{ inputs.run_native_wayland_gate }}
+        shell: bash
+        env:
+          LSW_E2E_LSW: ${{ env.CARGO_TARGET_DIR }}/release/lsw
+          LSW_E2E_LSWD: ${{ env.CARGO_TARGET_DIR }}/release/lswd
+          LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
+          LSW_E2E_ARTIFACT_DIR: ${{ env.LSW_BUILD_ROOT }}/artifacts
+          LSW_E2E_ACTIVE_ROOT_FILE: ${{ env.LSW_BUILD_ROOT }}/active-e2e-root
+        run: |
+          set -euo pipefail
+          scripts/check-windows-native-wayland-e2e.sh 2>&1 | \
+            tee "$LSW_E2E_ARTIFACT_DIR/native-wayland-e2e.log"
+
       - name: Remove local E2E state
         if: ${{ always() && env.LSW_BUILD_ROOT != '' }}
         shell: bash
@@ -465,6 +552,15 @@ jobs:
             exit 1
           fi
           if [[ -d "$recorded_root" ]]; then
+            while IFS= read -r qemu_pid_file; do
+              qemu_pid=$(awk 'NR == 1 { print $1; exit }' "$qemu_pid_file")
+              if [[ "$qemu_pid" =~ ^[1-9][0-9]*$ ]] && \
+                 kill -0 "$qemu_pid" 2>/dev/null; then
+                echo "error: refusing to delete state while test QEMU process $qemu_pid is alive" >&2
+                exit 1
+              fi
+            done < <(find "$recorded_root/state/instances" -mindepth 3 -maxdepth 3 \
+              -type f -path '*/run/qemu.pid' -print 2>/dev/null || true)
             chmod -R u+rwX -- "$recorded_root" || true
             find "$recorded_root" -depth -delete
           fi
@@ -485,11 +581,15 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## Headless Windows/KVM gate passed"
+            if [[ "${{ inputs.run_native_wayland_gate }}" == true ]]; then
+              echo "## Final native Linux Wayland GUI gate passed"
+            else
+              echo "## Headless Windows/KVM gate passed"
+            fi
             echo
             echo "Validated commit: \`$GITHUB_SHA\`"
             echo
-            echo "Only redacted gate evidence is retained; the short-lived media request, ISO, and VM state are deleted after the run."
+            echo "Only redacted gate evidence is retained; the short-lived media request, ISO, VM state, and private login secret are deleted after the run."
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Remove local build output
@@ -510,7 +610,7 @@ jobs:
   windows-seamless-e2e:
     name: Windows-hosted WSLg compatibility matrix
     needs: windows-kvm-e2e
-    if: ${{ inputs.run_wslg_compatibility }}
+    if: ${{ inputs.run_wslg_compatibility && !inputs.run_native_wayland_gate }}
     environment: windows-seamless-e2e
     runs-on:
       - self-hosted

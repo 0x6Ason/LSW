@@ -17,6 +17,8 @@ root_base=${LSW_E2E_ROOT_BASE:-/tmp}
 artifact_dir=${LSW_E2E_ARTIFACT_DIR:-}
 active_root_file=${LSW_E2E_ACTIVE_ROOT_FILE:-}
 keep_state=${LSW_E2E_KEEP_STATE:-0}
+gui_handoff=${LSW_E2E_GUI_HANDOFF:-0}
+candidate_sha=${LSW_E2E_CANDIDATE_SHA:-${GITHUB_SHA:-}}
 expected_iso_sha256=${LSW_WINDOWS_ISO_SHA256:-}
 e2e_no_viewer=${LSW_E2E_NO_VIEWER:-1}
 
@@ -59,6 +61,19 @@ case "$keep_state" in
         exit 1
         ;;
 esac
+case "$gui_handoff" in
+    0|1) ;;
+    *)
+        echo "error: LSW_E2E_GUI_HANDOFF must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+if [ "$gui_handoff" = 1 ] \
+    && ! printf '%s\n' "$candidate_sha" | grep -Eq '^[0-9a-f]{40}$'
+then
+    echo "error: GUI handoff requires an exact lowercase candidate SHA" >&2
+    exit 1
+fi
 case "$e2e_no_viewer" in
     0|1) ;;
     *)
@@ -161,6 +176,8 @@ daemon_keepalive_pid=
 viewer_pid=
 sync_pid=
 artifacts_collected=0
+gui_handoff_complete=0
+gui_instance=none
 guest_build=unknown
 guest_edition=unknown
 setup_account_removed=unknown
@@ -351,6 +368,9 @@ collect_e2e_artifacts() {
         printf 'detached_run_verified=%s\n' "$detached_run_verified"
         printf 'recursive_transfer_verified=%s\n' "$recursive_transfer_verified"
         printf 'watch_sync_verified=%s\n' "$watch_sync_verified"
+        printf 'gui_handoff_requested=%s\n' "$gui_handoff"
+        printf 'gui_handoff_ready=%s\n' "$gui_handoff_complete"
+        printf 'gui_handoff_instance=%s\n' "$gui_instance"
         printf 'iso_sha256=%s\n' "$iso_sha256"
         printf 'official_iso_sha256=%s\n' "$official_iso_sha256"
         printf 'license_status=%s\n' "$license_status"
@@ -641,6 +661,93 @@ read_agent_service_identity() {
     fi
 }
 
+prepare_gui_handoff() {
+    gui_instance="${instance}-gui"
+    gui_instance_directory="$LSW_STATE_DIR/instances/$gui_instance"
+    if [ -e "$gui_instance_directory" ] || [ -L "$gui_instance_directory" ]; then
+        echo "error: refusing to replace an existing GUI handoff instance" >&2
+        return 1
+    fi
+
+    "$lsw" clone "$instance" "$gui_instance"
+    gui_login_secret="$e2e_root/gui-login.secret"
+    gui_handoff_metadata="$e2e_root/gui-handoff.env"
+    if [ -e "$gui_login_secret" ] || [ -L "$gui_login_secret" ] \
+        || [ -e "$gui_handoff_metadata" ] || [ -L "$gui_handoff_metadata" ]
+    then
+        echo "error: refusing to replace GUI handoff metadata" >&2
+        return 1
+    fi
+
+    gui_password="Lsw!$(tr -d '-' </proc/sys/kernel/random/uuid)9a"
+    (umask 077; printf '%s\n' "$gui_password" >"$gui_login_secret")
+    if ! printf '%s\n' "$gui_password" \
+        | timeout "${agent_boot_timeout_seconds}s" "$lsw" user setup "$gui_instance" \
+            --username lsw-e2e-gui --password-stdin --administrator
+    then
+        gui_password=
+        unset gui_password
+        echo "error: could not register the GUI handoff desktop user" >&2
+        return 1
+    fi
+    gui_password=
+    unset gui_password
+
+    # PowerShell expands its own account and Winlogon variables in the guest.
+    # shellcheck disable=SC2016
+    gui_user_output=$(timeout 60s "$lsw" exec "$gui_instance" -- \
+        powershell.exe -NoLogo -NoProfile -NonInteractive -Command \
+        '$ErrorActionPreference="Stop"; $User=Get-LocalUser -Name "lsw-e2e-gui"; if (-not $User.Enabled) { exit 91 }; $Administrators=Get-LocalGroup -SID "S-1-5-32-544"; if (-not (Get-LocalGroupMember -Group $Administrators | Where-Object { $_.SID -eq $User.SID })) { exit 92 }; $Interactive=[string](Get-CimInstance -ClassName Win32_ComputerSystem).UserName; if (-not [string]::IsNullOrWhiteSpace($Interactive)) { exit 93 }; $Winlogon=Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"; if ([string]$Winlogon.AutoAdminLogon -eq "1") { exit 94 }; $StoredPassword=$Winlogon.PSObject.Properties["DefaultPassword"]; if ($null -ne $StoredPassword -and -not [string]::IsNullOrEmpty([string]$StoredPassword.Value)) { exit 95 }; [Console]::Out.Write("LSW_GUI_HANDOFF_USER_READY")')
+    if [ "$gui_user_output" != LSW_GUI_HANDOFF_USER_READY ]; then
+        echo "error: GUI handoff user is missing, non-administrative, signed in, or configured for AutoLogon" >&2
+        return 1
+    fi
+
+    gui_qemu_pid=$(awk 'NR == 1 { print $1 }' \
+        "$gui_instance_directory/run/qemu.pid")
+    gui_agent_port=$(
+        "$lsw" show "$gui_instance" |
+            awk -v prefix='agent host port:      ' \
+                'index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }'
+    )
+    case "$gui_qemu_pid:$gui_agent_port" in
+        *[!0-9:]*|:*|*:)
+            echo "error: GUI handoff runtime identity is invalid" >&2
+            return 1
+            ;;
+    esac
+    if [ "$gui_qemu_pid" -eq 0 ] || [ "$gui_agent_port" -eq 0 ] \
+        || [ "$gui_agent_port" -gt 65535 ]
+    then
+        echo "error: GUI handoff runtime identity is out of range" >&2
+        return 1
+    fi
+    "$lsw" shutdown "$gui_instance"
+    assert_stopped_runtime_released "$gui_qemu_pid" "$gui_agent_port" "$gui_instance"
+    "$lsw" use "$gui_instance"
+    "$lsw" remove "$instance"
+    if [ -e "$LSW_STATE_DIR/instances/$instance" ]; then
+        echo "error: real-install source remained after GUI clone handoff" >&2
+        return 1
+    fi
+
+    gui_handoff_tmp="$gui_handoff_metadata.tmp-$$"
+    {
+        printf 'version=1\n'
+        printf 'candidate_sha=%s\n' "$candidate_sha"
+        printf 'source=real-install-linked-clone\n'
+        printf 'state_dir=%s\n' "$LSW_STATE_DIR"
+        printf 'instance=%s\n' "$gui_instance"
+        printf 'login_secret=%s\n' "$gui_login_secret"
+        printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
+        printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
+        printf 'agent_sha256=%s\n' "$(sha256sum "$agent" | awk '{ print $1 }')"
+    } >"$gui_handoff_tmp"
+    chmod 600 "$gui_handoff_tmp"
+    mv "$gui_handoff_tmp" "$gui_handoff_metadata"
+    gui_handoff_complete=1
+}
+
 cleanup_e2e() {
     status=$?
     trap - EXIT HUP INT TERM
@@ -651,6 +758,11 @@ cleanup_e2e() {
     fi
 
     if [ -n "$daemon_pid" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+        if [ "$gui_instance" != none ] \
+            && [ -f "$LSW_STATE_DIR/instances/$gui_instance/instance.lsw" ]
+        then
+            timeout 30s "$lsw" stop "$gui_instance" --force >/dev/null 2>&1 || :
+        fi
         timeout 30s "$lsw" stop "$instance" --force >/dev/null 2>&1 || :
     fi
 
@@ -669,7 +781,11 @@ cleanup_e2e() {
     if [ "$cleanup_failed" -ne 0 ] && [ "$status" -eq 0 ]; then
         status=1
     fi
-    if [ "$keep_state" = 1 ] && [ "$status" -ne 0 ]; then
+    if [ "$gui_handoff" = 1 ] && [ "$status" -eq 0 ] \
+        && [ "$gui_handoff_complete" -eq 1 ]
+    then
+        echo "LSW Windows/KVM E2E handed its stopped GUI clone to $e2e_root"
+    elif [ "$keep_state" = 1 ] && [ "$status" -ne 0 ]; then
         echo "LSW Windows/KVM E2E state retained by explicit request at $e2e_root" >&2
     else
         rm -rf -- "$e2e_root"
@@ -1854,12 +1970,20 @@ if [ -n "$artifact_dir" ]; then
 else
     "$lsw" diagnose "$instance" --bundle --output "$e2e_root/diagnose.tar.gz"
 fi
-"$lsw" remove "$instance"
-if [ -e "$LSW_STATE_DIR/instances/$instance" ]; then
-    echo "error: instance directory remained after lsw remove" >&2
-    exit 1
+if [ "$gui_handoff" = 1 ]; then
+    prepare_gui_handoff
+else
+    "$lsw" remove "$instance"
+    if [ -e "$LSW_STATE_DIR/instances/$instance" ]; then
+        echo "error: instance directory remained after lsw remove" >&2
+        exit 1
+    fi
 fi
 terminate_daemon
 collect_e2e_artifacts success
 
-echo "Windows/KVM E2E passed: WinPE -> unattended OOBE -> LSWAgent service -> ConPTY -> shutdown -> cold restart -> cleanup."
+if [ "$gui_handoff" = 1 ]; then
+    echo "Windows/KVM E2E passed and produced a stopped real-install linked clone for native GUI validation."
+else
+    echo "Windows/KVM E2E passed: WinPE -> unattended OOBE -> LSWAgent service -> ConPTY -> shutdown -> cold restart -> cleanup."
+fi
