@@ -147,6 +147,7 @@ if ($SettleSeconds -ne 0) {
     Start-Sleep -Seconds $SettleSeconds
 }
 $OperatingSystem = Get-CimInstance Win32_OperatingSystem
+$ComputerSystem = Get-CimInstance Win32_ComputerSystem
 $SystemVolume = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
 $Processes = @(Get-Process | Where-Object { $_.Id -ne 0 })
 $CommittedBytes = [uint64](Get-Counter '\Memory\Committed Bytes').CounterSamples[0].CookedValue
@@ -157,6 +158,9 @@ $Result = [ordered]@{
     profile = 'slim'
     revision = [string]$Report.revision
     windows_build = [string]$OperatingSystem.BuildNumber
+    edition = [string](Get-ItemProperty -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID
+    last_boot_utc = $OperatingSystem.LastBootUpTime.ToUniversalTime().ToString('o')
+    total_physical_bytes = [uint64]$ComputerSystem.TotalPhysicalMemory
     process_count = $Processes.Count
     committed_bytes = $CommittedBytes
     working_set_bytes = $WorkingSetBytes
@@ -168,6 +172,7 @@ $Result = [ordered]@{
     targeted_appx_count = $AppxTargets.Count
     targeted_service_count = $ServiceTargets.Count
     policy_count = $MachinePolicies.Count + $DefaultUserPolicies.Count
+    report_sha256 = (Get-FileHash -LiteralPath (Join-Path $ReportRoot 'report.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     outcome = 'passed'
 }
 [Console]::Out.Write(($Result | ConvertTo-Json -Depth 8 -Compress))

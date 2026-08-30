@@ -5,10 +5,10 @@ use crate::{CustomizationPlan, ProductUninstaller, RegistryHive, Result, Windows
 pub(crate) fn profile_script(profile: WindowsProfile, offline_marker_name: &str) -> Result<String> {
     let plan = CustomizationPlan::for_profile(profile)?;
     if profile == WindowsProfile::Vanilla || profile == WindowsProfile::Secure {
-        return Ok(format!(
-            "$ErrorActionPreference = 'Stop'\r\nWrite-Host 'LSW {} leaves the Windows image unchanged.'\r\n",
-            plan.revision
-        ));
+        return Ok(VANILLA_PROFILE_SCRIPT
+            .replace("__LSW_PROFILE__", &profile.to_string())
+            .replace("__LSW_PROFILE_REVISION__", &plan.revision)
+            .replace('\n', "\r\n"));
     }
 
     let script = SLIM_PROFILE_SCRIPT
@@ -189,6 +189,21 @@ function Get-LswStartupInventory {
         }
     }
     @($Inventory)
+}
+
+function Get-LswCompleteFeatureInventory {
+    @(Get-WindowsOptionalFeature -Online | Sort-Object FeatureName |
+        Select-Object FeatureName, State)
+}
+
+function Get-LswCompleteServiceInventory {
+    @(Get-CimInstance Win32_Service | Sort-Object Name |
+        Select-Object Name, State, StartMode)
+}
+
+function Get-LswCompleteStartupInventory {
+    @(Get-CimInstance Win32_StartupCommand | Sort-Object Name, Location |
+        Select-Object Name, Command, Location, User)
 }
 
 function Test-LswInstalledAppMatch {
@@ -414,6 +429,9 @@ $After = [pscustomobject]@{
     optional_features = @(Get-LswFeatureInventory)
     services = @(Get-LswServiceInventory)
     startup_entries = @(Get-LswStartupInventory)
+    all_optional_features = @(Get-LswCompleteFeatureInventory)
+    all_services = @(Get-LswCompleteServiceInventory)
+    all_startup_entries = @(Get-LswCompleteStartupInventory)
 }
 $After | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $ReportRoot 'after.json') -Encoding UTF8
 $Report = [pscustomobject]@{
@@ -438,6 +456,66 @@ $Report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $ReportR
 if ($null -ne $Failure) {
     throw $Failure
 }
+"#;
+
+const VANILLA_PROFILE_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$ProfileName = '__LSW_PROFILE__'
+$ProfileRevision = '__LSW_PROFILE_REVISION__'
+$ReportRoot = Join-Path $env:ProgramData 'LSW\profile'
+New-Item -ItemType Directory -Path $ReportRoot -Force | Out-Null
+
+function Get-LswVanillaInventory {
+    [pscustomobject]@{
+        provisioned_appx = @(Get-AppxProvisionedPackage -Online |
+            Sort-Object DisplayName, PackageName |
+            Select-Object DisplayName, PackageName)
+        installed_appx = @(Get-AppxPackage -AllUsers |
+            Sort-Object Name, PackageFullName |
+            Select-Object Name, PackageFullName, PackageFamilyName, NonRemovable)
+        all_optional_features = @(Get-WindowsOptionalFeature -Online |
+            Sort-Object FeatureName |
+            Select-Object FeatureName, State)
+        all_services = @(Get-CimInstance Win32_Service |
+            Sort-Object Name |
+            Select-Object Name, State, StartMode)
+        all_startup_entries = @(Get-CimInstance Win32_StartupCommand |
+            Sort-Object Name, Location |
+            Select-Object Name, Command, Location, User)
+    }
+}
+
+$Inventory = Get-LswVanillaInventory
+$Inventory | ConvertTo-Json -Depth 8 |
+    Set-Content -LiteralPath (Join-Path $ReportRoot 'before.json') -Encoding UTF8
+$Inventory | ConvertTo-Json -Depth 8 |
+    Set-Content -LiteralPath (Join-Path $ReportRoot 'after.json') -Encoding UTF8
+$Report = [pscustomobject]@{
+    schema_version = 2
+    profile = $ProfileName
+    revision = $ProfileRevision
+    applied_at_utc = [DateTime]::UtcNow.ToString('o')
+    offline_marker = $false
+    outcome = 'success'
+    targets = [pscustomobject]@{
+        appx = @()
+        optional_features = @()
+        services = @()
+        machine_policies = @()
+        default_user_policies = @()
+        uninstall_onedrive = $false
+        compact_os = $false
+    }
+    operations = @([pscustomobject]@{
+        kind = 'profile'
+        target = $ProfileRevision
+        result = 'unchanged'
+        detail = 'inventory only; no Windows component or policy mutation'
+    })
+}
+$Report | ConvertTo-Json -Depth 8 |
+    Set-Content -LiteralPath (Join-Path $ReportRoot 'report.json') -Encoding UTF8
+Write-Host ('LSW ' + $ProfileRevision + ' leaves the Windows image unchanged.')
 "#;
 
 #[cfg(test)]
@@ -473,6 +551,19 @@ mod tests {
     fn slim_script_parses_with_inbox_windows_powershell() {
         let script = profile_script(WindowsProfile::Slim, "offline.marker")
             .expect("slim script should generate");
+        assert_powershell_parses(&script);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn vanilla_script_parses_with_inbox_windows_powershell() {
+        let script = profile_script(WindowsProfile::Vanilla, "offline.marker")
+            .expect("vanilla script should generate");
+        assert_powershell_parses(&script);
+    }
+
+    #[cfg(windows)]
+    fn assert_powershell_parses(script: &str) {
         let mut child = Command::new("powershell.exe")
             .args([
                 "-NoLogo",
@@ -515,5 +606,8 @@ mod tests {
         ] {
             assert!(!script.contains(forbidden));
         }
+        assert!(script.contains("inventory only; no Windows component or policy mutation"));
+        assert!(script.contains("all_optional_features"));
+        assert!(script.contains("report.json"));
     }
 }

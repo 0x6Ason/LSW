@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added the final-native same-ISO profile comparison gate. The ordinary slim
+  install and a separate zero-mutation vanilla install now each publish three
+  settled cold-boot samples bound to one Windows build, edition, memory size,
+  immutable profile report, and exact ISO SHA-256. The gate fails closed unless
+  slim has at least 10 fewer processes, 256 MiB less committed memory, and
+  3 GiB less guest-used system-volume space. It records post-TRIM host
+  allocation without turning that diagnostic into an unsupported threshold,
+  removes the vanilla instance, and leaves the real-install native GUI matrix
+  as the final release step. Source fixtures pass; an exact-candidate real KVM
+  run is still required before Slice 4.5 can be accepted.
 - Replaced the conservative default image recipe with the typed `slim-v2`
   contract. WinPE now inventories and removes 53 exact provisioned AppX
   identities plus the Recall payload, re-inventories, persists its before/after
@@ -11,8 +21,7 @@
   readback, and writes a machine-readable report. Protected servicing,
   development, Store/winget/WebView2, Defender, UAC, input, recovery, and shell
   components are rejected at manifest-validation time. The exact Windows/KVM
-  gate now audits that report and captures three settled-boot resource samples;
-  the same-ISO vanilla comparison is still required before Slice 4.5 acceptance.
+  gate now audits that report and captures three settled-boot resource samples.
 - Extracted the pseudo-terminal ConPTY driver from the oversized Windows/KVM
   shell scenario into a focused Python fixture and moved `lsw profile` into its
   own command module. The gate script and CLI entry point both shrank while the

@@ -371,7 +371,8 @@ jobs:
           fi
 
           stale_e2e_root=$(find "$canonical_e2e_root" -mindepth 1 -maxdepth 1 \
-            -type d -name 'lsw-e2e.??????' -print -quit)
+            \( -name 'lsw-e2e.??????' -o -name 'lsw-profile.??????' \) \
+            -print -quit)
           if [[ -n "$stale_e2e_root" ]]; then
             echo "error: stale Windows/KVM state must be removed before starting another gate: $stale_e2e_root" >&2
             exit 1
@@ -507,6 +508,31 @@ jobs:
             exit 1
           fi
 
+      - name: Compare same-ISO vanilla and slim profiles
+        if: ${{ inputs.run_native_wayland_gate }}
+        shell: bash
+        env:
+          LSW_E2E_LSW: ${{ env.CARGO_TARGET_DIR }}/release/lsw
+          LSW_E2E_LSWD: ${{ env.CARGO_TARGET_DIR }}/release/lswd
+          LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
+          LSW_E2E_ARTIFACT_DIR: ${{ env.LSW_BUILD_ROOT }}/artifacts
+          LSW_PROFILE_COMPARISON_ACTIVE_ROOT_FILE: ${{ env.LSW_BUILD_ROOT }}/active-profile-comparison-root
+          LSW_SLIM_PROFILE_AUDIT_DIR: ${{ env.LSW_BUILD_ROOT }}/artifacts/profile-audits
+        run: |
+          set -euo pipefail
+          attestation="$LSW_E2E_ARTIFACT_DIR/attestation.env"
+          slim_host_bytes=$(awk -F= '
+            $1 == "profile_host_allocated_bytes_after_trim" {
+              count++; value=$2
+            }
+            END {
+              if (count == 1 && value ~ /^[0-9]+$/) print value
+              else exit 1
+            }
+          ' "$attestation")
+          export LSW_SLIM_HOST_ALLOCATED_BYTES="$slim_host_bytes"
+          scripts/check-windows-profile-comparison.sh
+
       - name: Run the real-install seamless GUI matrix
         if: ${{ inputs.run_native_wayland_gate }}
         shell: bash
@@ -527,46 +553,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          active_root_file="$LSW_BUILD_ROOT/active-e2e-root"
-          if [[ ! -e "$active_root_file" ]]; then
-            exit 0
-          fi
-          if [[ -L "$active_root_file" || ! -f "$active_root_file" ]]; then
-            echo "error: refusing an invalid active E2E root record" >&2
+          cleanup_failed=0
+          for active_root_file in \
+            "$LSW_BUILD_ROOT/active-profile-comparison-root" \
+            "$LSW_BUILD_ROOT/active-e2e-root"
+          do
+            scripts/cleanup-windows-e2e-root.sh \
+              "$LSW_E2E_ROOT_BASE" "$active_root_file" || cleanup_failed=1
+          done
+          if (( cleanup_failed != 0 )); then
             exit 1
           fi
-          mapfile -t recorded_roots <"$active_root_file"
-          if (( ${#recorded_roots[@]} != 1 )); then
-            echo "error: refusing an ambiguous active E2E root record" >&2
-            exit 1
-          fi
-          canonical_e2e_root=$(realpath -e -- "$LSW_E2E_ROOT_BASE")
-          recorded_root=${recorded_roots[0]}
-          recorded_parent=${recorded_root%/*}
-          recorded_name=${recorded_root##*/}
-          if [[ "$recorded_parent" != "$canonical_e2e_root" || \
-                ! "$recorded_name" =~ ^lsw-e2e\.[[:alnum:]]{6}$ ]]; then
-            echo "error: refusing cleanup of an unexpected E2E path: $recorded_root" >&2
-            exit 1
-          fi
-          if [[ -L "$recorded_root" || ( -e "$recorded_root" && ! -d "$recorded_root" ) ]]; then
-            echo "error: refusing cleanup of a non-directory E2E path: $recorded_root" >&2
-            exit 1
-          fi
-          if [[ -d "$recorded_root" ]]; then
-            while IFS= read -r qemu_pid_file; do
-              qemu_pid=$(awk 'NR == 1 { print $1; exit }' "$qemu_pid_file")
-              if [[ "$qemu_pid" =~ ^[1-9][0-9]*$ ]] && \
-                 kill -0 "$qemu_pid" 2>/dev/null; then
-                echo "error: refusing to delete state while test QEMU process $qemu_pid is alive" >&2
-                exit 1
-              fi
-            done < <(find "$recorded_root/state/instances" -mindepth 3 -maxdepth 3 \
-              -type f -path '*/run/qemu.pid' -print 2>/dev/null || true)
-            chmod -R u+rwX -- "$recorded_root" || true
-            find "$recorded_root" -depth -delete
-          fi
-          rm -f -- "$active_root_file"
 
       - name: Upload redacted gate evidence
         if: ${{ always() && env.LSW_BUILD_ROOT != '' }}

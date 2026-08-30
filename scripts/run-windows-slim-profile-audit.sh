@@ -85,6 +85,7 @@ fi
 python3 - "$output_tmp" "$phase" <<'PY'
 import json
 from pathlib import Path
+import re
 import sys
 
 path = Path(sys.argv[1])
@@ -99,6 +100,12 @@ if result.get("profile") != "slim" or result.get("revision") != "slim-v2":
     raise SystemExit("error: slim-profile audit identity is not slim-v2")
 if result.get("outcome") != "passed":
     raise SystemExit("error: slim-profile audit did not pass")
+if not isinstance(result.get("edition"), str) or not result["edition"]:
+    raise SystemExit("error: slim-profile audit has no Windows edition")
+if not isinstance(result.get("last_boot_utc"), str) or not result["last_boot_utc"]:
+    raise SystemExit("error: slim-profile audit has no cold-boot identity")
+if not re.fullmatch(r"[0-9a-f]{64}", str(result.get("report_sha256", ""))):
+    raise SystemExit("error: slim-profile audit has no exact profile-report hash")
 for field in (
     "process_count",
     "committed_bytes",
@@ -109,6 +116,7 @@ for field in (
     "targeted_appx_count",
     "targeted_service_count",
     "policy_count",
+    "total_physical_bytes",
 ):
     value = result.get(field)
     if not isinstance(value, int) or value < 0:
@@ -117,6 +125,8 @@ if result["targeted_appx_count"] < 40 or result["targeted_service_count"] < 10:
     raise SystemExit("error: slim-profile audit target set is unexpectedly small")
 if result["policy_count"] < 20:
     raise SystemExit("error: slim-profile audit policy set is unexpectedly small")
+if result["total_physical_bytes"] == 0:
+    raise SystemExit("error: slim-profile audit reports no physical memory")
 print(
     f"Slim-v2 {phase} audit passed: {result['process_count']} processes, "
     f"{result['committed_bytes']} committed bytes, "

@@ -11,9 +11,11 @@ This document describes the target state and records incremental acceptance.
 Protocol, host-client, native-presenter, and typed profile extraction are
 implemented. `slim-v2` is now the source and sealed-image preparation identity:
 it performs bounded offline and first-boot mutation with persistent audit
-evidence. That implementation is not yet a runtime acceptance claim; the
-same-ISO `vanilla` comparison and preservation matrix below must pass on the
-real Windows/KVM runner before Slice 4.5 closes.
+evidence. The final native workflow now installs zero-mutation `vanilla` from
+the same exact ISO, measures three cold boots for each profile, and fails closed
+on the numerical thresholds below before running the GUI matrix last. This is
+not yet a runtime acceptance claim: that comparison and the preservation
+matrix must pass on the real Windows/KVM runner before Slice 4.5 closes.
 
 ## Measured starting point
 
@@ -250,7 +252,8 @@ The comparison report becomes a release artifact. If a Windows build renames a
 target or changes a preservation dependency, the gate fails for review instead
 of silently claiming a slim image.
 
-Current status: the `slim-v2` mutation/audit path and three-boot slim verifier
-are source-complete and locally parsed/tested. The numerical vanilla-versus-slim
-thresholds and network-dependent Store/Update preservation probes remain an
-unpassed real-run gate, so they must not be described as achieved.
+Current status: the `slim-v2` mutation/audit path, inventory-only `vanilla-v2`
+report, three-boot verifiers, exact-identity comparison, thresholds, and bounded
+cleanup are source-complete and locally parsed/tested. The numerical comparison
+and network-dependent Store/Update preservation probes remain an unpassed
+real-run gate, so they must not be described as achieved.

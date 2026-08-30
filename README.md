@@ -449,8 +449,10 @@ experimental `shell-light` profile remains beta.9 work; user-versioned custom
 profiles are not part of the current release.
 
 The broader recipe is implemented and source-tested on `master`, but its
-same-ISO vanilla-versus-slim resource thresholds are not a release claim until
-the protected Windows/KVM comparison artifact passes.
+final-native gate still must prove the same-ISO vanilla-versus-slim thresholds
+on real KVM. It takes three cold-boot samples per profile and fails closed on
+process count, committed memory, and guest-used disk before the final GUI
+matrix; source presence is not a resource claim.
 
 ## Advanced commands
 
@@ -565,13 +567,15 @@ covers real WinPE DISM, unattended OOBE and cleanup, NetAPI user creation,
 SCM/licensing identity, ConPTY, clone-secret isolation, folder boundaries,
 balloon/TRIM/hibernate/compaction, full shutdown, no-login cold restart, and
 complete runtime cleanup. The final GUI matrix runs after those checks in the
-same exact-SHA native Linux/KVM job. The headless phase creates a stopped linked
-clone from its sealed real install; a private headless Sway compositor then
-drives login, window, input, screenshot, crash/reattach, and cleanup checks
-without inheriting WSLg or a signed-in host desktop. The optional Windows-hosted
-WSLg adapter remains development-only. Before beta.8 is released, the exact
-candidate must pass the provisioned native runner; source presence alone is not
-runtime evidence.
+same exact-SHA native Linux/KVM job. Before that last GUI step, the job installs
+zero-mutation `vanilla` from the same ISO, compares three settled cold boots
+against the slim samples, and removes the comparison VM. The headless phase
+creates a stopped linked clone from its sealed real install; a private headless
+Sway compositor then drives login, window, input, screenshot, crash/reattach,
+and cleanup checks without inheriting WSLg or a signed-in host desktop. The
+optional Windows-hosted WSLg adapter remains development-only. Before beta.8 is
+released, the exact candidate must pass the provisioned native runner; source
+presence alone is not runtime evidence.
 
 See [the operator workflow and evidence contract](docs/WINDOWS_KVM_E2E.md) and
 [the detailed acceptance boundary](docs/BETA.md). Ordinary CI also runs bounded

@@ -28,6 +28,8 @@ jobs:
           sudo apt-get install --yes shellcheck
       - name: Check syntax and lint
         run: scripts/check-shell.sh
+      - name: Exercise the profile-comparison fail-closed thresholds
+        run: python3 scripts/compare-windows-profile-audits.py --self-test
       - name: Enforce the Slice 4.5 source-layout ratchet
         run: scripts/check-source-layout.sh
 
@@ -123,8 +125,13 @@ jobs:
       - name: Parse the Windows profile audit fixture
         shell: powershell
         run: |
-          $Source = Get-Content .\scripts\check-windows-slim-profile.ps1 -Raw
-          [scriptblock]::Create($Source) | Out-Null
+          foreach ($Path in @(
+            '.\scripts\check-windows-slim-profile.ps1',
+            '.\scripts\measure-windows-profile.ps1'
+          )) {
+            $Source = Get-Content $Path -Raw
+            [scriptblock]::Create($Source) | Out-Null
+          }
       - name: Record runtime-test boundary
         shell: pwsh
         run: |

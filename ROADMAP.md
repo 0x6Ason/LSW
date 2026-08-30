@@ -262,9 +262,12 @@ headless workflows working.
 Implementation status: schema-v2 manifests, the bounded 53-identity AppX
 allowlist, offline Recall removal, OneDrive uninstall, service/policy
 application, preservation guards, durable before/after reports, a versioned
-sealed-image identity, and three-boot slim audit/resource artifacts are in the
-tree. Slice 4.5 remains open until the protected real Windows/KVM job publishes
-and passes the same-ISO `vanilla` comparison and the full preservation matrix.
+sealed-image identity, three-boot slim audit/resource artifacts, and the
+fail-closed same-ISO `vanilla` comparison step are in the tree. That step runs
+only in the final native job, removes its separate vanilla instance, and keeps
+the GUI matrix last. Slice 4.5 remains open until the protected exact-candidate
+Windows/KVM run publishes a passing comparison artifact and the full
+preservation matrix passes at runtime.
 
 ### Slice 5: complete HWND and display behavior
 

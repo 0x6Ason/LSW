@@ -178,6 +178,7 @@ export LSW_E2E_LSW="$lsw"
 export LSW_E2E_INSTANCE="$instance"
 autospawn_blocker="$e2e_root/lswd-autospawn-disabled"
 cold_daemon_pid_file="$e2e_root/cold-daemon.pid"
+daemon_pid_file="$e2e_root/lswd.pid"
 export LSW_DAEMON="$autospawn_blocker"
 daemon_pid=
 daemon_keepalive_pid=
@@ -417,6 +418,12 @@ adopt_cold_daemon_if_present() {
             ;;
     esac
     daemon_pid=$candidate_daemon_pid
+    if ! printf '%s\n' "$daemon_pid" >"$daemon_pid_file" \
+        || ! chmod 600 "$daemon_pid_file"
+    then
+        echo "error: could not track the cold-start daemon PID" >&2
+        return 1
+    fi
     rm -f -- "$cold_daemon_pid_file"
 }
 
@@ -476,6 +483,7 @@ terminate_daemon() {
     case "$daemon_pid" in
         ''|*[!0-9]*)
             daemon_pid=
+            rm -f -- "$daemon_pid_file"
             return 0
             ;;
     esac
@@ -516,6 +524,7 @@ terminate_daemon() {
     fi
     wait "$daemon_pid" 2>/dev/null || :
     daemon_pid=
+    rm -f -- "$daemon_pid_file"
 }
 
 assert_stopped_runtime_released() {
@@ -815,6 +824,8 @@ chmod 700 "$LSW_STATE_DIR"
 # product's default 30-second idle configuration.
 LSW_DAEMON_IDLE_SECONDS=3600 setsid "$lswd" >"$e2e_root/lswd.log" 2>&1 &
 daemon_pid=$!
+printf '%s\n' "$daemon_pid" >"$daemon_pid_file"
+chmod 600 "$daemon_pid_file"
 daemon_ready=0
 daemon_attempt=0
 while [ "$daemon_attempt" -lt 100 ]; do

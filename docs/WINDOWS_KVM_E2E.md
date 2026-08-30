@@ -38,9 +38,12 @@ fully headless. A successful ordinary CI run is not a substitute for this gate.
 
 beta.8 adds a native mode to the same exact-SHA workflow. One native Linux/KVM
 job first keeps the complete no-console-user headless invariant, then creates a
-stopped linked clone from the sealed real install and consumes it in the final
-GUI matrix. That matrix starts a private headless Sway compositor and does not
-inherit a host display session. The opt-in WSLg job remains a separately
+stopped linked clone from the sealed real install. It next installs
+zero-mutation `vanilla` from the same exact ISO, records three settled cold
+boots for both profiles, enforces the Slice 4.5 resource thresholds, and removes
+the vanilla instance. Only then does it consume the stopped slim clone in the
+final GUI matrix. That matrix starts a private headless Sway compositor and does
+not inherit a host display session. The opt-in WSLg job remains a separately
 provisioned Windows-hosted development adapter; it is not release evidence or a
 user prerequisite.
 
@@ -345,8 +348,9 @@ operation retains a shorter independent bound.
 This workflow and its harnesses define the acceptance mechanism; source presence
 alone is not a runtime claim. Tag beta.8 only after the exact candidate completes
 one successful `Final native Linux Wayland GUI gate` job containing the trusted
-runner, real Windows/KVM, handoff-verification, and real-install GUI steps. The
-WSLg adapter remains a compatibility smoke test and does not satisfy that gate.
+runner, real Windows/KVM, handoff verification, same-ISO profile comparison,
+and real-install GUI steps. The WSLg adapter remains a compatibility smoke test
+and does not satisfy that gate.
 
 Tag only the exact commit named in a successful run. If `master` changes, run
 the gate again for the new commit. The release workflow rejects every new tag
@@ -358,7 +362,10 @@ release decision is auditable.
 
 Per-run build output and guest state are deleted after either success or
 failure. The harness records the exact temporary root so the workflow can make
-a second bounded cleanup attempt if the harness is interrupted. A new gate
-refuses to start when an older `lsw-e2e.*` directory exists, preventing stale
-VM state from silently consuming the runner's disk. Diagnostics use only the
-redacted uploaded evidence; the release workflow has no state-retention mode.
+a second bounded cleanup attempt if the harness is interrupted. Cleanup accepts
+only runner-owned mode-0700 `lsw-e2e.*` or `lsw-profile.*` roots recorded by one
+private mode-0600 file, and refuses deletion while a tracked QEMU or daemon is
+alive. A new gate refuses to start when either kind of older root exists,
+preventing stale VM state from silently consuming the runner's disk. Diagnostics
+use only the redacted uploaded evidence; the release workflow has no
+state-retention mode.

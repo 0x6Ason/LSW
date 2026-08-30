@@ -29,8 +29,10 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   validation protects Windows Update, WinSxS, Defender, Store, winget,
   WebView2, Terminal, PowerShell, ConPTY, WMI, UAC, input, hibernation, and
   Recovery. Source and local parser tests cover this path; its numerical
-  resource improvements are not claimed until the same-ISO real Windows/KVM
-  comparison passes.
+  comparison is wired into the final native job with three cold boots per
+  profile and fail-closed process, committed-memory, and guest-disk thresholds.
+  The resource improvements are not claimed until that exact-candidate real
+  Windows/KVM step passes.
 - The pre-applied unattend installs the Windows x64 PE agent during
   `specialize` and registers the automatic `LSWAgent` service as
   `NT SERVICE\LSWAgent`, rather than using an interactive user's `HKCU` startup
