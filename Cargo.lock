@@ -593,6 +593,7 @@ name = "lsw-core"
 version = "1.0.0-beta.8-dev.0"
 dependencies = [
  "getrandom",
+ "lsw-protocol",
  "md4",
  "serde",
  "serde_json",
@@ -607,6 +608,10 @@ version = "1.0.0-beta.8-dev.0"
 dependencies = [
  "lsw-core",
 ]
+
+[[package]]
+name = "lsw-protocol"
+version = "1.0.0-beta.8-dev.0"
 
 [[package]]
 name = "md4"

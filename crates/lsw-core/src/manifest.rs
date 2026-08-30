@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use lsw_protocol::WindowsUserRole;
+
 use crate::{LswError, Result, WindowsProfile};
 
 const MANIFEST_VERSION: u32 = 8;
@@ -24,36 +26,6 @@ pub enum NetworkMode {
 pub enum IdlePolicy {
     Off,
     PauseHibernate,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowsUserRole {
-    Standard,
-    Administrator,
-}
-
-impl fmt::Display for WindowsUserRole {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Standard => "standard",
-            Self::Administrator => "administrator",
-        })
-    }
-}
-
-impl FromStr for WindowsUserRole {
-    type Err = LswError;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "standard" => Ok(Self::Standard),
-            "administrator" => Ok(Self::Administrator),
-            _ => Err(LswError::InvalidValue {
-                field: "Windows user role",
-                reason: format!("unknown role {value:?}; expected standard or administrator"),
-            }),
-        }
-    }
 }
 
 impl fmt::Display for IdlePolicy {
@@ -957,18 +929,7 @@ fn windows_roots_overlap(left: &str, right: &str) -> bool {
 }
 
 pub fn validate_windows_user_name(name: &str) -> Result<()> {
-    const FORBIDDEN: [char; 16] = [
-        '"', '/', '\\', '[', ']', ':', ';', '|', '=', ',', '+', '*', '?', '<', '>', '@',
-    ];
-    let valid = !name.is_empty()
-        && name.encode_utf16().count() <= 20
-        && name != "."
-        && name != ".."
-        && !name.ends_with([' ', '.'])
-        && !name
-            .chars()
-            .any(|character| character.is_control() || FORBIDDEN.contains(&character));
-    if valid {
+    if lsw_protocol::validate_windows_user_name(name).is_ok() {
         Ok(())
     } else {
         Err(LswError::InvalidValue {

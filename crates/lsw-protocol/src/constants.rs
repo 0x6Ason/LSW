@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+pub const AGENT_PROTOCOL_VERSION: u16 = 1;
+pub const CAPABILITY_CONPTY_V1: &str = "conpty-v1";
+pub const CAPABILITY_SESSION_CONTROL_V1: &str = "session-control-v1";
+pub const CAPABILITY_SESSION_LEASE_V1: &str = "session-lease-v1";
+pub const CAPABILITY_PROCESS_ENVIRONMENT_V1: &str = "process-environment-v1";
+pub const CAPABILITY_DETACHED_RUN_V1: &str = "detached-run-v1";
+pub const CAPABILITY_SESSION_SIGNAL_V1: &str = "session-signal-v1";
+pub const CAPABILITY_TERMINAL_RESIZE_V1: &str = "terminal-resize-v1";
+pub const CAPABILITY_POWER_HIBERNATE_V1: &str = "power-hibernate-v1";
+pub const CAPABILITY_USER_ACCOUNT_V1: &str = "user-account-v1";
+pub const CAPABILITY_USER_ACCOUNT_ROLE_V1: &str = "user-account-role-v1";
+pub const CAPABILITY_MAINTENANCE_TRIM_V1: &str = "maintenance-trim-v1";
+pub const CAPABILITY_MAINTENANCE_HIBERNATE_V1: &str = "maintenance-hibernate-v1";
+pub const CAPABILITY_MAINTENANCE_SHUTDOWN_V1: &str = "maintenance-shutdown-v1";
+pub const CAPABILITY_WINDOWS_SUDO_V1: &str = "windows-sudo-v1";
+pub const CAPABILITY_LIVE_SHARE_V1: &str = "live-share-v1";
+pub const CAPABILITY_DESKTOP_COMPANION_V1: &str = "desktop-companion-v1";
+pub const CAPABILITY_GUI_LAUNCH_V1: &str = "gui-launch-v1";
+pub const CAPABILITY_GUI_ICON_V1: &str = "gui-icon-v1";
+pub const CAPABILITY_DESKTOP_LIVE_SHARE_V1: &str = "desktop-live-share-v1";
+pub const CAPABILITY_GUI_WINDOW_V3: &str = "gui-window-v3";
+pub const SESSION_CANCEL_EXIT_CODE: i32 = 130;
+pub const DEFAULT_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 120_000;
+pub const MIN_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 1_000;
+pub const MAX_SESSION_LEASE_TIMEOUT_MILLIS: u32 = 300_000;
+pub const MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
+pub const MAX_ARGUMENTS: usize = 1024;
+pub const MAX_STRING_BYTES: usize = 1024 * 1024;
+pub const MAX_TERMINAL_DIMENSION: u16 = i16::MAX as u16;
+pub const MAX_GUI_WINDOW_DIMENSION: u32 = 8_192;
+pub const MAX_GUI_DAMAGE_DIMENSION: u32 = 512;
+pub const MAX_GUI_FRAME_BYTES: usize = 128 * 1024 * 1024;

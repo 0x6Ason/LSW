@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Extracted the 2,442-line shared agent wire implementation from `lsw-core`
+  into the dependency-free `lsw-protocol` crate. Focused modules now own frame,
+  session, user, integration, transfer, and seamless-GUI messages, all remain
+  below the Slice 4.5 size limit, and the original `lsw-core` API is retained
+  through compatibility re-exports and mapped frame I/O errors. All existing
+  protocol bytes, limits, capabilities, and version-one behavior are unchanged.
 - Added the temporary beta.8 Slice 4.5 architecture and default-image
   optimization contract. It defines a WSL-inspired host/guest/shared/service
   source split, a separately versioned but always bundled `lswg` runtime, an

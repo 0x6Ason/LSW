@@ -114,6 +114,15 @@ Migration order preserves wire and release behavior:
 6. Replace duplicated E2E shell flows with shared scenario drivers and small
    environment adapters.
 
+Step 1's agent-wire extraction is implemented. `lsw-protocol` is dependency
+free and separates constants, framing, integration controls, user operations,
+sessions, GUI messages, transfers, codecs, and protocol tests. The public
+`lsw-core` surface remains compatible through re-exports and error-mapping
+frame wrappers; the protocol version and encoded bytes did not change. The
+local daemon protocol moves when the host-client boundary is extracted in step
+2, avoiding an artificial dependency from the shared crate back into a Unix
+client.
+
 Every step must keep ordinary headless commands and the current first-HWND
 matrix passing. A giant rename-only commit is not acceptable.
 

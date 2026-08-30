@@ -80,4 +80,13 @@ impl From<io::Error> for LswError {
     }
 }
 
+impl From<lsw_protocol::ProtocolError> for LswError {
+    fn from(error: lsw_protocol::ProtocolError) -> Self {
+        match error {
+            lsw_protocol::ProtocolError::Io(error) => Self::Io(error),
+            lsw_protocol::ProtocolError::Protocol(reason) => Self::Protocol(reason),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, LswError>;

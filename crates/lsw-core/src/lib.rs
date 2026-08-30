@@ -2,7 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-mod agent_protocol;
 mod backend;
 mod capabilities;
 mod customization;
@@ -81,19 +80,19 @@ pub const CLONE_IDENTITY_NAME_FILE: &str = "instance.name";
 pub const CLONE_IDENTITY_TOKEN_FILE: &str = "agent.token";
 pub const DAEMON_PROTOCOL_VERSION: u16 = 2;
 pub const MANIFEST_FILE: &str = "instance.lsw";
-pub use agent_protocol::{
+pub use lsw_protocol::{
     constant_time_token_eq, decode_exit, decode_file_length, decode_process_id, decode_resize,
-    encode_exit, encode_file_length, encode_process_id, encode_resize, read_frame, write_frame,
-    ClientHello, DesktopLiveShareRequest, DesktopUserRequest, FileGetRequest, FilePutRequest,
-    Frame, FrameKind, GuiIconRequest, GuiInputEvent, GuiPointerButton, GuiStartRequest,
-    GuiWindowAction, GuiWindowClosed, GuiWindowDamage, GuiWindowDragHint, GuiWindowReady,
-    GuiWindowResize, LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello,
-    SessionKind, SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest,
-    TerminalSize, TerminalStartRequest, UserCreateRequest, UserSetRoleRequest,
-    WindowsSudoConfigureRequest, WindowsSudoMode, WindowsSudoStatus, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_CONPTY_V1, CAPABILITY_DESKTOP_COMPANION_V1, CAPABILITY_DESKTOP_LIVE_SHARE_V1,
-    CAPABILITY_DETACHED_RUN_V1, CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1,
-    CAPABILITY_GUI_WINDOW_V3, CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
+    encode_exit, encode_file_length, encode_process_id, encode_resize, ClientHello,
+    DesktopLiveShareRequest, DesktopUserRequest, FileGetRequest, FilePutRequest, Frame, FrameKind,
+    GuiIconRequest, GuiInputEvent, GuiPointerButton, GuiStartRequest, GuiWindowAction,
+    GuiWindowClosed, GuiWindowDamage, GuiWindowDragHint, GuiWindowReady, GuiWindowResize,
+    LiveShareConfigureRequest, LiveShareStatus, ProcessEnvironment, ServerHello, SessionKind,
+    SessionLease, SessionLeaseState, SessionOptions, SessionSignal, StartRequest, TerminalSize,
+    TerminalStartRequest, UserCreateRequest, UserSetRoleRequest, WindowsSudoConfigureRequest,
+    WindowsSudoMode, WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
+    CAPABILITY_DESKTOP_COMPANION_V1, CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_DETACHED_RUN_V1,
+    CAPABILITY_GUI_ICON_V1, CAPABILITY_GUI_LAUNCH_V1, CAPABILITY_GUI_WINDOW_V3,
+    CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_HIBERNATE_V1,
     CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
     CAPABILITY_POWER_HIBERNATE_V1, CAPABILITY_PROCESS_ENVIRONMENT_V1,
     CAPABILITY_SESSION_CONTROL_V1, CAPABILITY_SESSION_LEASE_V1, CAPABILITY_SESSION_SIGNAL_V1,
@@ -103,3 +102,11 @@ pub use agent_protocol::{
     MAX_SESSION_LEASE_TIMEOUT_MILLIS, MAX_TERMINAL_DIMENSION, MIN_SESSION_LEASE_TIMEOUT_MILLIS,
     SESSION_CANCEL_EXIT_CODE,
 };
+
+pub fn write_frame(writer: &mut impl std::io::Write, frame: &Frame) -> Result<()> {
+    lsw_protocol::write_frame(writer, frame).map_err(Into::into)
+}
+
+pub fn read_frame(reader: &mut impl std::io::Read) -> Result<Frame> {
+    lsw_protocol::read_frame(reader).map_err(Into::into)
+}

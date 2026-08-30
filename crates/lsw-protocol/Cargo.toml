@@ -1,0 +1,8 @@
+[package]
+name = "lsw-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned and bounded wire protocols shared by LSW host and Windows guest"
+publish = false

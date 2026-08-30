@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 getrandom = "=0.2.15"
+lsw-protocol = { path = "../lsw-protocol" }
 serde = { version = "=1.0.203", features = ["derive"] }
 serde_json = "=1.0.117"
 sha2 = "=0.10.8"

@@ -23,6 +23,7 @@ validation claims on the beta.8 development line.
 | QEMU backend | Linux runtime implemented; firmware smoke passed | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
 | Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
 | `lsw-agent.exe` | Implemented | Token authentication, concurrent pipe/ConPTY sessions, capability-gated control/leases, process ownership and file transfer |
+| `lsw-protocol` | Agent wire extraction implemented | Dependency-free bounded frame, session, user, transfer, and GUI wire types shared by host and guest; `lsw-core` retains compatibility re-exports |
 | ConPTY transport | Implemented; beta.6 exact KVM gate passed | Capability negotiation, console I/O, signals and terminal resize |
 | PE inspector | Implemented | Bounded PE/COFF metadata, imports, JSON and conservative beta compatibility assessment |
 | WinPE DISM backend | Integrated; beta.6 exact KVM gate passed | Runs two network-disabled WinPE microVM phases using the official media's `dism.exe`: prepare a profile WIM, then partition/apply it to the private target qcow2 |
@@ -44,6 +45,11 @@ the process model before the desktop matrix expands. It follows the applicable
 WSL management pattern of separate client, service, host, guest, shared, and GUI
 components while retaining LSW's own QEMU/KVM direction and non-RDP seamless
 protocol.
+
+The first Slice 4.5 migration is complete: the former 2,442-line
+`lsw-core/src/agent_protocol.rs` now has focused modules in the dependency-free
+`lsw-protocol` crate. Encoded bytes and protocol version remain unchanged, and
+`lsw-core` keeps its existing public names while host consumers are migrated.
 
 The target tree, migration order, bundled `lswg` contract, line-count limits,
 and default-image acceptance measurements are specified in
