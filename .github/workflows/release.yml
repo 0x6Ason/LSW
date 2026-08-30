@@ -52,14 +52,16 @@ jobs:
               ;;
           esac
 
-          # beta.5-beta.7 shipped before the signed-in seamless matrix existed.
-          # New tags must prove both independent jobs in the same exact-SHA run.
-          require_seamless=1
+          # beta.5-beta.7 shipped before the native Linux seamless gate existed.
+          # New tags must prove the ordered headless and native GUI jobs in the
+          # same exact-SHA run. The Windows-hosted WSLg compatibility matrix is
+          # deliberately not accepted as release evidence.
+          require_native_gui=1
           case "$GITHUB_REF_NAME:$GITHUB_SHA" in
             v1.0.0-beta.5:ee125c132a9fc07cd8065933e62a85baf31b304e|\
             v1.0.0-beta.6:091089aca074b394e0c1934f3ec01f5fdfb7ef62|\
             v1.0.0-beta.7:deff0d56016dbfb9661935af650454e197288824)
-              require_seamless=0
+              require_native_gui=0
               ;;
           esac
 
@@ -72,23 +74,23 @@ jobs:
               -f per_page=100 \
               --paginate \
               --jq '.workflow_runs[] |
-                [.id, .head_sha, .head_branch, .event, .status, .conclusion] |
+                [.id, .head_sha, .head_branch, .event, .status] |
                 @tsv'
           )
 
           if [[ -z "$candidate_runs" ]]; then
-            echo "error: no successful Windows/KVM workflow run exists for commit $GITHUB_SHA" >&2
+            echo "error: no completed Windows/KVM workflow run exists for commit $GITHUB_SHA" >&2
             echo "Run the headless Windows/KVM release gate from master before tagging this commit." >&2
             exit 1
           fi
 
           matched_run=
-          while IFS=$'\t' read -r run_id run_sha run_branch run_event run_status run_conclusion; do
+          while IFS=$'\t' read -r run_id run_sha run_branch run_event run_status; do
             [[ "$run_id" =~ ^[0-9]+$ ]] || continue
             [[ "$run_sha" == "$GITHUB_SHA" ]] || continue
             [[ "$run_branch" == master ]] || continue
             [[ "$run_event" == workflow_dispatch ]] || continue
-            [[ "$run_status" == completed && "$run_conclusion" == success ]] || continue
+            [[ "$run_status" == completed ]] || continue
             matching_headless_jobs=$(
               gh api --paginate \
                 "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
@@ -107,33 +109,36 @@ jobs:
                     .conclusion == "success")) |
                    .id'
             )
-            matching_seamless_jobs=$(
+            matching_native_gui_jobs=$(
               gh api --paginate \
                 "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
                 --jq '.jobs[] |
-                  select(.name == "Windows 11 signed-in WSLg seamless GUI matrix") |
+                  select(.name == "Final native Linux Wayland GUI gate") |
                   select(.status == "completed" and .conclusion == "success") |
                   select((.labels // []) | index("self-hosted")) |
                   select((.labels // []) | index("Linux")) |
                   select((.labels // []) | index("X64")) |
-                  select((.labels // []) | index("lsw-windows-seamless-e2e")) |
+                  select((.labels // []) | index("lsw-windows-kvm-gui-e2e")) |
                   select(any(.steps[]?;
-                    .name == "Verify the dedicated interactive WSLg runner" and
+                    .name == "Verify the native Linux Wayland runner and real-install handoff" and
                     .conclusion == "success")) |
                   select(any(.steps[]?;
-                    .name == "Run the signed-in seamless GUI matrix" and
+                    .name == "Run the real-install seamless GUI matrix" and
                     .conclusion == "success")) |
                   .id'
             )
             if [[ -n "$matching_headless_jobs" && \
-                  ( "$require_seamless" == 0 || -n "$matching_seamless_jobs" ) ]]; then
+                  ( "$require_native_gui" == 0 || -n "$matching_native_gui_jobs" ) ]]; then
               matched_run=$run_id
               break
             fi
           done <<<"$candidate_runs"
 
           if [[ -z "$matched_run" ]]; then
-            echo "error: successful workflow metadata exists for $GITHUB_SHA, but the required exact-SHA headless and signed-in GUI jobs did not both pass" >&2
+            echo "error: completed workflow metadata exists for $GITHUB_SHA, but the required ordered exact-SHA headless and native Linux Wayland GUI jobs did not both pass" >&2
+            if [[ "$require_native_gui" == 1 ]]; then
+              echo "error: the Windows-hosted WSLg compatibility matrix is development evidence and cannot release beta.8" >&2
+            fi
             exit 1
           fi
 
@@ -142,8 +147,8 @@ jobs:
           {
             echo "## Windows/KVM release gate"
             echo
-            if [[ "$require_seamless" == 1 ]]; then
-              echo "Exact commit \`$GITHUB_SHA\` passed both the headless KVM and independent signed-in WSLg GUI jobs in [run $matched_run]($gate_url)."
+            if [[ "$require_native_gui" == 1 ]]; then
+              echo "Exact commit \`$GITHUB_SHA\` passed the ordered headless KVM and final native Linux Wayland GUI jobs in [run $matched_run]($gate_url)."
             else
               echo "Exact legacy commit \`$GITHUB_SHA\` was validated by [run $matched_run]($gate_url)."
             fi

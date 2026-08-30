@@ -178,9 +178,11 @@ headless workflows working.
   maximized host surface aspect-fits the exact guest frame with non-interactive
   black letterboxing instead of stretching it. Injected input is released on
   focus loss or disconnect. Rust 1.76 protocol, Windows-agent, and Linux
-  cross-target gates pass. Release validation additionally requires the
-  independent exact-SHA signed-in WSLg job; the existing no-login Windows/KVM
-  job remains a separate mandatory boundary.
+  cross-target gates pass. The current signed-in WSLg matrix is an opt-in
+  development adapter for the Windows plus WSL workstation, not a user
+  requirement or the final Linux desktop claim. Release validation must run
+  the no-login Windows/KVM job first and the native Linux Wayland GUI matrix
+  last.
 
 ### Slice 5: complete HWND and display behavior
 
@@ -222,15 +224,24 @@ headless workflows working.
 - Measure idle companion memory, frame latency, input latency, live-share
   throughput, drag-and-drop resume, and audio stability. Finish the Wayland and
   X11 application matrix and the exact-commit Windows/KVM release gate.
+- Make the GUI matrix the final stage after the complete headless install,
+  OOBE, agent, cold-restart, and cleanup assertions pass. Hand a stopped linked
+  clone of that ordinary LSW-installed image to the GUI stage through a
+  same-host, mode-0700 state boundary; do not use a manually provisioned VM as
+  final release evidence. The GUI stage owns and removes the clone.
+- Add a native Linux Wayland runner and compositor/input/screenshot driver.
+  Keep WSLg as a useful Windows-hosted compatibility smoke test, but never make
+  WSLg, `powershell.exe`, `wsl.exe`, or an `msrdc` HWND a product prerequisite.
 
 Acceptance requires common development applications, administrator and standard
 account flows, native-sudo detection, real UAC consent and credential prompts,
 secure-desktop spoof boundaries, file dialogs, elevated window boundaries,
 clipboard focus, large-file drag-and-drop, DPI transitions, full-screen recovery,
-desktop-session restart testing on Wayland and X11, driverless live-share escape
-tests, simple-command compatibility tests, and published file-performance
-results. The existing synchronized mirror remains supported even after live
-sharing becomes the recommended interactive path.
+desktop-session restart testing on native Wayland and X11, ordered real-install
+handoff into the final GUI stage, driverless live-share escape tests,
+simple-command compatibility tests, and published file-performance results.
+The existing synchronized mirror remains supported even after live sharing
+becomes the recommended interactive path.
 
 ## beta.9: seamless desktop polish and shell-light mode
 

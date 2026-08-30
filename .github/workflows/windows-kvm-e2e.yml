@@ -14,6 +14,11 @@ on:
         description: Type RUN-WINDOWS-KVM-E2E to use the dedicated runner
         required: true
         type: string
+      run_wslg_compatibility:
+        description: Also run the Windows-hosted WSLg development matrix after KVM
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -480,7 +485,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## Windows/KVM release gate passed"
+            echo "## Headless Windows/KVM gate passed"
             echo
             echo "Validated commit: \`$GITHUB_SHA\`"
             echo
@@ -503,8 +508,9 @@ jobs:
           fi
 
   windows-seamless-e2e:
-    name: Windows 11 signed-in WSLg seamless GUI matrix
-    needs: authorize
+    name: Windows-hosted WSLg compatibility matrix
+    needs: windows-kvm-e2e
+    if: ${{ inputs.run_wslg_compatibility }}
     environment: windows-seamless-e2e
     runs-on:
       - self-hosted
@@ -532,12 +538,18 @@ jobs:
             printf 'CARGO_TARGET_DIR=%s/target\n' "$JOB_BUILD_ROOT"
           } >>"$GITHUB_ENV"
 
+      - name: Receive accepted headless KVM evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-kvm-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.LSW_GUI_BUILD_ROOT }}/headless-evidence
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Verify the dedicated interactive WSLg runner
+      - name: Verify the WSLg development adapter
         shell: bash
         env:
           EXPECTED_SHA: ${{ inputs.candidate_sha }}
@@ -549,10 +561,26 @@ jobs:
             echo "error: the GUI checkout must be the exact authorized candidate SHA" >&2
             exit 1
           fi
+          headless_attestation="$LSW_GUI_BUILD_ROOT/headless-evidence/attestation.env"
+          if [[ -L "$headless_attestation" || ! -f "$headless_attestation" || \
+                "$(stat -c %s -- "$headless_attestation")" -gt 16384 ]]; then
+            echo "error: the compatibility stage requires bounded headless KVM evidence from this run" >&2
+            exit 1
+          fi
+          headless_result=$(awk -F= '$1 == "result" { print $2 }' "$headless_attestation")
+          installed_iso_sha=$(awk -F= '$1 == "iso_sha256" { print $2 }' "$headless_attestation")
+          official_iso_sha=$(awk -F= '$1 == "official_iso_sha256" { print $2 }' "$headless_attestation")
+          if [[ "$headless_result" != success || \
+                ! "$installed_iso_sha" =~ ^[0-9a-f]{64}$ || \
+                "$installed_iso_sha" != "$official_iso_sha" ]]; then
+            echo "error: the compatibility stage did not receive successful exact-media KVM evidence" >&2
+            exit 1
+          fi
           if [[ -z "${WSL_DISTRO_NAME:-}" || -z "${WAYLAND_DISPLAY:-}" || \
                 -z "${XDG_RUNTIME_DIR:-}" || "$WAYLAND_DISPLAY" == */* || \
                 ! -S "${XDG_RUNTIME_DIR%/}/$WAYLAND_DISPLAY" ]]; then
-            echo "error: start this runner from the signed-in user's interactive WSLg Wayland session" >&2
+            echo "error: the current development adapter must start from a signed-in WSLg Wayland session" >&2
+            echo "error: WSLg is test infrastructure here, not an LSW runtime requirement" >&2
             exit 1
           fi
           for command in \
@@ -571,7 +599,7 @@ jobs:
           fi
           {
             printf 'candidate_sha=%s\n' "$GITHUB_SHA"
-            printf 'runner_contract=signed-in-wslg-wayland\n'
+            printf 'runner_contract=wayland-wslg-development-adapter\n'
           } >"$LSW_GUI_BUILD_ROOT/artifacts/runner.env"
           chmod 600 -- "$LSW_GUI_BUILD_ROOT/artifacts/runner.env"
 
@@ -631,11 +659,11 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## Signed-in WSLg seamless GUI gate passed"
+            echo "## Windows-hosted WSLg compatibility matrix passed"
             echo
             echo "Validated commit: \`$GITHUB_SHA\`"
             echo
-            echo "The independent GUI job attested the candidate CLI, active daemon, and installed guest agent by SHA-256."
+            echo "This development-only stage consumed the successful headless evidence and attested the candidate CLI, active daemon, and installed guest agent by SHA-256. It is not the native Linux beta.8 release gate."
           } >>"$GITHUB_STEP_SUMMARY"
 
       - name: Remove local GUI build output

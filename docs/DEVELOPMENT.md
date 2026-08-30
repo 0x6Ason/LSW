@@ -205,15 +205,20 @@ agent commands run as `NT SERVICE\LSWAgent`. It also verifies WMI license status
 demand-start LocalSystem helper. After shutdown it requires a no-login cold
 boot, the same service SID, true ConPTY, detached installation media, and
 complete runtime cleanup. A second, independently labeled
-`lsw-windows-seamless-e2e` runner must inherit a signed-in WSLg session and
-pre-provision one exact-candidate instance. It attests the candidate CLI, active
-daemon, and installed guest agent by SHA-256 before running the first-HWND GUI
-matrix; it neither weakens nor replaces the no-login headless contract. See
+`lsw-windows-seamless-e2e` runner currently inherits a signed-in WSLg session
+for the opt-in Windows-hosted development adapter. Its job runs only when the
+dispatch explicitly selects it and only after the headless job succeeds. It
+consumes that run's accepted evidence and attests the candidate CLI, active
+daemon, and installed guest agent by SHA-256 before the first-HWND matrix. It
+neither weakens nor replaces the no-login contract. See
 [`WINDOWS_KVM_E2E.md`](WINDOWS_KVM_E2E.md) for runner isolation, protected
 environment, media provisioning, and operator instructions. Tagged releases
 after the existing beta.1–beta.7 tags fail closed unless the same workflow run
-has successful headless KVM and signed-in WSLg jobs for the exact tag commit;
-manual untagged bundle builds remain available without that hardware
+has successful ordered headless and native Linux Wayland GUI jobs for the exact
+tag commit. The current release checker intentionally does not accept the WSLg
+compatibility job. WSLg is test infrastructure, not a runtime dependency;
+native Linux Wayland and direct real-install handoff remain beta.8 release work.
+Manual untagged bundle builds remain available without that hardware
 attestation.
 
 Before describing a build as runtime-validated, a maintainer must separately

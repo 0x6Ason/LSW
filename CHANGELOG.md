@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Made native Linux Wayland the seamless-GUI product contract. The
+  Windows-hosted WSLg matrix is now an explicitly development-only
+  compatibility stage ordered after the complete headless Windows/KVM gate;
+  it is opt-in and no longer satisfies the beta.8 release check. Final beta.8
+  evidence must run last on native Linux Wayland using a stopped clone handed
+  off from the ordinary accepted `lsw install` path.
 - Completed beta.8 Slice 4's first seamless application window. `lsw run
   --gui` now captures the exact first visible HWND through Windows Graphics
   Capture and presents it as an undecorated native Wayland surface whose only

@@ -4,8 +4,10 @@
 
 use std::env;
 use std::fmt::Display;
+use std::fs;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
@@ -57,7 +59,7 @@ pub(crate) fn present(session: GuiWindowSession) -> Result<i32, Box<dyn std::err
     builder.with_wayland();
     let mut event_loop = builder.build().map_err(|error| {
         format!(
-            "could not connect to the WSLg Wayland compositor; ensure WSLg is running and WAYLAND_DISPLAY is valid: {error}"
+            "could not connect to the Wayland compositor; ensure the graphical session is running and WAYLAND_DISPLAY is valid: {error}"
         )
     })?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -70,14 +72,12 @@ pub(crate) fn present(session: GuiWindowSession) -> Result<i32, Box<dyn std::err
             .with_inner_size(initial_size)
             .with_decorations(false)
             // Windows owns every visible caption and resize affordance. Keep
-            // the undecorated host proxy non-resizable while idle so WSLg's
-            // invisible outer border cannot steal clicks from the guest's
+            // the undecorated host surface non-resizable while idle so a
+            // compositor resize border cannot steal clicks from the guest's
             // real non-client frame.
             .with_resizable(false)
             .build(&event_loop)
-            .map_err(|error| {
-                format!("could not create the borderless WSLg Wayland window: {error}")
-            })?,
+            .map_err(|error| format!("could not create the borderless Wayland window: {error}"))?,
     );
     let context = Context::new(window.clone())
         .map_err(|error| format!("could not initialize Wayland software rendering: {error}"))?;
@@ -391,13 +391,13 @@ pub(crate) fn present(session: GuiWindowSession) -> Result<i32, Box<dyn std::err
 fn ensure_wayland_environment() -> Result<(), Box<dyn std::error::Error>> {
     if env::var_os("WAYLAND_DISPLAY").is_none() {
         return Err(
-            "seamless GUI requires WSLg Wayland, but WAYLAND_DISPLAY is not set; start LSW from a WSLg-enabled interactive WSL session"
+            "seamless GUI requires a Wayland desktop, but WAYLAND_DISPLAY is not set; start LSW from an interactive Linux graphical session"
                 .into(),
         );
     }
     if env::var_os("XDG_RUNTIME_DIR").is_none() {
         return Err(
-            "seamless GUI requires WSLg Wayland, but XDG_RUNTIME_DIR is not set; start LSW from a WSLg-enabled interactive WSL session"
+            "seamless GUI requires a Wayland desktop, but XDG_RUNTIME_DIR is not set; start LSW from an interactive Linux graphical session"
                 .into(),
         );
     }
@@ -842,7 +842,7 @@ fn begin_host_drag(
         return false;
     };
     if let Err(error) = result {
-        eprintln!("warning: WSLg rejected the guest {action:?} drag: {error}");
+        eprintln!("warning: the Wayland compositor rejected the guest {action:?} drag: {error}");
     } else {
         trace_gui(format_args!("submitted native host drag {action:?}"));
     }
@@ -1389,7 +1389,7 @@ fn display_title(title: &str) -> String {
 }
 
 fn minimize_host_window(window: &Window, host_window_title: &str) -> Result<(), String> {
-    if !running_under_wsl() {
+    if !running_under_wslg() {
         trace_gui("requesting native Wayland minimization");
         window.set_minimized(true);
         return Ok(());
@@ -1410,8 +1410,26 @@ fn minimize_host_window(window: &Window, host_window_title: &str) -> Result<(), 
     result
 }
 
-fn running_under_wsl() -> bool {
-    env::var_os("WSL_INTEROP").is_some() || env::var_os("WSL_DISTRO_NAME").is_some()
+fn running_under_wslg() -> bool {
+    if env::var_os("WSL_INTEROP").is_none() || env::var_os("WSL_DISTRO_NAME").is_none() {
+        return false;
+    }
+    let Some(runtime_directory) = env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let Some(display) = env::var_os("WAYLAND_DISPLAY") else {
+        return false;
+    };
+    let display_path = Path::new(&display);
+    let socket_path = if display_path.is_absolute() {
+        display_path.to_path_buf()
+    } else {
+        Path::new(&runtime_directory).join(display_path)
+    };
+    fs::canonicalize(socket_path)
+        .or_else(|_| fs::canonicalize(&runtime_directory))
+        .map(|path| path.starts_with("/mnt/wslg"))
+        .unwrap_or(false)
 }
 
 fn run_wslg_host_control(operation: &str, host_window_title: &str) -> Result<(), String> {
