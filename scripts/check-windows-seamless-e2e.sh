@@ -1435,9 +1435,11 @@ place_fixture_via_guest_caption() {
         printf '%s\n' "$placement_value" | grep -Eq '^-?[0-9]+$' \
             || fail "the Windows work-area query was invalid $placement_label"
     done
-    [ "$placement_width" -le "$placement_work_width" ] \
-        && [ "$placement_height" -le "$placement_work_height" ] \
-        || fail "the seamless HWND cannot fit in its Windows monitor work area"
+    if [ "$placement_width" -gt "$placement_work_width" ] \
+        || [ "$placement_height" -gt "$placement_work_height" ]
+    then
+        fail "the seamless HWND cannot fit in its Windows monitor work area"
+    fi
     placement_target_x=$((placement_work_left + (placement_work_width - placement_width) / 2))
     placement_target_y=$((placement_work_top + (placement_work_height - placement_height) / 2))
     placement_delta_x=$((placement_target_x - placement_x))
