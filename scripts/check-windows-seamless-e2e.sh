@@ -925,8 +925,9 @@ fit_viewport_values() {
         fit_width=$((fit_guest_width * fit_host_height / fit_guest_height))
         fit_height=$fit_host_height
     fi
-    [ "$fit_width" -gt 0 ] && [ "$fit_height" -gt 0 ] \
-        || fail "aspect-fit viewport collapsed to ${fit_width}x${fit_height}"
+    if [ "$fit_width" -le 0 ] || [ "$fit_height" -le 0 ]; then
+        fail "aspect-fit viewport collapsed to ${fit_width}x${fit_height}"
+    fi
     fit_x=$(((fit_host_width - fit_width) / 2))
     fit_y=$(((fit_host_height - fit_height) / 2))
     printf '%s %s %s %s\n' "$fit_x" "$fit_y" "$fit_width" "$fit_height"
@@ -2044,8 +2045,9 @@ native_restore_width=$(window_field "$window_id" WIDTH) \
     || fail "could not read native-restored host width"
 native_restore_height=$(window_field "$window_id" HEIGHT) \
     || fail "could not read native-restored host height"
-[ "$native_restore_width" -eq 900 ] && [ "$native_restore_height" -eq 650 ] \
-    || fail "native restore returned ${native_restore_width}x${native_restore_height}, expected 900x650"
+if [ "$native_restore_width" -ne 900 ] || [ "$native_restore_height" -ne 650 ]; then
+    fail "native restore returned ${native_restore_width}x${native_restore_height}, expected 900x650"
+fi
 wait_visual_sentinel native-restored "$resize_color" 0.005 900 650
 pass native_host_restore_to_guest
 pass native_host_restore_frame_ready

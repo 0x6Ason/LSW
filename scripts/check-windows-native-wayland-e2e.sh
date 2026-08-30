@@ -457,8 +457,9 @@ while [ "$(date +%s)" -lt "$sway_deadline" ]; do
     fi
     sleep 0.1
 done
-[ -n "$wayland_socket" ] && [ -n "$sway_socket" ] \
-    || fail "the private native Sway sockets did not appear"
+if [ -z "$wayland_socket" ] || [ -z "$sway_socket" ]; then
+    fail "the private native Sway sockets did not appear"
+fi
 export XDG_RUNTIME_DIR="$runtime_dir"
 export WAYLAND_DISPLAY="${wayland_socket##*/}"
 export SWAYSOCK="$sway_socket"
@@ -779,8 +780,9 @@ pointer_click "$((window_x + window_width - maximize_offset))" "$((window_y + ca
 wait_marker_exact 'window-state=Maximized' || fail "the guest window did not maximize"
 sleep 0.8
 refresh_window || fail "could not inspect the maximized native window"
-[ "$window_width" -eq 1280 ] && [ "$window_height" -eq 720 ] \
-    || fail "the maximized native window did not fill the compositor output"
+if [ "$window_width" -ne 1280 ] || [ "$window_height" -ne 720 ]; then
+    fail "the maximized native window did not fill the compositor output"
+fi
 capture_window maximized
 pass guest_caption_maximize
 
@@ -816,8 +818,9 @@ marker_has_exact "$(guest_marker_text)" closed \
 start_presenter
 reattach_pid=$(guest_marker_text | awk -F '\t' '$2 ~ /^process-id=/ { print substr($2, 12); exit }')
 reattach_hwnd=$(guest_marker_text | awk -F '\t' '$2 ~ /^window-hwnd=/ { print substr($2, 13); exit }')
-[ "$reattach_pid" = "$fixture_pid" ] && [ "$reattach_hwnd" = "$fixture_hwnd" ] \
-    || fail "native presenter recovery replaced the retained guest identity"
+if [ "$reattach_pid" != "$fixture_pid" ] || [ "$reattach_hwnd" != "$fixture_hwnd" ]; then
+    fail "native presenter recovery replaced the retained guest identity"
+fi
 pass native_exact_reattach
 
 refresh_window || fail "could not inspect the recovered native window"
