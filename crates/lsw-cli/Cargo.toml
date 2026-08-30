@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 lsw-core = { path = "../lsw-core" }
-signal-hook = "=0.3.17"
+lsw-host = { path = "../lsw-host" }
 
 [target.'cfg(unix)'.dependencies]
 # winit accepts newer ahash 0.8 releases whose target-only dependency graph

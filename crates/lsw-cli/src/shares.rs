@@ -11,9 +11,8 @@ use lsw_core::{
     DesktopLiveShareRequest, FolderShare, FolderShareMode, FolderShareTransport, HostCapabilities,
     InstanceState, LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
 };
+use lsw_host::{AgentClient, DaemonClient};
 
-use super::agent_client::AgentClient;
-use super::daemon_client::DaemonClient;
 use super::{
     absolute_path, connect_agent, fix_host_dependencies, resolve_name, start_named_instance,
     transfer,

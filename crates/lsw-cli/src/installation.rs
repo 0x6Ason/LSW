@@ -23,8 +23,8 @@ use lsw_core::{
     WindowsMediaInspector, WindowsProfile, WINPE_VM_TIMEOUT,
 };
 
-use crate::agent_client::AgentClient;
 use crate::progress::{ProgressEvent, ProgressRenderer};
+use lsw_host::AgentClient;
 
 use super::{
     absolute_path, fix_host_dependencies, launch_installation_viewer, resolve_name,

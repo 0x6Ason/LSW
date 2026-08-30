@@ -119,9 +119,15 @@ free and separates constants, framing, integration controls, user operations,
 sessions, GUI messages, transfers, codecs, and protocol tests. The public
 `lsw-core` surface remains compatible through re-exports and error-mapping
 frame wrappers; the protocol version and encoded bytes did not change. The
-local daemon protocol moves when the host-client boundary is extracted in step
-2, avoiding an artificial dependency from the shared crate back into a Unix
-client.
+local daemon protocol remains separately versioned while its typed command
+model is extracted.
+
+Step 2's client extraction is also implemented. `lsw-host` now owns the private
+Unix daemon connection plus focused agent control, process/terminal, GUI, and
+file-transfer sessions. The old 1,862-line CLI client and 216-line daemon
+client are gone; every new production module is below 600 lines. `lsw` retains
+command parsing, notices, progress, and the Wayland presenter, so the host crate
+does not import executable-private modules.
 
 Every step must keep ordinary headless commands and the current first-HWND
 matrix passing. A giant rename-only commit is not acceptable.

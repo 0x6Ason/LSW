@@ -1,0 +1,12 @@
+[package]
+name = "lsw-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Reusable Linux host clients for the LSW daemon and Windows guest agent"
+publish = false
+
+[dependencies]
+lsw-core = { path = "../lsw-core" }
+signal-hook = "=0.3.17"

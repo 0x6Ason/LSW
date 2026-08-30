@@ -19,6 +19,7 @@ validation claims on the beta.8 development line.
 | Component | Beta state | Responsibility |
 | --- | --- | --- |
 | `lsw` | Implemented | One-shot media resolution/download, instance installation, default shell, process/file and activation commands |
+| `lsw-host` | Host-client extraction implemented | Reusable Unix clients for private `lswd` IPC and authenticated agent control, process, GUI, and file sessions; contains no command parser or Wayland presenter |
 | `lswd` | Implemented | User-private Unix API, QEMU/swtpm supervision, QMP reconciliation and shutdown |
 | QEMU backend | Linux runtime implemented; firmware smoke passed | UEFI/vTPM microVM, KVM/TCG, private storage, loopback forwarding and recovery display |
 | Backend selector | Planner implemented | KVM/HVF/WHPX/TCG selection and acceleration argv; only Linux KVM detection is wired to a delivered host |
@@ -50,6 +51,10 @@ The first Slice 4.5 migration is complete: the former 2,442-line
 `lsw-core/src/agent_protocol.rs` now has focused modules in the dependency-free
 `lsw-protocol` crate. Encoded bytes and protocol version remain unchanged, and
 `lsw-core` keeps its existing public names while host consumers are migrated.
+The second migration moved the former CLI-private daemon and agent clients into
+`lsw-host`; process, GUI, transfer, and daemon transports are now separately
+owned modules, while command parsing, user notices, and presentation remain in
+`lsw`.
 
 The target tree, migration order, bundled `lswg` contract, line-count limits,
 and default-image acceptance measurements are specified in

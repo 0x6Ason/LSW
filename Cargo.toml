@@ -4,6 +4,7 @@ members = [
     "crates/lsw-core",
     "crates/lsw-daemon",
     "crates/lsw-agent",
+    "crates/lsw-host",
     "crates/lsw-protocol",
 ]
 resolver = "2"

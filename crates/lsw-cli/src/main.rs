@@ -5,10 +5,8 @@
 #[cfg(not(unix))]
 compile_error!("the LSW 1.0 beta CLI currently requires a Unix host");
 
-mod agent_client;
 mod arguments;
 mod completion;
-mod daemon_client;
 mod desktop_launcher;
 mod file_bench;
 #[cfg(unix)]
@@ -34,11 +32,9 @@ use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use agent_client::AgentClient;
 use arguments::{
     next_value, parse_number, resolve_port_forwards, CreateArguments, InstallArguments,
 };
-use daemon_client::DaemonClient;
 use installation::{find_windows_agent, install_instance};
 use license::{license, show_activation_notice_once};
 use lsw_core::{
@@ -48,12 +44,13 @@ use lsw_core::{
     PeImportSymbol, ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner, SessionKind,
     StartRequest, StateStore, VmAccelerator, WindowsProfile,
 };
+use lsw_host::{agent_address, AgentClient, DaemonClient};
 use progress::{ProgressEvent, ProgressRenderer};
-
 // Windows can spend several minutes servicing a cold boot, and removable
 // identity media can arrive after the automatic SCM agent starts.
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
+const PIPE_SHELL_NOTICE: &str =
+    "lsw: note: this agent provides a pipe shell; ConPTY is not available in this beta build";
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
@@ -1194,6 +1191,9 @@ fn shell(store: &StateStore, arguments: &[OsString]) -> Result<u8, Box<dyn std::
         working_directory: None,
     };
     let client = connect_agent(store, &name)?;
+    if !client.supports_conpty() {
+        eprintln!("{PIPE_SHELL_NOTICE}");
+    }
     guest_exit_code(client.run(&request, true)?)
 }
 
@@ -1559,7 +1559,7 @@ fn connect_agent(
             progress.finish();
             return Err(format!(
                 "timed out waiting for the guest agent at {}; inspect the VM and {}",
-                agent_client::address(&manifest),
+                agent_address(&manifest),
                 store.instance_dir(name)?.join("qemu.log").display()
             )
             .into());

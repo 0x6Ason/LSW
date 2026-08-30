@@ -583,7 +583,7 @@ version = "1.0.0-beta.8-dev.0"
 dependencies = [
  "ahash",
  "lsw-core",
- "signal-hook",
+ "lsw-host",
  "softbuffer",
  "winit",
 ]
@@ -607,6 +607,14 @@ name = "lsw-daemon"
 version = "1.0.0-beta.8-dev.0"
 dependencies = [
  "lsw-core",
+]
+
+[[package]]
+name = "lsw-host"
+version = "1.0.0-beta.8-dev.0"
+dependencies = [
+ "lsw-core",
+ "signal-hook",
 ]
 
 [[package]]

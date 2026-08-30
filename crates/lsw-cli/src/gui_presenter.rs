@@ -18,6 +18,7 @@ use lsw_core::{
     GuiInputEvent, GuiPointerButton, GuiWindowAction, GuiWindowDamage, GuiWindowDragHint,
     GuiWindowReady, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION,
 };
+use lsw_host::{GuiWindowEvent, GuiWindowReader, GuiWindowSession, GuiWindowWriter};
 use softbuffer::{Context, Surface};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent};
@@ -26,8 +27,6 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
 use winit::platform::wayland::EventLoopBuilderExtWayland;
 use winit::window::{ResizeDirection, Window, WindowBuilder};
-
-use crate::agent_client::{GuiWindowEvent, GuiWindowSession, GuiWindowWriter};
 
 const EVENT_QUEUE_DEPTH: usize = 256;
 const DRAG_GRANT_TIMEOUT: Duration = Duration::from_millis(750);
@@ -405,7 +404,7 @@ fn ensure_wayland_environment() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn spawn_event_reader(
-    mut reader: crate::agent_client::GuiWindowReader,
+    mut reader: GuiWindowReader,
     proxy: EventLoopProxy<PresenterWake>,
 ) -> (Receiver<AgentEvent>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::sync_channel(EVENT_QUEUE_DEPTH);

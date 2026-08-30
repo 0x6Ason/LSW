@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added the reusable Unix `lsw-host` crate and removed the CLI-private
+  1,862-line agent client and daemon client. Agent control, process/terminal,
+  seamless-GUI, and file-transfer sessions now have focused modules, `lswd`
+  startup/IPC has its own module, and the CLI retains command parsing, notices,
+  progress, and Wayland presentation. The existing 20 transport behavior tests
+  moved with their implementation and the public CLI behavior is unchanged.
 - Extracted the 2,442-line shared agent wire implementation from `lsw-core`
   into the dependency-free `lsw-protocol` crate. Focused modules now own frame,
   session, user, integration, transfer, and seamless-GUI messages, all remain
