@@ -670,6 +670,7 @@ conventions.
 - [Roadmap](ROADMAP.md)
 - [Beta acceptance scope and known limitations](docs/BETA.md)
 - [Architecture](docs/ARCHITECTURE.md)
+- [Slice 4.5 architecture and default-image optimization](docs/SLICE_4_5_OPTIMIZATION.md)
 - [Security model](docs/SECURITY.md)
 - [Development and release gates](docs/DEVELOPMENT.md)
 - [Real Windows/KVM release gate](docs/WINDOWS_KVM_E2E.md)

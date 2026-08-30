@@ -26,6 +26,10 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   only an explicit AppX allowlist and preserves Windows Update, WinSxS,
   Defender, Store, winget, WebView2, Terminal, PowerShell, ConPTY, WMI,
   hibernation, and Recovery.
+  This describes the currently implemented conservative profile. The temporary
+  beta.8 Slice 4.5 must replace it with the measured, inventory-driven removal
+  and service/policy contract in `SLICE_4_5_OPTIMIZATION.md`; none of those
+  broader reductions are claimed until the exact Windows/KVM comparison passes.
 - The pre-applied unattend installs the Windows x64 PE agent during
   `specialize` and registers the automatic `LSWAgent` service as
   `NT SERVICE\LSWAgent`, rather than using an interactive user's `HKCU` startup

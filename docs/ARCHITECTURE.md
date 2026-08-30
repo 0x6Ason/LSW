@@ -32,7 +32,26 @@ validation claims on the beta.8 development line.
 | Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and mapped as agent-session and registered-user-session Windows `L:` without a guest filesystem driver |
 | User-session companion | Slice 3 implemented; Slice 4 source-gated | On-demand authenticated broker launched through a SID-checked WTS token; GUI ownership, first-HWND capture, icon discovery, desktop `L:`, and idle exit |
 | Host compositor bridge | Slice 4 source-gated | First visible HWND mapped to an undecorated native Wayland window; focus, keyboard, pointer, resize, explicit window actions, and exact-HWND crash reattach |
+| `lswg` | Slice 4.5 extraction planned | Version-locked native Linux Wayland integration runtime, bundled with every standard release and demand-started for GUI work; the current presenter still resides in `lsw` until the extraction gate lands |
 | Fast graphics transport | CPU correctness path implemented | Bounded 128-pixel damage tiles over the authenticated channel; shared-memory or GPU acceleration remains optional future work |
+
+## Source ownership
+
+The current product boundaries are correct at the process level, but several
+implementation files combine entry-point routing, protocol encoding, runtime
+state, platform integration, and tests. Slice 4.5 makes the source layout match
+the process model before the desktop matrix expands. It follows the applicable
+WSL management pattern of separate client, service, host, guest, shared, and GUI
+components while retaining LSW's own QEMU/KVM direction and non-RDP seamless
+protocol.
+
+The target tree, migration order, bundled `lswg` contract, line-count limits,
+and default-image acceptance measurements are specified in
+[`SLICE_4_5_OPTIMIZATION.md`](SLICE_4_5_OPTIMIZATION.md). CI immediately applies
+a no-growth ratchet to legacy files above 1,000 lines and rejects new oversized
+Rust or automation files. The completed slice removes all production
+exceptions; moving code without a single-responsibility boundary does not count
+as completion.
 
 ## Lifecycle
 

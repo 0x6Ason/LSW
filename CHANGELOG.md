@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Added the temporary beta.8 Slice 4.5 architecture and default-image
+  optimization contract. It defines a WSL-inspired host/guest/shared/service
+  source split, a separately versioned but always bundled `lswg` runtime, an
+  inventory-driven default `slim` removal/service/policy matrix, preservation
+  gates, and exact-ISO resource comparisons. CI now rejects new Rust or
+  automation files above 1,000 lines and prevents every recorded legacy
+  oversized file from growing while it is split.
 - Added the fail-closed beta.8 native GUI release path. One
   `lsw-windows-kvm-gui-e2e` job now performs the complete real Windows install,
   creates a stopped linked clone with an ephemeral administrator and no

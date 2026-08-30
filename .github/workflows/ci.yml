@@ -28,6 +28,8 @@ jobs:
           sudo apt-get install --yes shellcheck
       - name: Check syntax and lint
         run: scripts/check-shell.sh
+      - name: Enforce the Slice 4.5 source-layout ratchet
+        run: scripts/check-source-layout.sh
 
   rust:
     name: Rust ${{ matrix.check }}

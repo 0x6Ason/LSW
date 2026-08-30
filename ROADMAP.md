@@ -76,7 +76,7 @@ soaks, and a cold-restart Windows/KVM gate.
 This release makes a Windows GUI application launched by LSW behave like a
 native Linux desktop application rather than exposing a remote Windows desktop.
 
-beta.8 is delivered as eight bounded slices. The slices are internal acceptance
+beta.8 is delivered as nine bounded slices. The slices are internal acceptance
 boundaries, not additional version tags; each must keep existing terminal and
 headless workflows working.
 
@@ -187,6 +187,75 @@ headless workflows working.
   development adapter for the Windows plus WSL workstation, not a user
   requirement or the final Linux desktop claim. Slice 4 release acceptance
   remains open until an exact candidate passes that native runner at runtime.
+
+### Slice 4.5: architecture and default-image optimization
+
+- Insert a temporary architecture boundary before expanding the GUI feature
+  matrix. Split host, guest, shared protocol, servicing, packaging, and E2E
+  responsibilities into explicit modules. Keep executable entry points thin,
+  move command implementations under command modules, and split capture,
+  presentation, input, lifecycle, media, and DISM code by ownership. Production
+  source files must finish below 1,000 lines, executable entry points below 300
+  lines, and E2E scenarios must use reusable libraries and fixtures instead of
+  growing single shell scripts. A CI ratchet prevents every existing oversized
+  file from growing while the split is in progress and rejects new oversized
+  files immediately.
+- Follow the applicable management boundaries from Microsoft's WSL and WSLg
+  projects: a small CLI, a separately supervised service, explicit host/guest/
+  shared protocol layers, versioned packaging, and a GUI integration component
+  that users do not assemble themselves. Do not copy WSL's Windows-hosted
+  implementation or adopt RDP as LSW's seamless transport.
+- Extract the current native presenter into a version-locked `lswg` component.
+  It remains an LSW-owned native Linux Wayland runtime, is shipped and installed
+  with every standard LSW bundle, is started on demand by `lsw` inside the
+  calling Linux graphical session, and requires no separate package-selection
+  step. It obtains VM/agent leases from display-agnostic `lswd`; the daemon must
+  not depend on `WAYLAND_DISPLAY`. `lsw run --gui` must fail with a precise
+  corrupt-install diagnostic if the matching helper is missing or has a
+  different protocol/build identity. Headless use leaves it idle, but release
+  bundles cannot omit it because Windows GUI integration is a core product path.
+- Replace the current conservative `slim` recipe with an inventory-driven,
+  locally applied default developer profile. Offline DISM must remove the
+  provisioned and installed targets for Copilot, Recall/Click to Do and removable
+  AI experiences, OneDrive, consumer Teams/Skype/Cortana, Xbox and Game Bar,
+  Clipchamp, Solitaire, Bing consumer feeds, Feedback/Get Started/Get Help/Tips,
+  Phone Link, Mixed Reality, legacy 3D/Maps/People/Todos/Mail/Calendar apps, and
+  third-party promotional packages when they are present. Package-family names
+  vary by Windows build, so the plan must inventory first, use an explicit
+  versioned allowlist, record every match/removal, and fail the real gate if a
+  targeted package survives. Never use an unbounded wildcard removal.
+- Remove the Recall optional-feature payload when present, invoke Microsoft's
+  supported OneDrive uninstaller, remove its startup hooks, and block consumer
+  reprovisioning. Disable the measured high-impact background set in `slim`:
+  DiagTrack, SysMain, WSearch, Xbox services, Fax, Retail Demo, and obsolete
+  diagnostics collectors. Disable the legacy tablet service only after the
+  no-touch capability and keyboard/IME/accessibility matrix passes. Limit
+  Delivery Optimization to non-peer, on-demand behavior instead of breaking
+  Windows Update or Store delivery. Keep the core Diagnostic Policy Service
+  until LSW supplies and gates an equivalent repair path.
+- Apply documented machine/default-user policies for Widgets/news, Windows
+  Spotlight and lock-screen promotion, suggested and consumer applications,
+  Start recommendations, web results in local search, activity history,
+  advertising ID, tailored experiences, and optional diagnostic data. Every
+  service and policy mutation must be declarative, edition/build-aware,
+  idempotent, and included in the sealed-image preparation identity.
+- Keep `vanilla` genuinely untouched. Even the default `slim` profile must
+  preserve Windows Update and the servicing stack, WinSxS, MSI/MSIX deployment,
+  Microsoft Store, App Installer/winget, WebView2, PowerShell, Windows Terminal,
+  ConPTY, WMI, Defender, UAC and the secure desktop, WinRE, hibernation, core
+  accessibility/input, Explorer/file dialogs, and Visual Studio/SDK build
+  prerequisites. The later experimental minimal/shell-light profile may make a
+  different compatibility tradeoff, but it cannot weaken `slim` silently.
+- Publish a cold-boot `vanilla` versus `slim` report from the same exact ISO:
+  provisioned packages, optional features, services, startup entries, process
+  count, committed/working memory, guest system-volume usage, and host qcow2
+  allocation after TRIM. Slice acceptance requires zero surviving removal
+  targets, zero running disabled targets after a cold restart, no OneDrive
+  process/startup entry, at least 10 fewer background processes, at least
+  256 MiB lower idle committed memory, and at least 3 GiB lower guest-used disk,
+  while installation, user registration, Store/winget, Windows Update scan,
+  Defender, MSI/MSIX, ConPTY, hibernate/resume, UAC, file sharing, and seamless
+  GUI gates continue to pass.
 
 ### Slice 5: complete HWND and display behavior
 

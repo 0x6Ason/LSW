@@ -17,10 +17,15 @@ cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 scripts/check-shell.sh
+scripts/check-source-layout.sh
 ```
 
 `scripts/check-shell.sh` requires Bash, Dash, and ShellCheck. It parses every
 script with the shell named by its shebang before running ShellCheck.
+`scripts/check-source-layout.sh` rejects new Rust and automation files above
+1,000 lines and prevents every temporary Slice 4.5 exception from growing. An
+exception must be removed as soon as its module is split below the default; the
+completed slice permits no production exception.
 
 ## Apple Silicon x86_64 validation
 
