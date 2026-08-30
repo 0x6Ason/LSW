@@ -9,10 +9,9 @@ mod arguments;
 mod completion;
 mod desktop_launcher;
 mod file_bench;
-#[cfg(unix)]
-mod gui_presenter;
 mod installation;
 mod license;
+mod lswg_launcher;
 mod path_translation;
 mod progress;
 mod shares;
@@ -1219,21 +1218,14 @@ fn guest_command(
             .folder_shares
             .iter()
             .any(|share| share.transport == FolderShareTransport::LiveSmb);
-        let session = connect_agent(store, &name)?.open_gui_window(&GuiStartRequest {
+        let request = GuiStartRequest {
             user_name,
             request,
             environment: parsed.environment,
             mount_live_share,
-        })?;
-        #[cfg(unix)]
-        {
-            return guest_exit_code(gui_presenter::present(session)?);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = session;
-            return Err("beta.8 seamless GUI presentation requires a native Wayland host".into());
-        }
+        };
+        connect_agent(store, &name)?.probe()?;
+        return guest_exit_code(lswg_launcher::present(store, &name, &request)?);
     }
     let client = connect_agent(store, &name)?;
     if parsed.detached {

@@ -449,7 +449,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release -p lsw-cli -p lsw-daemon
+          cargo build --locked --release -p lsw-cli -p lsw-daemon -p lswg
           scripts/build-windows-agent.sh
 
       - name: Run the real Windows/KVM gate
@@ -457,6 +457,7 @@ jobs:
         env:
           LSW_E2E_LSW: ${{ env.CARGO_TARGET_DIR }}/release/lsw
           LSW_E2E_LSWD: ${{ env.CARGO_TARGET_DIR }}/release/lswd
+          LSW_E2E_LSWG: ${{ env.CARGO_TARGET_DIR }}/release/lswg
           LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
           LSW_E2E_ARTIFACT_DIR: ${{ env.LSW_BUILD_ROOT }}/artifacts
           LSW_E2E_ACTIVE_ROOT_FILE: ${{ env.LSW_BUILD_ROOT }}/active-e2e-root
@@ -512,6 +513,7 @@ jobs:
         env:
           LSW_E2E_LSW: ${{ env.CARGO_TARGET_DIR }}/release/lsw
           LSW_E2E_LSWD: ${{ env.CARGO_TARGET_DIR }}/release/lswd
+          LSW_E2E_LSWG: ${{ env.CARGO_TARGET_DIR }}/release/lswg
           LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
           LSW_E2E_ARTIFACT_DIR: ${{ env.LSW_BUILD_ROOT }}/artifacts
           LSW_E2E_ACTIVE_ROOT_FILE: ${{ env.LSW_BUILD_ROOT }}/active-e2e-root
@@ -707,13 +709,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --locked --release -p lsw-cli -p lsw-daemon
+          cargo build --locked --release -p lsw-cli -p lsw-daemon -p lswg
           scripts/build-windows-agent.sh
 
       - name: Run the signed-in seamless GUI matrix
         shell: bash
         env:
           LSW_E2E_LSW: ${{ env.CARGO_TARGET_DIR }}/release/lsw
+          LSW_E2E_LSWG: ${{ env.CARGO_TARGET_DIR }}/release/lswg
           LSW_DAEMON: ${{ env.CARGO_TARGET_DIR }}/release/lswd
           LSW_WINDOWS_AGENT: ${{ env.CARGO_TARGET_DIR }}/x86_64-pc-windows-gnu/release/lsw-agent.exe
         run: |
@@ -721,6 +724,7 @@ jobs:
           candidate_agent="$LSW_WINDOWS_AGENT"
           expected_agent_sha=$(sha256sum -- "$candidate_agent" | awk '{ print $1; exit }')
           expected_daemon_sha=$(sha256sum -- "$LSW_DAEMON" | awk '{ print $1; exit }')
+          expected_lswg_sha=$(sha256sum -- "$LSW_E2E_LSWG" | awk '{ print $1; exit }')
           daemon_status=$("$LSW_E2E_LSW" daemon status)
           daemon_pid=$(printf '%s\n' "$daemon_status" | \
             awk -F= '$1 ~ /^[[:space:]]*PID$/ && $2 ~ /^[0-9]+$/ { print $2; exit }')
@@ -737,6 +741,7 @@ jobs:
             printf 'candidate_sha=%s\n' "$GITHUB_SHA"
             printf 'linux_cli_sha256=%s\n' "$(sha256sum -- "$LSW_E2E_LSW" | awk '{ print $1; exit }')"
             printf 'linux_daemon_sha256=%s\n' "$expected_daemon_sha"
+            printf 'linux_lswg_sha256=%s\n' "$expected_lswg_sha"
             printf 'windows_agent_sha256=%s\n' "$expected_agent_sha"
           } >"$LSW_GUI_BUILD_ROOT/artifacts/attestation.env"
           chmod 600 -- "$LSW_GUI_BUILD_ROOT/artifacts/attestation.env"

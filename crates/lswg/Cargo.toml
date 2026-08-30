@@ -1,0 +1,17 @@
+[package]
+name = "lswg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Version-locked native Wayland integration runtime for LSW"
+publish = false
+
+[dependencies]
+lsw-core = { path = "../lsw-core" }
+lsw-host = { path = "../lsw-host" }
+
+[target.'cfg(unix)'.dependencies]
+ahash = "=0.8.11"
+softbuffer = { version = "=0.4.8", default-features = false, features = ["wayland", "wayland-dlopen"] }
+winit = { version = "=0.29.15", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }

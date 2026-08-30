@@ -59,6 +59,9 @@ Install the release bundle and repair host dependencies:
 lsw doctor --fix
 ```
 
+The standard bundle always installs the matching on-demand `lswg` Wayland
+runtime; Windows GUI support has no separate package or resident service.
+
 Create and start a Windows development environment in one command:
 
 ```bash

@@ -11,6 +11,7 @@ overall_timeout_seconds=${LSW_NATIVE_GUI_E2E_TIMEOUT_SECONDS:-1800}
 workspace_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 lsw=${LSW_E2E_LSW:-"$workspace_root/target/release/lsw"}
 lswd=${LSW_E2E_LSWD:-"$workspace_root/target/release/lswd"}
+lswg=${LSW_E2E_LSWG:-"$workspace_root/target/release/lswg"}
 agent=${LSW_WINDOWS_AGENT:-"$workspace_root/target/x86_64-pc-windows-gnu/release/lsw-agent.exe"}
 active_root_file=${LSW_E2E_ACTIVE_ROOT_FILE:-}
 artifact_dir=${LSW_E2E_ARTIFACT_DIR:-}
@@ -53,8 +54,8 @@ do
         exit 1
     fi
 done
-if [ ! -x "$lsw" ] || [ ! -x "$lswd" ] || [ ! -f "$agent" ]; then
-    echo "error: the exact candidate lsw, lswd, and Windows agent are required" >&2
+if [ ! -x "$lsw" ] || [ ! -x "$lswd" ] || [ ! -x "$lswg" ] || [ ! -f "$agent" ]; then
+    echo "error: the exact candidate lsw, lswd, lswg, and Windows agent are required" >&2
     exit 1
 fi
 if ! printf '%s\n' "$expected_sha" | grep -Eq '^[0-9a-f]{40}$'; then
@@ -128,7 +129,7 @@ if [ -L "$handoff_metadata" ] || [ ! -f "$handoff_metadata" ] \
 then
     fail "the GUI handoff metadata must be one bounded private regular file"
 fi
-[ "$(awk 'END { print NR }' "$handoff_metadata")" -eq 9 ] \
+[ "$(awk 'END { print NR }' "$handoff_metadata")" -eq 10 ] \
     || fail "the GUI handoff metadata has an unexpected field count"
 handoff_version=$(handoff_field version) || fail "the GUI handoff has no unique version"
 handoff_sha=$(handoff_field candidate_sha) || fail "the GUI handoff has no unique candidate SHA"
@@ -138,6 +139,7 @@ instance=$(handoff_field instance) || fail "the GUI handoff has no unique instan
 login_secret=$(handoff_field login_secret) || fail "the GUI handoff has no unique login secret"
 handoff_lsw_sha=$(handoff_field lsw_sha256) || fail "the GUI handoff has no unique CLI hash"
 handoff_lswd_sha=$(handoff_field lswd_sha256) || fail "the GUI handoff has no unique daemon hash"
+handoff_lswg_sha=$(handoff_field lswg_sha256) || fail "the GUI handoff has no unique lswg hash"
 handoff_agent_sha=$(handoff_field agent_sha256) || fail "the GUI handoff has no unique agent hash"
 
 [ "$handoff_version" = 1 ] || fail "unsupported GUI handoff version"
@@ -150,7 +152,7 @@ handoff_agent_sha=$(handoff_field agent_sha256) || fail "the GUI handoff has no 
     || fail "the GUI handoff login-secret path changed"
 printf '%s\n' "$instance" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' \
     || fail "the GUI handoff instance name is invalid"
-for handoff_hash in "$handoff_lsw_sha" "$handoff_lswd_sha" "$handoff_agent_sha"; do
+for handoff_hash in "$handoff_lsw_sha" "$handoff_lswd_sha" "$handoff_lswg_sha" "$handoff_agent_sha"; do
     printf '%s\n' "$handoff_hash" | grep -Eq '^[0-9a-f]{64}$' \
         || fail "the GUI handoff contains an invalid binary hash"
 done
@@ -158,6 +160,8 @@ done
     || fail "the GUI handoff CLI does not match the candidate"
 [ "$handoff_lswd_sha" = "$(sha256sum "$lswd" | awk '{ print $1 }')" ] \
     || fail "the GUI handoff daemon does not match the candidate"
+[ "$handoff_lswg_sha" = "$(sha256sum "$lswg" | awk '{ print $1 }')" ] \
+    || fail "the GUI handoff lswg does not match the candidate"
 [ "$handoff_agent_sha" = "$(sha256sum "$agent" | awk '{ print $1 }')" ] \
     || fail "the GUI handoff agent does not match the candidate"
 if [ -L "$login_secret" ] || [ ! -f "$login_secret" ] \
@@ -183,6 +187,8 @@ pass real_install_handoff
 
 export LSW_STATE_DIR="$state_dir"
 export LSW_WINDOWS_AGENT="$agent"
+export LSWG="$lswg"
+export LSWG_SHA256="$handoff_lswg_sha"
 autospawn_blocker="$handoff_root/lswd-autospawn-disabled"
 export LSW_DAEMON="$autospawn_blocker"
 daemon_pid=

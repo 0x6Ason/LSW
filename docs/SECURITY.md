@@ -117,6 +117,13 @@ normal Windows close path. No public VNC, RDP, or LAN listener is enabled. Slice
 4 does not cross UIPI or the UAC secure desktop; later slices must retain the
 private-viewer fallback instead of weakening those boundaries.
 
+The native presenter runs on demand as the separately bundled `lswg` process.
+Before launch, `lsw` requires a regular non-symlink helper, verifies its exact
+SHA-256, and checks the package version plus `gui-window-v3` identity. It sends
+one bounded GUI request over stdin. The per-instance agent token is never placed
+in argv, stdin, or the environment; `lswg` reloads it from the private state
+store and revalidates the registered desktop user and live-share mode first.
+
 The recovery viewer keeps QEMU's VNC endpoint on a per-instance Unix socket.
 Since `remote-viewer` cannot consume a Unix socket for VNC, `lsw view` exposes
 it only through a random `127.0.0.1` port while launching the viewer. The

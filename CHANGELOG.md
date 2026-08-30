@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Extracted the 2,001-line native Wayland presenter from `lsw` into the bundled
+  `lswg` runtime. Rendering, input, event-loop, WSLg-adapter, and tests now have
+  focused modules below 1,000 lines. GUI launch verifies the helper's exact hash
+  and version, sends one bounded non-secret stdin request, and preserves the
+  existing GUI exit code. Release bundles, installation, verification, and both
+  native and WSLg gates now include and attest the same `lswg` binary.
 - Added the reusable Unix `lsw-host` crate and removed the CLI-private
   1,862-line agent client and daemon client. Agent control, process/terminal,
   seamless-GUI, and file-transfer sessions now have focused modules, `lswd`

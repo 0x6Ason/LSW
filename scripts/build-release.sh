@@ -43,7 +43,7 @@ esac
 SOURCE_DATE_EPOCH=$release_epoch
 export SOURCE_DATE_EPOCH
 
-cargo build --locked --release --bin lsw --bin lswd
+cargo build --locked --release --bin lsw --bin lswd --bin lswg
 windows_agent=$("$workspace_root/scripts/build-windows-agent.sh")
 version_output=$("$cargo_target_directory/release/lsw" --version)
 version_field_count=$(printf '%s\n' "$version_output" | awk '{ print NF }')
@@ -94,7 +94,13 @@ staged_checksum="$staged_archive.sha256"
 install -d -m 0755 -- "$staged_bundle/docs" "$staged_bundle/source" "$staged_bundle/systemd"
 install -m 0755 -- "$cargo_target_directory/release/lsw" "$staged_bundle/lsw"
 install -m 0755 -- "$cargo_target_directory/release/lswd" "$staged_bundle/lswd"
+install -m 0755 -- "$cargo_target_directory/release/lswg" "$staged_bundle/lswg"
 install -m 0644 -- "$windows_agent" "$staged_bundle/lsw-agent.exe"
+lsw_sha256=$(sha256sum -- "$staged_bundle/lsw" | awk '{ print $1; exit }')
+lswd_sha256=$(sha256sum -- "$staged_bundle/lswd" | awk '{ print $1; exit }')
+lswg_sha256=$(sha256sum -- "$staged_bundle/lswg" | awk '{ print $1; exit }')
+agent_sha256=$(sha256sum -- "$staged_bundle/lsw-agent.exe" | awk '{ print $1; exit }')
+printf '%s\n' "$lswg_sha256" >"$staged_bundle/lswg.sha256"
 install -m 0755 -- scripts/install.sh "$staged_bundle/install.sh"
 install -m 0644 -- contrib/systemd/lswd.service contrib/systemd/lswd.socket \
     "$staged_bundle/systemd/"
@@ -123,6 +129,10 @@ printf '%s\n' \
     'CORRESPONDING_SOURCE=source/' \
     'HOST_TARGET=x86_64-unknown-linux-gnu' \
     'GUEST_AGENT_TARGET=x86_64-pc-windows-gnu' \
+    "LSW_SHA256=$lsw_sha256" \
+    "LSWD_SHA256=$lswd_sha256" \
+    "LSWG_SHA256=$lswg_sha256" \
+    "WINDOWS_AGENT_SHA256=$agent_sha256" \
     "SOURCE_DATE_EPOCH=$release_epoch" >"$staged_bundle/BUILDINFO.txt"
 
 tar --sort=name --mtime="@$release_epoch" --owner=0 --group=0 --numeric-owner \

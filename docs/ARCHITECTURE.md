@@ -34,7 +34,7 @@ validation claims on the beta.8 development line.
 | Live Linux folder | Implemented; opt-in | One canonical host root exported by private QEMU user-network SMB and mapped as agent-session and registered-user-session Windows `L:` without a guest filesystem driver |
 | User-session companion | Slice 3 implemented; Slice 4 source-gated | On-demand authenticated broker launched through a SID-checked WTS token; GUI ownership, first-HWND capture, icon discovery, desktop `L:`, and idle exit |
 | Host compositor bridge | Slice 4 source-gated | First visible HWND mapped to an undecorated native Wayland window; focus, keyboard, pointer, resize, explicit window actions, and exact-HWND crash reattach |
-| `lswg` | Slice 4.5 extraction planned | Version-locked native Linux Wayland integration runtime, bundled with every standard release and demand-started for GUI work; the current presenter still resides in `lsw` until the extraction gate lands |
+| `lswg` | Slice 4.5 extraction implemented | Version-locked native Linux Wayland integration runtime, exact-hash checked, bundled with every standard release, and demand-started for GUI work |
 | Fast graphics transport | CPU correctness path implemented | Bounded 128-pixel damage tiles over the authenticated channel; shared-memory or GPU acceleration remains optional future work |
 
 ## Source ownership
@@ -53,8 +53,11 @@ The first Slice 4.5 migration is complete: the former 2,442-line
 `lsw-core` keeps its existing public names while host consumers are migrated.
 The second migration moved the former CLI-private daemon and agent clients into
 `lsw-host`; process, GUI, transfer, and daemon transports are now separately
-owned modules, while command parsing, user notices, and presentation remain in
-`lsw`.
+owned modules, while command parsing and user notices remain in `lsw`. The
+third migration moved the former 2,001-line native presenter into the bundled
+`lswg` process. Rendering, input, WSLg compatibility, orchestration, and tests
+now have focused modules below 1,000 lines; `lsw` retains only the bounded
+launch handoff and exact helper-integrity checks.
 
 The target tree, migration order, bundled `lswg` contract, line-count limits,
 and default-image acceptance measurements are specified in

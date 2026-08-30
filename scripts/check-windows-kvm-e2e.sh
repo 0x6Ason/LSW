@@ -1,10 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
-
 workspace_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 lsw=${LSW_E2E_LSW:-"$workspace_root/target/release/lsw"}
 lswd=${LSW_E2E_LSWD:-"$workspace_root/target/release/lswd"}
+lswg=${LSW_E2E_LSWG:-"$workspace_root/target/release/lswg"}
 iso=${LSW_WINDOWS_ISO:-}
 edition=${LSW_WINDOWS_EDITION:-pro}
 profile=${LSW_WINDOWS_PROFILE:-slim}
@@ -21,7 +21,6 @@ gui_handoff=${LSW_E2E_GUI_HANDOFF:-0}
 candidate_sha=${LSW_E2E_CANDIDATE_SHA:-${GITHUB_SHA:-}}
 expected_iso_sha256=${LSW_WINDOWS_ISO_SHA256:-}
 e2e_no_viewer=${LSW_E2E_NO_VIEWER:-1}
-
 for required_command in awk chmod cmp date grep kill mkdir mktemp mv python3 rm setsid sha256sum sleep timeout tr uname; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "error: required command $required_command was not found" >&2
@@ -40,8 +39,8 @@ if [ ! -f "$agent" ]; then
     echo "error: set LSW_WINDOWS_AGENT to the matching lsw-agent.exe" >&2
     exit 1
 fi
-if [ ! -x "$lsw" ] || [ ! -x "$lswd" ]; then
-    echo "error: build release lsw and lswd binaries before running this gate" >&2
+if [ ! -x "$lsw" ] || [ ! -x "$lswd" ] || [ ! -x "$lswg" ]; then
+    echo "error: build release lsw, lswd, and lswg binaries before running this gate" >&2
     exit 1
 fi
 case "$timeout_seconds" in
@@ -117,7 +116,6 @@ if [ -n "$active_root_file" ]; then
         exit 1
     fi
 fi
-
 expected_iso_sha256=$(printf '%s' "$expected_iso_sha256" | tr 'A-F' 'a-f')
 if [ -n "$expected_iso_sha256" ]; then
     case "$expected_iso_sha256" in
@@ -382,6 +380,7 @@ collect_e2e_artifacts() {
         printf 'maintenance_helper_start_name=%s\n' "$maintenance_helper_start_name"
         printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
         printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
+        printf 'lswg_sha256=%s\n' "$(sha256sum "$lswg" | awk '{ print $1 }')"
         printf 'agent_sha256=%s\n' "$(sha256sum "$agent" | awk '{ print $1 }')"
         printf 'ovmf_code_sha256=%s\n' "$ovmf_code_sha256"
         printf 'ovmf_vars_sha256=%s\n' "$ovmf_vars_sha256"
@@ -741,6 +740,7 @@ prepare_gui_handoff() {
         printf 'login_secret=%s\n' "$gui_login_secret"
         printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
         printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
+        printf 'lswg_sha256=%s\n' "$(sha256sum "$lswg" | awk '{ print $1 }')"
         printf 'agent_sha256=%s\n' "$(sha256sum "$agent" | awk '{ print $1 }')"
     } >"$gui_handoff_tmp"
     chmod 600 "$gui_handoff_tmp"

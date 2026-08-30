@@ -205,15 +205,17 @@ headless workflows working.
   shared protocol layers, versioned packaging, and a GUI integration component
   that users do not assemble themselves. Do not copy WSL's Windows-hosted
   implementation or adopt RDP as LSW's seamless transport.
-- Extract the current native presenter into a version-locked `lswg` component.
-  It remains an LSW-owned native Linux Wayland runtime, is shipped and installed
-  with every standard LSW bundle, is started on demand by `lsw` inside the
-  calling Linux graphical session, and requires no separate package-selection
-  step. It obtains VM/agent leases from display-agnostic `lswd`; the daemon must
-  not depend on `WAYLAND_DISPLAY`. `lsw run --gui` must fail with a precise
-  corrupt-install diagnostic if the matching helper is missing or has a
-  different protocol/build identity. Headless use leaves it idle, but release
-  bundles cannot omit it because Windows GUI integration is a core product path.
+- The native presenter is now extracted into the version-locked `lswg`
+  component. It remains an LSW-owned native Linux Wayland runtime, is shipped
+  and installed with every standard LSW bundle, is started on demand by `lsw`
+  inside the calling Linux graphical session, and requires no separate
+  package-selection step. Display-agnostic `lswd` makes the VM ready without
+  depending on `WAYLAND_DISPLAY`; `lswg` then owns the authenticated GUI agent
+  session.
+  `lsw run --gui` fails with a precise corrupt-install diagnostic if the helper
+  is missing or has a different exact hash, protocol, or build identity.
+  Headless use leaves it idle, but release bundles cannot omit it because
+  Windows GUI integration is a core product path.
 - Replace the current conservative `slim` recipe with an inventory-driven,
   locally applied default developer profile. Offline DISM must remove the
   provisioned and installed targets for Copilot, Recall/Click to Do and removable

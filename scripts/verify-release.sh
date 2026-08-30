@@ -131,7 +131,7 @@ fi
 for required_file in \
     BUILDINFO.txt CHANGELOG.md LICENSE README.md ROADMAP.md THIRD_PARTY_NOTICES.md \
     SOURCE-MANIFEST.sha256 \
-    install.sh lsw lsw-agent.exe lswd \
+    install.sh lsw lsw-agent.exe lswd lswg lswg.sha256 \
     systemd/lswd.service systemd/lswd.socket \
     docs/DEVELOPMENT.md docs/WINDOWS_KVM_E2E.md \
     source/Cargo.lock source/Cargo.toml source/LICENSE source/README.md \
@@ -143,6 +143,10 @@ for required_file in \
     source/crates/lsw-cli/Cargo.toml source/crates/lsw-cli/src/main.rs \
     source/crates/lsw-core/Cargo.toml source/crates/lsw-core/src/lib.rs \
     source/crates/lsw-daemon/Cargo.toml source/crates/lsw-daemon/src/main.rs \
+    source/crates/lsw-host/Cargo.toml source/crates/lsw-host/src/lib.rs \
+    source/crates/lsw-protocol/Cargo.toml source/crates/lsw-protocol/src/lib.rs \
+    source/crates/lswg/Cargo.toml source/crates/lswg/src/lib.rs \
+    source/crates/lswg/src/main.rs \
     source/scripts/build-release.sh source/scripts/build-windows-agent.sh \
     source/scripts/check-systemd-socket-activation.sh \
     source/scripts/normalize-pe-timestamp.py \
@@ -157,7 +161,7 @@ for required_file in \
         exit 1
     fi
 done
-for executable in install.sh lsw lswd; do
+for executable in install.sh lsw lswd lswg; do
     if [ ! -x "$bundle/$executable" ]; then
         echo "error: archive entry is not executable: $executable" >&2
         exit 1
@@ -180,6 +184,31 @@ if ! grep -Fx 'LICENSE=GPL-3.0-or-later' "$bundle/BUILDINFO.txt" >/dev/null \
     || ! grep -Fx 'HOST_TARGET=x86_64-unknown-linux-gnu' "$bundle/BUILDINFO.txt" >/dev/null \
     || ! grep -Fx 'GUEST_AGENT_TARGET=x86_64-pc-windows-gnu' "$bundle/BUILDINFO.txt" >/dev/null; then
     echo "error: BUILDINFO is incomplete or has unexpected release metadata" >&2
+    exit 1
+fi
+verify_build_hash() {
+    component_sha=$(sha256sum -- "$bundle/$1" | awk '{ print $1; exit }')
+    if ! grep -Fx "$2=$component_sha" "$bundle/BUILDINFO.txt" >/dev/null; then
+        echo "error: BUILDINFO does not identify the exact $1 binary" >&2
+        exit 1
+    fi
+}
+verify_build_hash lsw LSW_SHA256
+verify_build_hash lswd LSWD_SHA256
+verify_build_hash lsw-agent.exe WINDOWS_AGENT_SHA256
+expected_lswg_sha=$(awk 'NR == 1 { value = $0 } END { if (NR == 1) print value; else exit 1 }' \
+    "$bundle/lswg.sha256") || {
+    echo "error: lswg SHA-256 sidecar must contain exactly one line" >&2
+    exit 1
+}
+if ! printf '%s\n' "$expected_lswg_sha" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "error: lswg SHA-256 sidecar is not a lowercase SHA-256 digest" >&2
+    exit 1
+fi
+actual_lswg_sha=$(sha256sum -- "$bundle/lswg" | awk '{ print $1; exit }')
+if [ "$actual_lswg_sha" != "$expected_lswg_sha" ] \
+    || ! grep -Fx "LSWG_SHA256=$expected_lswg_sha" "$bundle/BUILDINFO.txt" >/dev/null; then
+    echo "error: bundled lswg does not match its exact build identity" >&2
     exit 1
 fi
 if ! cmp -s "$bundle/LICENSE" "$bundle/source/LICENSE"; then
@@ -227,7 +256,8 @@ if ! grep -F 'license = "GPL-3.0-or-later"' "$bundle/source/Cargo.toml" >/dev/nu
 fi
 
 if ! file "$bundle/lsw" | grep -E 'ELF 64-bit LSB.*x86-64' >/dev/null \
-    || ! file "$bundle/lswd" | grep -E 'ELF 64-bit LSB.*x86-64' >/dev/null; then
+    || ! file "$bundle/lswd" | grep -E 'ELF 64-bit LSB.*x86-64' >/dev/null \
+    || ! file "$bundle/lswg" | grep -E 'ELF 64-bit LSB.*x86-64' >/dev/null; then
     echo "error: archive host binaries are not Linux x86_64 ELF executables" >&2
     exit 1
 fi
@@ -251,11 +281,16 @@ fi
 
 if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
     "$bundle/lsw" --version | grep -Fx "lsw $release_version" >/dev/null
+    "$bundle/lswg" --version \
+        | grep -Fx "lswg $release_version gui-window-v3" >/dev/null
     "$bundle/lsw" help >/dev/null
     install_test_prefix="$verification_directory/install-root"
     LSW_INSTALL_PREFIX="$install_test_prefix" "$bundle/install.sh" >/dev/null
     if ! cmp -s "$bundle/lsw" "$install_test_prefix/bin/lsw" \
         || ! cmp -s "$bundle/lswd" "$install_test_prefix/bin/lswd" \
+        || ! cmp -s "$bundle/lswg" "$install_test_prefix/bin/lswg" \
+        || ! cmp -s "$bundle/lswg.sha256" \
+            "$install_test_prefix/libexec/lsw/lswg.sha256" \
         || ! cmp -s "$bundle/lsw-agent.exe" \
             "$install_test_prefix/libexec/lsw/lsw-agent.exe"; then
         echo "error: install.sh did not reproduce the release binaries" >&2
@@ -263,6 +298,8 @@ if [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ]; then
     fi
     "$install_test_prefix/bin/lsw" --version \
         | grep -Fx "lsw $release_version" >/dev/null
+    "$install_test_prefix/bin/lswg" --version \
+        | grep -Fx "lswg $release_version gui-window-v3" >/dev/null
 else
     echo "note: skipped Linux x86_64 host-binary smoke tests on this verifier host" >&2
 fi

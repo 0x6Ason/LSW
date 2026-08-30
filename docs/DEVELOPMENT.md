@@ -186,7 +186,10 @@ gate described above. All Rust jobs use the declared 1.76.0 MSRV. The native
 Windows job does not boot a managed guest or exercise a service-backed ConPTY
 shell end to end;
 the QEMU jobs use no Windows ISO. CI also builds, installs, and verifies a
-disposable release bundle without publishing it.
+disposable release bundle without publishing it. `BUILDINFO.txt` identifies all
+four shipped binaries by SHA-256, and the bundle also carries an `lswg` runtime
+sidecar. Verification checks its ELF target, shared version/protocol identity,
+and installed bytes.
 
 `.github/workflows/release.yml` runs only for version tags or a manual
 dispatch. It repeats the source gates, checks package determinism, verifies the

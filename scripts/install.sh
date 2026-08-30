@@ -28,7 +28,7 @@ if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
     exit 1
 fi
 
-for required_file in lsw lswd lsw-agent.exe LICENSE; do
+for required_file in lsw lswd lswg lswg.sha256 lsw-agent.exe LICENSE; do
     if [ ! -f "$bundle_directory/$required_file" ]; then
         echo "error: bundle is missing $required_file" >&2
         exit 1
@@ -44,6 +44,8 @@ done
 install -d -m 0755 -- "$binary_directory" "$agent_directory" "$documentation_directory"
 install -m 0755 -- "$bundle_directory/lsw" "$binary_directory/lsw"
 install -m 0755 -- "$bundle_directory/lswd" "$binary_directory/lswd"
+install -m 0755 -- "$bundle_directory/lswg" "$binary_directory/lswg"
+install -m 0644 -- "$bundle_directory/lswg.sha256" "$agent_directory/lswg.sha256"
 install -m 0644 -- "$bundle_directory/lsw-agent.exe" "$agent_directory/lsw-agent.exe"
 install -m 0644 -- "$bundle_directory/LICENSE" "$documentation_directory/LICENSE"
 

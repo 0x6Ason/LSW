@@ -48,12 +48,12 @@ fi
 
 workspace_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 lsw=${LSW_E2E_LSW:-"$workspace_root/target/release/lsw"}
+lswg=${LSW_E2E_LSWG:-"$workspace_root/target/release/lswg"}
 fixture_source="$workspace_root/scripts/windows-seamless-fixture.ps1"
 host_helper_source="$workspace_root/scripts/windows-seamless-host.ps1"
 wslg_transport_probe_source="$workspace_root/scripts/check-wslg-transport.sh"
 window_title_prefix='LSW Seamless Fixture '
 window_title=
-
 for required_command in \
     awk base64 convert date dirname env grep iconv identify kill mktemp powershell.exe rm rmdir \
     id setsid sha256sum sleep stat tail tr wsl.exe wslpath
@@ -64,30 +64,30 @@ do
         exit 1
     fi
 done
-
 expected_guest_agent_sha=$(printf '%s' "$expected_guest_agent_sha" | tr 'A-F' 'a-f')
 if [ -z "${WSL_DISTRO_NAME:-}" ] || [ -z "${WAYLAND_DISPLAY:-}" ]; then
     echo "error: this driver requires an interactive WSLg Wayland session (WSL_DISTRO_NAME and WAYLAND_DISPLAY)" >&2
     exit 1
 fi
-if [ ! -x "$lsw" ]; then
-    echo "error: LSW_E2E_LSW must name an executable Linux lsw binary" >&2
+if [ ! -x "$lsw" ] || [ ! -x "$lswg" ]; then
+    echo "error: LSW_E2E_LSW and LSW_E2E_LSWG must name executable candidate binaries" >&2
     exit 1
 fi
-cli_sha=$(sha256sum -- "$lsw" | awk '{ print $1; exit }') || {
-    echo "error: could not hash the exact Linux lsw candidate" >&2
-    exit 1
+candidate_sha256() {
+    candidate_value=$(sha256sum -- "$1" | awk '{ print $1; exit }') || {
+        echo "error: could not hash the exact Linux $2 candidate" >&2
+        return 1
+    }
+    printf '%s\n' "$candidate_value" | grep -Eq '^[0-9a-f]{64}$' || {
+        echo "error: sha256sum returned an invalid Linux $2 candidate hash" >&2
+        return 1
+    }
+    printf '%s\n' "$candidate_value"
 }
-case "$cli_sha" in
-    ''|*[!0-9a-f]*)
-        echo "error: sha256sum returned an invalid Linux lsw candidate hash" >&2
-        exit 1
-        ;;
-esac
-if [ "${#cli_sha}" -ne 64 ]; then
-    echo "error: sha256sum returned a non-SHA-256 Linux candidate hash" >&2
-    exit 1
-fi
+cli_sha=$(candidate_sha256 "$lsw" lsw) || exit 1
+lswg_sha=$(candidate_sha256 "$lswg" lswg) || exit 1
+export LSWG="$lswg"
+export LSWG_SHA256="$lswg_sha"
 if [ ! -f "$fixture_source" ] || [ -L "$fixture_source" ]; then
     echo "error: the seamless fixture must be a regular non-symlink file: $fixture_source" >&2
     exit 1

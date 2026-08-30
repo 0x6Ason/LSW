@@ -7,9 +7,10 @@ large modules would make ownership and regression testing worse. It also turns
 `slim` from a small AppX allowlist into a measured developer workstation
 profile.
 
-This document describes target state. The current source tree and conservative
-`slim-v1` behavior remain implemented facts until the individual gates below
-land and pass the real Windows/KVM job.
+This document describes the target state and records incremental acceptance.
+Protocol, host-client, and native-presenter extraction are implemented. The
+conservative `slim-v1` behavior remains the image fact until `slim-v2` lands
+and passes the real Windows/KVM comparison gate.
 
 ## Measured starting point
 
@@ -126,8 +127,17 @@ Step 2's client extraction is also implemented. `lsw-host` now owns the private
 Unix daemon connection plus focused agent control, process/terminal, GUI, and
 file-transfer sessions. The old 1,862-line CLI client and 216-line daemon
 client are gone; every new production module is below 600 lines. `lsw` retains
-command parsing, notices, progress, and the Wayland presenter, so the host crate
-does not import executable-private modules.
+command parsing, notices, and progress, so the host crate does not import
+executable-private modules.
+
+Step 3 is implemented. The old 2,001-line CLI presenter is now the separately
+built `lswg` runtime, split into event-loop, rendering, input, WSLg-adapter, and
+test modules. `lsw` performs readiness, verifies an exact lowercase SHA-256 and
+the shared `gui-window-v3`/package version, and sends one bounded launch frame
+over the child's stdin. `lswg` reloads private instance state and its agent
+credential itself, so tokens never enter argv, the environment, or the handoff.
+The release bundle, installer, verifier, native gate, and WSLg development gate
+all attest the same helper binary.
 
 Every step must keep ordinary headless commands and the current first-HWND
 matrix passing. A giant rename-only commit is not acceptable.
@@ -138,8 +148,9 @@ matrix passing. A giant rename-only commit is not acceptable.
 `lsw`, `lswd`, `lswg`, and the matching Windows agent. The release manifest
 records all four hashes and a shared GUI protocol/build identity. `lsw run
 --gui` launches the adjacent trusted `lswg` in the calling Linux graphical
-session, and `lswg` obtains a bounded VM/agent lease through `lswd`. The daemon
-stays display-agnostic so socket activation never requires `WAYLAND_DISPLAY`.
+session. `lsw` asks display-agnostic `lswd` to make the VM ready, then `lswg`
+opens the bounded authenticated agent session while the daemon continues to
+supervise the VM. Socket activation never requires `WAYLAND_DISPLAY`.
 Users never run an install command for the helper and no GUI process remains
 resident when the last window and integration lease close.
 
