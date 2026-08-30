@@ -13,6 +13,7 @@ mod installation;
 mod license;
 mod lswg_launcher;
 mod path_translation;
+mod profile;
 mod progress;
 mod shares;
 mod transfer;
@@ -37,11 +38,11 @@ use arguments::{
 use installation::{find_windows_agent, install_instance};
 use license::{license, show_activation_notice_once};
 use lsw_core::{
-    CustomizationPlan, FolderShareTransport, GuiStartRequest, HostCapabilities, IdlePolicy,
-    ImageManager, InstallSeedBuilder, InstallSeedOptions, InstanceManifest, InstanceSpec,
-    InstanceState, LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage,
-    PeImportSymbol, ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner, SessionKind,
-    StartRequest, StateStore, VmAccelerator, WindowsProfile,
+    FolderShareTransport, GuiStartRequest, HostCapabilities, IdlePolicy, ImageManager,
+    InstallSeedBuilder, InstallSeedOptions, InstanceManifest, InstanceSpec, InstanceState,
+    LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage, PeImportSymbol,
+    ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest,
+    StateStore, VmAccelerator,
 };
 use lsw_host::{agent_address, AgentClient, DaemonClient};
 use progress::{ProgressEvent, ProgressRenderer};
@@ -82,7 +83,7 @@ fn run(arguments: Vec<OsString>) -> Result<u8, Box<dyn std::error::Error>> {
             return Ok(0);
         }
         "profile" => {
-            profile(remaining)?;
+            profile::command(remaining)?;
             return Ok(0);
         }
         "media" => {
@@ -1607,37 +1608,6 @@ fn required_exact_name<'a>(
     command: &str,
 ) -> Result<&'a str, Box<dyn std::error::Error>> {
     optional_name(arguments, command)?.ok_or_else(|| format!("usage: lsw {command} NAME").into())
-}
-
-fn profile(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {
-    let profile = arguments
-        .first()
-        .and_then(|value| value.to_str())
-        .ok_or("usage: lsw profile PROFILE")?
-        .parse::<WindowsProfile>()?;
-    if arguments.len() != 1 {
-        return Err("usage: lsw profile PROFILE".into());
-    }
-    let plan = CustomizationPlan::for_profile(profile)?;
-    println!("LSW Windows profile: {}", plan.profile);
-    println!("  servicing preserved: {}", profile.keeps_servicing());
-    println!("  CompactOS requested: {}", plan.compact_os);
-    if plan.remove_provisioned_appx_patterns.is_empty() {
-        println!("  provisioned AppX removals: none");
-    } else {
-        println!("  provisioned AppX patterns removed locally:");
-        for pattern in plan.remove_provisioned_appx_patterns {
-            println!("    - {pattern}");
-        }
-    }
-    println!("  explicitly preserved:");
-    for component in plan.preserve_components {
-        println!("    - {component}");
-    }
-    for warning in plan.warnings {
-        println!("  warning: {warning}");
-    }
-    Ok(())
 }
 
 fn media(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Error>> {

@@ -259,6 +259,13 @@ headless workflows working.
   Defender, MSI/MSIX, ConPTY, hibernate/resume, UAC, file sharing, and seamless
   GUI gates continue to pass.
 
+Implementation status: schema-v2 manifests, the bounded 53-identity AppX
+allowlist, offline Recall removal, OneDrive uninstall, service/policy
+application, preservation guards, durable before/after reports, a versioned
+sealed-image identity, and three-boot slim audit/resource artifacts are in the
+tree. Slice 4.5 remains open until the protected real Windows/KVM job publishes
+and passes the same-ISO `vanilla` comparison and the full preservation matrix.
+
 ### Slice 5: complete HWND and display behavior
 
 - Map every eligible top-level Windows HWND to an independent Linux window with

@@ -21,7 +21,7 @@ gui_handoff=${LSW_E2E_GUI_HANDOFF:-0}
 candidate_sha=${LSW_E2E_CANDIDATE_SHA:-${GITHUB_SHA:-}}
 expected_iso_sha256=${LSW_WINDOWS_ISO_SHA256:-}
 e2e_no_viewer=${LSW_E2E_NO_VIEWER:-1}
-for required_command in awk chmod cmp date grep kill mkdir mktemp mv python3 rm setsid sha256sum sleep timeout tr uname; do
+for required_command in awk chmod cmp date du grep kill mkdir mktemp mv python3 rm setsid sha256sum sleep timeout tr uname; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
         echo "error: required command $required_command was not found" >&2
         exit 1
@@ -157,6 +157,16 @@ case "$e2e_root" in
         exit 1
         ;;
 esac
+profile_audit_dir="$e2e_root/profile-audits"
+profile_report_destination=
+mkdir -p -- "$profile_audit_dir"
+chmod 700 "$profile_audit_dir"
+if [ -n "$artifact_dir" ]; then
+    profile_audit_dir="$artifact_dir/profile-audits"
+    profile_report_destination="$artifact_dir/profile"
+    mkdir -p -- "$profile_audit_dir"
+    chmod 700 "$profile_audit_dir"
+fi
 if [ -n "$active_root_file" ]; then
     printf '%s\n' "$e2e_root" >"$active_root_file"
     chmod 600 "$active_root_file"
@@ -217,6 +227,9 @@ user_helper_start_mode=unknown
 user_helper_start_name=unknown
 maintenance_helper_start_mode=unknown
 maintenance_helper_start_name=unknown
+profile_audit_boots=0
+profile_revision=not-applicable
+profile_host_allocated_bytes=unknown
 
 python3 - "$LSW_STATE_DIR/instances/$instance/run/recovery-vnc.sock" <<'PY'
 import os
@@ -231,95 +244,21 @@ if len(path) > 100:
 PY
 
 run_conpty_probe() {
-    probe_timeout=$1
-    probe_marker=$2
-    probe_command=$3
-    shift 3
-    python3 - "$probe_timeout" "$probe_marker" "$probe_command" "$@" <<'PY'
-import errno
-import fcntl
-import os
-import pty
-import select
-import signal
-import struct
-import subprocess
-import sys
-import termios
-import time
+    python3 "$workspace_root/scripts/run-windows-conpty-probe.py" "$@"
+}
 
-timeout_seconds = int(sys.argv[1])
-marker = os.fsencode(sys.argv[2])
-command = os.fsencode(sys.argv[3])
-argv = sys.argv[4:]
-if not argv:
-    raise SystemExit("error: ConPTY probe received no command")
-
-master, slave = pty.openpty()
-fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-process = subprocess.Popen(
-    argv,
-    stdin=slave,
-    stdout=slave,
-    stderr=slave,
-    close_fds=True,
-    start_new_session=True,
-)
-os.close(slave)
-deadline = time.monotonic() + timeout_seconds
-transcript = bytearray()
-command_sent = False
-exit_sent = False
-timed_out = False
-
-while True:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        timed_out = True
-        break
-    ready, _, _ = select.select([master], [], [], min(0.1, remaining))
-    if ready:
-        try:
-            data = os.read(master, 32768)
-        except OSError as error:
-            if error.errno != errno.EIO:
-                raise
-            data = b""
-        if data:
-            os.write(sys.stdout.fileno(), data)
-            transcript.extend(data)
-            if len(transcript) > 1024 * 1024:
-                del transcript[: len(transcript) - 1024 * 1024]
-            prompt = transcript.find(b"PS C:\\")
-            if not command_sent and prompt >= 0 and b">" in transcript[prompt:]:
-                os.write(master, command + b"\r")
-                command_sent = True
-            if command_sent and not exit_sent and marker in transcript:
-                os.write(master, b"exit\r")
-                exit_sent = True
-        elif process.poll() is not None:
-            break
-    elif process.poll() is not None:
-        break
-
-if timed_out:
-    os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-    raise SystemExit("error: timed out waiting for the ConPTY probe")
-
-status = process.wait()
-if not command_sent:
-    raise SystemExit("error: ConPTY shell never produced a PowerShell prompt")
-if marker not in transcript:
-    raise SystemExit("error: ConPTY shell exited before returning its marker")
-if status < 0 or status > 255:
-    raise SystemExit(f"error: ConPTY probe returned unsupported status {status}")
-raise SystemExit(status)
-PY
+audit_slim_profile() {
+    phase=$1
+    [ "$profile" = slim ] || return 0
+    report_destination=
+    if [ "$phase" = boot-1 ]; then
+        report_destination=$profile_report_destination
+    fi
+    sh "$workspace_root/scripts/run-windows-slim-profile-audit.sh" \
+        "$lsw" "$instance" "$phase" "$profile_audit_dir/$phase.json" 30 \
+        "$report_destination"
+    profile_audit_boots=$((profile_audit_boots + 1))
+    profile_revision=slim-v2
 }
 
 collect_e2e_artifacts() {
@@ -378,6 +317,9 @@ collect_e2e_artifacts() {
         printf 'user_helper_start_name=%s\n' "$user_helper_start_name"
         printf 'maintenance_helper_start_mode=%s\n' "$maintenance_helper_start_mode"
         printf 'maintenance_helper_start_name=%s\n' "$maintenance_helper_start_name"
+        printf 'profile_revision=%s\n' "$profile_revision"
+        printf 'profile_audit_boots=%s\n' "$profile_audit_boots"
+        printf 'profile_host_allocated_bytes_after_trim=%s\n' "$profile_host_allocated_bytes"
         printf 'lsw_sha256=%s\n' "$(sha256sum "$lsw" | awk '{ print $1 }')"
         printf 'lswd_sha256=%s\n' "$(sha256sum "$lswd" | awk '{ print $1 }')"
         printf 'lswg_sha256=%s\n' "$(sha256sum "$lswg" | awk '{ print $1 }')"
@@ -1098,6 +1040,7 @@ initial_interactive_user=none
 cached_unattend_removed=true
 setup_payload_removed=true
 automatic_logon=false
+audit_slim_profile boot-1
 
 pid_file="$LSW_STATE_DIR/instances/$instance/run/qemu.pid"
 clone_instance="${instance}-clone"
@@ -1167,6 +1110,7 @@ if [ "$resume_output" != "$resume_marker" ]; then
     exit 1
 fi
 clone_identity_isolated=true
+audit_slim_profile boot-2
 
 desktop_user='lsw-e2e-user'
 desktop_password="Lsw!$(tr -d '-' </proc/sys/kernel/random/uuid)9a"
@@ -1745,6 +1689,12 @@ if [ "$(cat "$LSW_STATE_DIR/instances/$instance/run/balloon.target")" != 4096 ];
     exit 1
 fi
 "$lsw" trim "$instance" >/dev/null
+profile_host_allocated_bytes=$(du -B1 \
+    "$base_disk" "$LSW_STATE_DIR/instances/$instance/disk.qcow2" | \
+    awk '{ total += $1 } END { print total }')
+case "$profile_host_allocated_bytes" in
+    ''|*[!0-9]*) echo "error: could not measure allocated profile storage" >&2; exit 1 ;;
+esac
 hibernate_pid=$(awk 'NR == 1 { print $1 }' \
     "$LSW_STATE_DIR/instances/$instance/run/qemu.pid")
 timeout 180s "$lsw" hibernate "$instance"
@@ -1910,6 +1860,7 @@ then
     exit 1
 fi
 cold_interactive_user=none
+audit_slim_profile boot-3
 
 cold_qemu_pid=
 if [ -f "$pid_file" ]; then

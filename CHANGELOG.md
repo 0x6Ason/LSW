@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Replaced the conservative default image recipe with the typed `slim-v2`
+  contract. WinPE now inventories and removes 53 exact provisioned AppX
+  identities plus the Recall payload, re-inventories, persists its before/after
+  evidence, and refuses a surviving target. First-boot setup removes matching
+  installed AppX packages, invokes the inbox OneDrive uninstaller, applies the
+  bounded service and machine/Default User policy sets, verifies every
+  readback, and writes a machine-readable report. Protected servicing,
+  development, Store/winget/WebView2, Defender, UAC, input, recovery, and shell
+  components are rejected at manifest-validation time. The exact Windows/KVM
+  gate now audits that report and captures three settled-boot resource samples;
+  the same-ISO vanilla comparison is still required before Slice 4.5 acceptance.
+- Extracted the pseudo-terminal ConPTY driver from the oversized Windows/KVM
+  shell scenario into a focused Python fixture and moved `lsw profile` into its
+  own command module. The gate script and CLI entry point both shrank while the
+  Slice 4.5 no-growth ratchet remained unchanged.
 - Extracted the 2,001-line native Wayland presenter from `lsw` into the bundled
   `lswg` runtime. Rendering, input, event-loop, WSLg-adapter, and tests now have
   focused modules below 1,000 lines. GUI launch verifies the helper's exact hash

@@ -3,7 +3,7 @@
 //! CLI parsing, configuration-unit, and serialization regression tests.
 
 use super::*;
-use lsw_core::PortForward;
+use lsw_core::{PortForward, WindowsProfile};
 
 #[test]
 fn agent_wait_covers_slow_first_windows_cold_boots() {

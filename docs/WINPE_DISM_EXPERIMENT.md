@@ -23,14 +23,20 @@ Given a profile, a validated WIM index and an instance directory, the backend:
    total preparation slower. Mount intentionally
    omits `/Optimize`: real Windows 11 25H2/KVM first-boot testing reproduced
    `PROCESS1_INITIALIZATION_FAILED (0x6B)` with that optional optimized path.
-7. Inventories provisioned AppX packages with `/English`, resolves the profile's
-   display-name allowlist to full package names, and removes only matches.
-8. Commits the result as `lsw-prepared.wim`, with integrity checks on export,
+7. Inventories provisioned AppX packages and optional features with `/English`,
+   resolves the profile's exact display-name allowlist to full package names,
+   removes only matches, and removes the separately supported Recall feature
+   payload when present. It then re-inventories and fails if any exact target
+   remains enabled or provisioned.
+8. Persists the offline before/after inventory and schema/revision identity
+   under `ProgramData\LSW\profile` in the prepared image.
+9. Commits the result as `lsw-prepared.wim`, with integrity checks on export,
    mount and commit. In the one-shot installer, it stages the private agent and
    answer file into the mounted WIM immediately before that commit. A bounded
-   marker tells first boot not to repeat the already completed provisioned-AppX
-   work.
-9. Emits phase markers and bounded live DISM output to a private writable
+   marker tells first boot which schema-v2 offline profile was applied; the
+   online phase still removes installed per-user identities and verifies the
+   complete contract.
+10. Emits phase markers and bounded live DISM output to a private writable
    status volume, allowing the host to report real percentages, and discards a
    mounted image after an error.
 
@@ -45,9 +51,10 @@ The generated seed contains no Microsoft binary, Windows image, product key,
 activation data or agent token. Linux `wimlib` is not called for package, AppX
 or feature servicing.
 
-The `slim` plan enables CompactOS during the named Windows
+The `slim-v2` plan enables CompactOS during the named Windows
 `applying-profile` setup stage after the target image has been applied safely.
-The offline marker skips duplicate AppX work without skipping CompactOS. This
+The offline marker records completed offline work without skipping installed-
+package, product, service, policy, or CompactOS verification. This
 keeps a CompactOS failure recoverable and avoids the non-deterministic,
 CPU-bound stall reproduced by the exact Windows/KVM gate when DISM combined
 `/Apply-Image` with `/Compact:on`. The profile does not run `ResetBase`, remove
@@ -73,9 +80,10 @@ process after termination so preparation RAM is released before normal boot.
 ## Verification status
 
 Unit tests cover stage construction, image-index validation, atomic/private seed
-writing, absence of product keys, the conservative stock path, exact DISM
-operations, separated disk topology, deferred CompactOS behavior, payload ACL
-staging, control-media topology, and mandatory completion markers. The backend
+writing, absence of product keys, the zero-mutation vanilla path, exact AppX and
+Recall DISM operations, survivor assertions, separated disk topology, deferred
+CompactOS behavior, payload ACL staging, control-media topology, and mandatory
+completion markers. The backend
 is enabled in the beta.6 installer. A real Windows 11 25H2/KVM run completed
 both WinPE phases, specialize, and SCM agent startup, then exposed a race where
 the first agent connection preceded the specialize-to-OOBE reboot. The headless
@@ -87,4 +95,5 @@ The command sequence follows Microsoft's documentation for
 [WinPE startup scripts](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/wpeinit-and-startnetcmd-using-winpe-startup-scripts?view=windows-11),
 [Winpeshl.ini](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/winpeshlini-reference-launching-an-app-when-winpe-starts?view=windows-11),
 [offline DISM image modification](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/mount-and-modify-a-windows-image-using-dism?view=windows-11), and
-[provisioned AppX servicing](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-app-package--appx-or-appxbundle--servicing-command-line-options?view=windows-11).
+[provisioned AppX servicing](https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-app-package--appx-or-appxbundle--servicing-command-line-options?view=windows-11), and
+[Recall removal](https://learn.microsoft.com/en-us/windows/client-management/manage-recall).

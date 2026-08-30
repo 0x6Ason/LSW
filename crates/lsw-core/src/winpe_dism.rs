@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::install_seed::OFFLINE_APPX_MARKER_NAME;
+use crate::install_seed::OFFLINE_PROFILE_MARKER_NAME;
+use crate::winpe_profile::prepare_script;
 use crate::{
     CommandInvocation, CustomizationPlan, HostCapabilities, InstanceManifest, LswError,
     PreparationPlan, PreparationStep, QemuBackend, Result, WindowsProfile,
@@ -173,11 +174,20 @@ pub enum WinPeDismStage {
     MountOfflineImage,
     /// Enumerate provisioned AppX packages before bounded removal.
     InventoryProvisionedAppx,
+    /// Enumerate optional features before bounded removal.
+    InventoryOptionalFeatures,
     /// Remove one allowlisted provisioned AppX package when present.
     RemoveProvisionedAppx {
         /// Exact allowlisted package display-name pattern passed to DISM.
         display_name: String,
     },
+    /// Remove one allowlisted optional feature and its payload when present.
+    RemoveOptionalFeature {
+        /// Exact optional-feature name passed to DISM.
+        feature_name: String,
+    },
+    /// Re-inventory the mounted image and fail if an exact target survived.
+    VerifyProfile,
     /// Stage the offline unattend file and private guest-agent setup payload.
     StageGuestSetup,
     /// Commit and integrity-check the prepared WIM.
@@ -234,8 +244,17 @@ impl WinPeDismStage {
             Self::InventoryProvisionedAppx => {
                 "inventory provisioned AppX packages with Windows DISM".to_owned()
             }
+            Self::InventoryOptionalFeatures => {
+                "inventory optional features with Windows DISM".to_owned()
+            }
             Self::RemoveProvisionedAppx { display_name } => {
                 format!("remove provisioned AppX package {display_name} when present")
+            }
+            Self::RemoveOptionalFeature { feature_name } => {
+                format!("remove optional feature payload {feature_name} when present")
+            }
+            Self::VerifyProfile => {
+                "verify exact AppX and optional-feature targets are absent".to_owned()
             }
             Self::StageGuestSetup => {
                 "stage the offline unattend file and private guest-agent setup payload in the prepared WIM"
@@ -387,7 +406,13 @@ impl WinPeDismBackend {
         }
 
         let customization = CustomizationPlan::for_profile(profile)?;
-        validate_appx_patterns(&customization.remove_provisioned_appx_patterns)?;
+        validate_appx_patterns(
+            &customization
+                .appx_removals
+                .iter()
+                .map(|removal| removal.display_name.clone())
+                .collect::<Vec<_>>(),
+        )?;
         let mut stages = vec![
             WinPeDismStage::InitializeWorkspace,
             WinPeDismStage::LocateInstallImage,
@@ -396,15 +421,22 @@ impl WinPeDismBackend {
             },
             WinPeDismStage::MountOfflineImage,
             WinPeDismStage::InventoryProvisionedAppx,
+            WinPeDismStage::InventoryOptionalFeatures,
         ];
+        stages.extend(customization.appx_removals.iter().map(|removal| {
+            WinPeDismStage::RemoveProvisionedAppx {
+                display_name: removal.display_name.clone(),
+            }
+        }));
         stages.extend(
             customization
-                .remove_provisioned_appx_patterns
+                .optional_feature_removals
                 .iter()
-                .map(|display_name| WinPeDismStage::RemoveProvisionedAppx {
-                    display_name: display_name.clone(),
+                .map(|feature_name| WinPeDismStage::RemoveOptionalFeature {
+                    feature_name: feature_name.clone(),
                 }),
         );
+        stages.push(WinPeDismStage::VerifyProfile);
         stages.push(WinPeDismStage::CommitPreparedImage);
 
         let mut generated = BTreeMap::new();
@@ -414,7 +446,15 @@ impl WinPeDismBackend {
         );
         generated.insert(
             PathBuf::from(WINPE_SCRIPT_FILE),
-            winpe_script(edition_index, &customization, false).into_bytes(),
+            prepare_script(
+                edition_index,
+                &customization,
+                false,
+                WINPE_WORKSPACE_DRIVE,
+                WINPE_PREPARED_IMAGE_NAME,
+                OFFLINE_PROFILE_MARKER_NAME,
+            )
+            .into_bytes(),
         );
         generated.insert(
             PathBuf::from("README.txt"),
@@ -460,7 +500,15 @@ impl WinPeDismBackend {
         plan.includes_agent = copy_guest_setup_payload(&mut plan.generated, install_seed)?;
         plan.generated.insert(
             PathBuf::from(WINPE_SCRIPT_FILE),
-            winpe_script(edition_index, &customization, true).into_bytes(),
+            prepare_script(
+                edition_index,
+                &customization,
+                true,
+                WINPE_WORKSPACE_DRIVE,
+                WINPE_PREPARED_IMAGE_NAME,
+                OFFLINE_PROFILE_MARKER_NAME,
+            )
+            .into_bytes(),
         );
         let commit = plan
             .stages
@@ -1604,152 +1652,6 @@ fn validate_unattend_password_value(value: &str) -> Result<()> {
     }
 }
 
-fn winpe_script(
-    edition_index: u32,
-    customization: &CustomizationPlan,
-    stage_guest_setup: bool,
-) -> String {
-    let removal_patterns = customization
-        .remove_provisioned_appx_patterns
-        .iter()
-        .map(|pattern| {
-            format!("call :remove_if_present \"{pattern}\"\r\nif errorlevel 1 goto :fail_mounted")
-        })
-        .collect::<Vec<_>>()
-        .join("\r\n");
-    let removal = if removal_patterns.is_empty() {
-        "call :status no-appx-removals".to_owned()
-    } else {
-        removal_patterns
-    };
-    let guest_setup = if stage_guest_setup {
-        format!(
-            r#"call :status stage-guest-setup
-mkdir "%LSW_MOUNT%\ProgramData\LSW\setup" "%LSW_MOUNT%\Windows\Panther" >>"%LSW_LOG%" 2>&1
-if errorlevel 1 goto :fail_mounted
-xcopy.exe "%LSW_SEED%\payload\lsw\*" "%LSW_MOUNT%\ProgramData\LSW\setup\" /E /H /K /Y /I >>"%LSW_LOG%" 2>&1
-if errorlevel 1 goto :fail_mounted
->"%LSW_MOUNT%\ProgramData\LSW\setup\{OFFLINE_APPX_MARKER_NAME}" echo LSW-OFFLINE-APPX-APPLIED
-if errorlevel 1 goto :fail_mounted
-copy /Y "%LSW_SEED%\lsw\offline-unattend.xml" "%LSW_MOUNT%\Windows\Panther\unattend.xml" >>"%LSW_LOG%" 2>&1
-if errorlevel 1 goto :fail_mounted
-icacls.exe "%LSW_MOUNT%\ProgramData\LSW\setup" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" >>"%LSW_LOG%" 2>&1
-if errorlevel 1 goto :fail_mounted
-"#
-        )
-    } else {
-        String::new()
-    };
-
-    format!(
-        r#"@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-set "LSW_SEED=%~d0"
-set "LSW_WORK={WINPE_WORKSPACE_DRIVE}"
-set "LSW_MOUNT={WINPE_WORKSPACE_DRIVE}\mount"
-set "LSW_SCRATCH={WINPE_WORKSPACE_DRIVE}\scratch"
-set "LSW_LOG="
-set "LSW_PACKAGES={WINPE_WORKSPACE_DRIVE}\logs\provisioned-appx.txt"
-set "LSW_IMAGE={WINPE_WORKSPACE_DRIVE}\{WINPE_PREPARED_IMAGE_NAME}"
-set "LSW_DISM=%SystemRoot%\System32\dism.exe"
-set "LSW_STATUS="
-for %%D in (C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if exist "%%D:\lsw-status.tag" set "LSW_STATUS=%%D:"
-if not defined LSW_STATUS (
-    wpeutil.exe shutdown
-    exit /b 1
-)
-set "LSW_LOG=%LSW_STATUS%\dism.log"
-
-call :status initialize-workspace
-diskpart.exe /s "%LSW_SEED%\lsw\workspace.diskpart" > X:\lsw-workspace.log 2>&1
-if errorlevel 1 goto :fail
-mkdir "%LSW_MOUNT%" "%LSW_SCRATCH%" "{WINPE_WORKSPACE_DRIVE}\logs" >nul 2>&1
-if errorlevel 1 goto :fail
-
-set "LSW_SOURCE="
-for %%D in (C D E F G H I J K L M N O P Q R S T U V X Y Z) do (
-    if not defined LSW_SOURCE if exist "%%D:\sources\install.wim" set "LSW_SOURCE=%%D:\sources\install.wim"
-    if not defined LSW_SOURCE if exist "%%D:\sources\install.esd" set "LSW_SOURCE=%%D:\sources\install.esd"
-)
-if not defined LSW_SOURCE (
-    >>"%LSW_LOG%" echo official media has no sources\install.wim or sources\install.esd
-    goto :fail
-)
-
-call :status export-image
-call :run "%LSW_DISM%" /English /Export-Image /SourceImageFile:"%LSW_SOURCE%" /SourceIndex:{edition_index} /DestinationImageFile:"%LSW_IMAGE%" /Compress:max /ScratchDir:"%LSW_SCRATCH%" /CheckIntegrity
-if errorlevel 1 goto :fail
-
-call :status mount-image
-call :run "%LSW_DISM%" /English /Mount-Image /ImageFile:"%LSW_IMAGE%" /Index:1 /MountDir:"%LSW_MOUNT%" /ScratchDir:"%LSW_SCRATCH%" /CheckIntegrity
-if errorlevel 1 goto :fail_mounted
-
-call :status inventory-appx
-"%LSW_DISM%" /English /Image:"%LSW_MOUNT%" /Get-ProvisionedAppxPackages >"%LSW_PACKAGES%" 2>>"%LSW_LOG%"
-if errorlevel 1 goto :fail_mounted
-{removal}
-
-{guest_setup}
-call :status commit-image
-call :run "%LSW_DISM%" /English /Unmount-Image /MountDir:"%LSW_MOUNT%" /Commit /CheckIntegrity
-if errorlevel 1 goto :fail_mounted
-call :retain_log
-call :status complete
-call :flush_status
-wpeutil.exe shutdown
-exit /b 0
-
-:remove_if_present
-set "LSW_DISPLAY_NAME=%~1"
-for /f "tokens=2 delims=:" %%P in ('findstr.exe /b /c:"PackageName :" "%LSW_PACKAGES%"') do (
-    set "LSW_PACKAGE=%%P"
-    for /f "tokens=*" %%Q in ("!LSW_PACKAGE!") do set "LSW_PACKAGE=%%Q"
-    echo(!LSW_PACKAGE!| findstr.exe /i /b /l /c:"!LSW_DISPLAY_NAME!_" >nul
-    if not errorlevel 1 (
-        call :status remove-appx !LSW_DISPLAY_NAME!
-        call :run "%LSW_DISM%" /English /Image:"%LSW_MOUNT%" /Remove-ProvisionedAppxPackage /PackageName:!LSW_PACKAGE!
-        if errorlevel 1 exit /b 1
-    )
-)
-exit /b 0
-
-:run
->>"%LSW_LOG%" echo LSW-DISM-COMMAND %*
-%* >>"%LSW_LOG%" 2>&1
-set "LSW_EXIT=!errorlevel!"
-if not "!LSW_EXIT!"=="0" >>"%LSW_LOG%" echo command failed with exit code !LSW_EXIT!
-exit /b !LSW_EXIT!
-
-:fail_mounted
-call :status discard-image
-"%LSW_DISM%" /English /Unmount-Image /MountDir:"%LSW_MOUNT%" /Discard >>"%LSW_LOG%" 2>&1
-
-:fail
-call :retain_log
-call :status failed
-call :flush_status
-wpeutil.exe shutdown
-exit /b 1
-
-:retain_log
-exit /b 0
-
-:flush_status
-if exist "%SystemRoot%\System32\timeout.exe" (
-    timeout.exe /t 2 /nobreak >nul 2>&1
-) else (
-    ping.exe -n 3 127.0.0.1 >nul 2>&1
-)
-exit /b 0
-
-:status
->>"%LSW_STATUS%\status.log" echo LSW-WINPE-DISM %*
-if defined LSW_LOG >>"%LSW_LOG%" echo LSW-DISM-STAGE %*
-exit /b 0
-"#
-    )
-}
-
 fn seed_readme(
     profile: WindowsProfile,
     edition_index: u32,
@@ -2014,13 +1916,20 @@ mod tests {
         assert!(!script.contains("wimlib"));
         assert!(!script.contains("powershell"));
         assert!(!script.contains("/Remove-Package"));
-        assert!(!script.contains("/Disable-Feature"));
+        assert!(script.contains("call :remove_feature_if_present \"Recall\""));
+        assert!(script.contains("/Disable-Feature /FeatureName:%LSW_FEATURE% /Remove"));
         assert!(plan.compact_during_setup);
         assert!(plan.stages.iter().any(|stage| matches!(
             stage,
             WinPeDismStage::RemoveProvisionedAppx { display_name }
                 if *display_name == "Clipchamp.Clipchamp"
         )));
+        assert!(plan.stages.iter().any(|stage| matches!(
+            stage,
+            WinPeDismStage::RemoveOptionalFeature { feature_name }
+                if *feature_name == "Recall"
+        )));
+        assert!(plan.stages.contains(&WinPeDismStage::VerifyProfile));
 
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
@@ -2035,7 +1944,7 @@ mod tests {
             .stages
             .iter()
             .any(|stage| matches!(stage, WinPeDismStage::RemoveProvisionedAppx { .. })));
-        assert!(!plan.script().contains("call :remove_if_present \""));
+        assert!(!plan.script().contains("call :remove_appx_if_present \""));
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 
@@ -2089,8 +1998,8 @@ mod tests {
             .expect("prepared image should be committed");
         assert!(stage < commit);
         assert!(script.contains("%LSW_MOUNT%\\Windows\\Panther\\unattend.xml"));
-        assert!(script.contains(OFFLINE_APPX_MARKER_NAME));
-        assert!(script.contains("LSW-OFFLINE-APPX-APPLIED"));
+        assert!(script.contains(OFFLINE_PROFILE_MARKER_NAME));
+        assert!(script.contains("LSW-OFFLINE-PROFILE-APPLIED slim-v2"));
 
         let unattend = String::from_utf8(
             plan.generated

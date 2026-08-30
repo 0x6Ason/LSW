@@ -15,6 +15,7 @@ mod manifest;
 mod pe;
 mod preparation;
 mod profile;
+mod profile_application;
 mod qemu;
 #[cfg(not(windows))]
 mod samba;
@@ -22,10 +23,14 @@ mod scoped_credential;
 mod store;
 mod windows_media;
 mod winpe_dism;
+mod winpe_profile;
 
 pub use backend::{AcceleratorCapabilities, HostPlatform, QemuBackend, VmAccelerator};
 pub use capabilities::HostCapabilities;
-pub use customization::{CustomizationPlan, PROFILE_MANIFEST_VERSION};
+pub use customization::{
+    AppxRemoval, CustomizationPlan, ProductUninstaller, RegistryHive, RegistryPolicy,
+    ServicePolicy, ServiceStartup, PROFILE_MANIFEST_VERSION,
+};
 pub use error::{LswError, Result};
 #[cfg(not(windows))]
 pub use image::{ImageManager, SealedImage};

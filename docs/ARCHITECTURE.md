@@ -93,6 +93,12 @@ as completion.
    After exact markers on private writable status volumes, LSW removes
    the workspace, ephemeral control ISO, and every token-bearing seed before
    marking the instance installed and starting its disk normally.
+   Profile schema v2 makes every slim mutation typed. WinPE inventories exact
+   provisioned AppX and optional-feature targets, removes matches, verifies the
+   mounted image, and persists offline evidence. First boot then removes exact
+   installed identities, applies the OneDrive/service/policy contract, verifies
+   readback, and writes `C:\ProgramData\LSW\profile\report.json`. The profile
+   revision is part of the sealed-image preparation identity.
 3. `lswd` waits for the swtpm and QMP Unix sockets before reporting success. It
    owns child handles while running and reconciles a surviving VM through QMP
    after daemon restart.

@@ -22,14 +22,15 @@ lifecycle, the Windows agent, and a lawful activation boundary into one path.
   phase. The phases use distinct disk topologies, OVMF variables, and exact
   private status-volume completion markers. Workspace disks and token-bearing
   seeds are removed after success.
-- Versioned declarative `vanilla` and default `slim` profiles. `slim` removes
-  only an explicit AppX allowlist and preserves Windows Update, WinSxS,
-  Defender, Store, winget, WebView2, Terminal, PowerShell, ConPTY, WMI,
-  hibernation, and Recovery.
-  This describes the currently implemented conservative profile. The temporary
-  beta.8 Slice 4.5 must replace it with the measured, inventory-driven removal
-  and service/policy contract in `SLICE_4_5_OPTIMIZATION.md`; none of those
-  broader reductions are claimed until the exact Windows/KVM comparison passes.
+- Versioned declarative `vanilla-v2` and default `slim-v2` profiles. The typed
+  slim plan inventories and applies exact AppX/package-family, Recall,
+  OneDrive, service, and machine/Default User policy operations, then persists
+  before/after/result evidence and fails a surviving matched target. Manifest
+  validation protects Windows Update, WinSxS, Defender, Store, winget,
+  WebView2, Terminal, PowerShell, ConPTY, WMI, UAC, input, hibernation, and
+  Recovery. Source and local parser tests cover this path; its numerical
+  resource improvements are not claimed until the same-ISO real Windows/KVM
+  comparison passes.
 - The pre-applied unattend installs the Windows x64 PE agent during
   `specialize` and registers the automatic `LSWAgent` service as
   `NT SERVICE\LSWAgent`, rather than using an interactive user's `HKCU` startup

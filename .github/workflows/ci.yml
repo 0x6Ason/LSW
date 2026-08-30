@@ -120,6 +120,11 @@ jobs:
         shell: powershell
         timeout-minutes: 5
         run: .\scripts\check-windows-agent-service.ps1
+      - name: Parse the Windows profile audit fixture
+        shell: powershell
+        run: |
+          $Source = Get-Content .\scripts\check-windows-slim-profile.ps1 -Raw
+          [scriptblock]::Create($Source) | Out-Null
       - name: Record runtime-test boundary
         shell: pwsh
         run: |

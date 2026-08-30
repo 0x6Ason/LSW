@@ -23,8 +23,8 @@ guest.
   through small per-instance linked-clone overlays with private agent secrets.
 - The default device model uses Windows inbox NVMe, e1000e, and VGA drivers.
   Signed VirtIO acceleration will remain optional.
-- The beta.7 `vanilla` and `slim` profiles retain the driverless installation
-  and recovery path.
+- The versioned `vanilla-v2` and `slim-v2` profiles retain the driverless
+  installation and recovery path.
 - LSW manages a complete Windows kernel, so it cannot match the absolute memory
   density of a Linux namespace container. The goal is WSL-like lifecycle and
   memory behavior, not misleading container terminology.
@@ -117,8 +117,9 @@ updates suitable for CI logs.
 Real Windows/KVM measurement found that fast WIM compression shortened export
 but made total preparation slower because the larger intermediate increased
 later mount and commit work. LSW therefore retains maximum compression and
-uses the private NTFS scratch directory explicitly. An offline AppX marker
-prevents first boot from repeating provisioned-package work. CompactOS runs in
+uses the private NTFS scratch directory explicitly. A versioned offline profile
+marker and durable before/after inventory let first boot verify the complete
+slim contract without guessing. CompactOS runs in
 the named Windows `applying-profile` stage after a reliable non-compact image
 apply; this avoids making target-disk creation depend on DISM's non-deterministic
 CompactOS-on-apply path. Exact media SHA-256 and `/CheckIntegrity` remain
@@ -434,15 +435,22 @@ documented hardware.
 | Profile | Behavior | Guest Secure Boot |
 | --- | --- | --- |
 | `vanilla` | Stock Windows plus the LSW agent | Off |
-| `slim` | Removes only an explicit optional AppX allowlist and enables CompactOS | Off |
+| `slim` | Exact consumer/AI/AppX and Recall removal, OneDrive uninstall, bounded service/policy optimization, and CompactOS | Off |
 
-`slim` is the beta.7 default. Both profiles are embedded versioned declarative
-manifests. They preserve WinSxS, Windows Update and the servicing stack,
+`slim` is the default and currently selects the typed `slim-v2` manifest;
+`vanilla` remains a zero-mutation Windows profile. The slim prepare/first-boot
+path inventories before and after, records every exact operation under
+`C:\ProgramData\LSW\profile`, and fails when a matched target survives. Both
+profiles preserve WinSxS, Windows Update and the servicing stack,
 MSI/MSIX, Defender, Terminal, PowerShell, ConPTY, Store, winget, WebView2, WMI,
 hibernation, Recovery, and common development-tool dependencies. LSW does not
 enable test signing or install a self-signed certificate by default. The
 experimental `shell-light` profile remains beta.9 work; user-versioned custom
 profiles are not part of the current release.
+
+The broader recipe is implemented and source-tested on `master`, but its
+same-ISO vanilla-versus-slim resource thresholds are not a release claim until
+the protected Windows/KVM comparison artifact passes.
 
 ## Advanced commands
 

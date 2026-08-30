@@ -8,15 +8,16 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::profile_application::profile_script;
 use crate::{
-    CustomizationPlan, InstanceManifest, LswError, Result, AGENT_GUEST_PORT,
-    LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    InstanceManifest, LswError, Result, AGENT_GUEST_PORT, LICENSE_HELPER_GUEST_PORT,
+    MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
 
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const LICENSE_HELPER_SCRIPT: &[u8] = include_bytes!("../assets/license-helper.ps1");
 const SETUP_ACCOUNT_NAME: &str = "LSWSetup";
-pub(crate) const OFFLINE_APPX_MARKER_NAME: &str = "offline-appx-applied.marker";
+pub(crate) const OFFLINE_PROFILE_MARKER_NAME: &str = "offline-profile-v2-applied.marker";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallSeedOptions {
@@ -164,7 +165,7 @@ impl InstallSeedBuilder {
         );
         generated.insert(
             PathBuf::from("lsw/apply-profile.ps1"),
-            profile_script(manifest)?.into_bytes(),
+            profile_script(manifest.spec.profile, OFFLINE_PROFILE_MARKER_NAME)?.into_bytes(),
         );
         generated.insert(
             PathBuf::from("README.txt"),
@@ -752,38 +753,6 @@ Set-LswSetupStage 'waiting-for-oobe'
     .replace("__LSW_SETUP_ACCOUNT__", SETUP_ACCOUNT_NAME)
 }
 
-fn profile_script(manifest: &InstanceManifest) -> Result<String> {
-    let plan = CustomizationPlan::for_profile(manifest.spec.profile)?;
-    let patterns = plan
-        .remove_provisioned_appx_patterns
-        .iter()
-        .map(|pattern| format!("    '{pattern}'"))
-        .collect::<Vec<_>>()
-        .join(",\r\n");
-    let removal = if patterns.is_empty() {
-        "Write-Host 'LSW profile does not remove provisioned applications.'".to_owned()
-    } else {
-        format!(
-            r#"$RemoveNames = @(
-{patterns}
-)
-Get-AppxProvisionedPackage -Online | Where-Object {{ $RemoveNames -contains $_.DisplayName }} | ForEach-Object {{
-    Write-Host ('Removing optional provisioned package: ' + $_.DisplayName)
-    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -AllUsers | Out-Null
-}}"#
-        )
-    };
-    let compact = if plan.compact_os {
-        "& compact.exe /CompactOS:always\r\nif ($LASTEXITCODE -ne 0) { throw \"CompactOS failed with exit code $LASTEXITCODE.\" }"
-    } else {
-        "Write-Host 'CompactOS not requested for this profile.'"
-    };
-    Ok(format!(
-        "$ErrorActionPreference = 'Stop'\r\n$OfflineAppxMarker = Join-Path $PSScriptRoot '{OFFLINE_APPX_MARKER_NAME}'\r\nWrite-Host 'Applying LSW {} profile.'\r\nif (Test-Path -LiteralPath $OfflineAppxMarker -PathType Leaf) {{\r\n    Write-Host 'LSW provisioned application profile was already applied offline by WinPE.'\r\n}} else {{\r\n{}\r\n}}\r\n{}\r\n",
-        manifest.spec.profile, removal, compact
-    ))
-}
-
 fn seed_readme(manifest: &InstanceManifest, options: &InstallSeedOptions) -> String {
     format!(
         "LSW installation seed\r\n\r\nInstance: {}\r\nProfile: {}\r\nLocale: {}\r\n\r\nThis seed contains no Windows image, product key, or activation data.\r\nThe answer file records the user's prior license acceptance and completes OOBE without automatic logon. A random one-shot local account is removed before setup is marked complete.\r\n{}\r\n",
@@ -1139,11 +1108,11 @@ mod tests {
         let profile = fs::read_to_string(root.join("seed/lsw/apply-profile.ps1"))
             .expect("profile should be readable");
         assert!(profile.contains("Remove-AppxProvisionedPackage"));
-        assert!(profile.contains(OFFLINE_APPX_MARKER_NAME));
-        assert!(profile.contains("application profile was already applied offline by WinPE"));
-        assert!(!profile.contains("    return\r\n"));
+        assert!(profile.contains(OFFLINE_PROFILE_MARKER_NAME));
+        assert!(profile.contains("WinPE servicing marker is present"));
+        assert!(profile.contains("report.json"));
         assert!(profile.contains("compact.exe /CompactOS:always"));
-        assert!(profile.contains("CompactOS failed with exit code $LASTEXITCODE"));
+        assert!(profile.contains("CompactOS failed with exit code"));
         fs::remove_dir_all(root).expect("fixture should be removed");
     }
 

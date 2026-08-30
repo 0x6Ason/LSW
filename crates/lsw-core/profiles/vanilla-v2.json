@@ -1,10 +1,15 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "revision": "vanilla-v2",
   "name": "vanilla",
   "experimental": false,
   "keeps_servicing": true,
   "compact_os": false,
-  "remove_provisioned_appx_patterns": [],
+  "appx_removals": [],
+  "optional_feature_removals": [],
+  "product_uninstallers": [],
+  "service_policies": [],
+  "registry_policies": [],
   "preserve_components": [
     "Windows component store (WinSxS)",
     "Windows Update and servicing stack",
@@ -14,9 +19,14 @@
     "Windows Management Instrumentation (WMI)",
     ".NET Framework optional-feature support",
     "Microsoft Defender",
+    "UAC and secure desktop",
     "hibernation support",
     "Windows Recovery Environment",
-    "Windows SDK and Visual Studio Build Tools prerequisites"
+    "Windows SDK and Visual Studio Build Tools prerequisites",
+    "Explorer, file dialogs, keyboard, IME, accessibility, clipboard, audio, and notifications",
+    "Calculator, Notepad, Paint, Snipping Tool, and Photos",
+    "Microsoft Edge",
+    "SMB client and Windows networking"
   ],
   "warnings": []
 }

@@ -8,9 +8,12 @@ large modules would make ownership and regression testing worse. It also turns
 profile.
 
 This document describes the target state and records incremental acceptance.
-Protocol, host-client, and native-presenter extraction are implemented. The
-conservative `slim-v1` behavior remains the image fact until `slim-v2` lands
-and passes the real Windows/KVM comparison gate.
+Protocol, host-client, native-presenter, and typed profile extraction are
+implemented. `slim-v2` is now the source and sealed-image preparation identity:
+it performs bounded offline and first-boot mutation with persistent audit
+evidence. That implementation is not yet a runtime acceptance claim; the
+same-ISO `vanilla` comparison and preservation matrix below must pass on the
+real Windows/KVM runner before Slice 4.5 closes.
 
 ## Measured starting point
 
@@ -139,6 +142,16 @@ credential itself, so tokens never enter argv, the environment, or the handoff.
 The release bundle, installer, verifier, native gate, and WSLg development gate
 all attest the same helper binary.
 
+The profile/DISM part of step 5 is implemented as schema version 2. Exact AppX
+display names and package-family names, optional features, supported product
+uninstallers, service startup values, registry policy values, and preservation
+requirements are typed and validated before any VM starts. Offline WinPE and
+first-boot PowerShell generation live in separate focused modules. Both paths
+inventory before and after, treat an absent build-specific target as not
+applicable, and fail if a matched target survives. The E2E path checks the
+persisted report on three boot cycles and records guest resource samples plus
+host allocation after TRIM. Runtime comparison to `vanilla` remains open.
+
 Every step must keep ordinary headless commands and the current first-HWND
 matrix passing. A giant rename-only commit is not acceptable.
 
@@ -236,3 +249,8 @@ Acceptance requires:
 The comparison report becomes a release artifact. If a Windows build renames a
 target or changes a preservation dependency, the gate fails for review instead
 of silently claiming a slim image.
+
+Current status: the `slim-v2` mutation/audit path and three-boot slim verifier
+are source-complete and locally parsed/tested. The numerical vanilla-versus-slim
+thresholds and network-dependent Store/Update preservation probes remain an
+unpassed real-run gate, so they must not be described as achieved.

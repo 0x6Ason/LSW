@@ -38,10 +38,12 @@ systems, firmware, hypervisors, installation media, trademarks, or user data.
   prepare phase cleans only a new private workspace; the apply phase cleans only
   the instance's dedicated target qcow2. Neither plan accepts a host block
   device.
-- The `slim` recipe runs locally and removes only an explicit list of optional
-  provisioned AppX packages. It preserves Windows servicing and development
-  prerequisites. Generated disks stay local unless the user separately has the
-  right to distribute them.
+- The `slim-v2` recipe runs locally against the user's authorized media. It
+  performs only typed, exact-identity AppX/feature removal, the inbox OneDrive
+  uninstaller, and bounded service/policy configuration while preserving the
+  declared servicing and development boundary. Its audit report does not grant
+  redistribution rights. Generated disks stay local unless the user separately
+  has the right to distribute them.
 - LSW neither bundles nor endorses Tiny11/Tiny10 images. A user-supplied modified
   image may be technically bootable, but provenance, redistribution rights,
   security and support remain with its supplier and user. Official beta testing

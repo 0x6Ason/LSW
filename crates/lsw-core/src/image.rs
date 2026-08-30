@@ -16,7 +16,7 @@ use crate::{
 };
 
 const IMAGE_FORMAT_VERSION: u32 = 1;
-const PREPARATION_IDENTITY: &str = "winpe-dism-v1/offline-setup-v1";
+const PREPARATION_IDENTITY: &str = "winpe-dism-v2/offline-setup-v2/slim-profile-v2";
 const IMAGE_METADATA_FILE: &str = "image.lsw";
 const BASE_DISK_FILE: &str = "base.qcow2";
 
