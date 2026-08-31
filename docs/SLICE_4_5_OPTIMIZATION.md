@@ -158,6 +158,11 @@ applicable, and fail if a matched target survives. The E2E path checks the
 persisted report on three boot cycles and records guest resource samples plus
 host allocation after TRIM. Runtime comparison to `vanilla` remains open.
 
+Installation-seed orchestration is also below the source limit. Unattended
+answer/password generation and the guest setup/SCM PowerShell payload are
+separately owned, while `InstallSeedBuilder` retains validation, atomic writes,
+and the existing public contract.
+
 Every step must keep ordinary headless commands and the current first-HWND
 matrix passing. A giant rename-only commit is not acceptable.
 

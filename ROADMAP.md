@@ -267,7 +267,9 @@ fail-closed same-ISO `vanilla` comparison step are in the tree. That step runs
 only in the final native job, removes its separate vanilla instance, and keeps
 the GUI matrix last. WinPE seed generation, VM planning, runtime/progress,
 control-media creation, and safe host I/O are now separate bounded modules, so
-the former WinPE source-size exception is removed. Slice 4.5 remains open until
+the former WinPE source-size exception is removed. Installation-seed
+orchestration, unattended generation, and guest setup payload generation are
+also separate bounded modules. Slice 4.5 remains open until
 the protected exact-candidate Windows/KVM run publishes a passing comparison
 artifact and the full
 preservation matrix passes at runtime.
