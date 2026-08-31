@@ -8,8 +8,9 @@ large modules would make ownership and regression testing worse. It also turns
 profile.
 
 This document describes the target state and records incremental acceptance.
-Protocol, host-client, native-presenter, and typed profile extraction are
-implemented. `slim-v2` is now the source and sealed-image preparation identity:
+Protocol, host-client, native-presenter, typed profile, and WinPE orchestration
+extraction are implemented. `slim-v2` is now the source and sealed-image
+preparation identity:
 it performs bounded offline and first-boot mutation with persistent audit
 evidence. The final native workflow now installs zero-mutation `vanilla` from
 the same exact ISO, measures three cold boots for each profile, and fails closed
@@ -148,8 +149,11 @@ The profile/DISM part of step 5 is implemented as schema version 2. Exact AppX
 display names and package-family names, optional features, supported product
 uninstallers, service startup values, registry policy values, and preservation
 requirements are typed and validated before any VM starts. Offline WinPE and
-first-boot PowerShell generation live in separate focused modules. Both paths
-inventory before and after, treat an absent build-specific target as not
+first-boot PowerShell generation live in separate focused modules. WinPE seed
+generation, QEMU planning, runtime/progress observation, control-media creation,
+safe host I/O, and tests are also separately owned; no resulting file needs a
+source-size exception. Both customization paths inventory before and after,
+treat an absent build-specific target as not
 applicable, and fail if a matched target survives. The E2E path checks the
 persisted report on three boot cycles and records guest resource samples plus
 host allocation after TRIM. Runtime comparison to `vanilla` remains open.

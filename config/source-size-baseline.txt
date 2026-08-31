@@ -10,7 +10,6 @@ crates/lsw-core/src/install_seed.rs|1184
 crates/lsw-core/src/iso_download.rs|1898
 crates/lsw-core/src/manifest.rs|1442
 crates/lsw-core/src/pe.rs|1093
-crates/lsw-core/src/winpe_dism.rs|2351
 crates/lsw-daemon/src/supervisor.rs|1306
 scripts/check-windows-kvm-e2e.sh|1989
 scripts/check-windows-seamless-e2e.sh|2443

@@ -57,7 +57,11 @@ owned modules, while command parsing and user notices remain in `lsw`. The
 third migration moved the former 2,001-line native presenter into the bundled
 `lswg` process. Rendering, input, WSLg compatibility, orchestration, and tests
 now have focused modules below 1,000 lines; `lsw` retains only the bounded
-launch handoff and exact helper-integrity checks.
+launch handoff and exact helper-integrity checks. The fourth migration split
+the former 2,260-line WinPE DISM module into seed generation, VM planning,
+runtime/progress, control-media creation, safe host I/O, and tests. Every
+resulting module is below 1,000 lines, and the public backend surface is
+unchanged.
 
 The target tree, migration order, bundled `lswg` contract, line-count limits,
 and default-image acceptance measurements are specified in
