@@ -7,6 +7,7 @@ cd "$workspace_root"
 
 baseline=config/source-size-baseline.txt
 default_limit=1000
+entrypoint_limit=300
 
 if [ ! -f "$baseline" ]; then
     echo "error: source-size baseline is missing: $baseline" >&2
@@ -48,6 +49,13 @@ lookup_limit() {
     ' "$baseline"
 }
 
+path_limit() {
+    case "$1" in
+        crates/*/src/main.rs) printf '%s\n' "$entrypoint_limit" ;;
+        *) printf '%s\n' "$default_limit" ;;
+    esac
+}
+
 failed=0
 while IFS='|' read -r path limit extra; do
     case "$path" in
@@ -72,7 +80,8 @@ while IFS='|' read -r path limit extra; do
     fi
     lines=$(wc -l <"$path")
     lines=$(printf '%s' "$lines" | awk '{$1=$1; print}')
-    if [ "$lines" -le "$default_limit" ]; then
+    target_limit=$(path_limit "$path")
+    if [ "$lines" -le "$target_limit" ]; then
         echo "error: remove the obsolete source-size exception for $path ($lines lines)" >&2
         failed=1
     elif [ "$lines" -gt "$limit" ]; then
@@ -87,7 +96,7 @@ while IFS= read -r path; do
     if [ -n "$limit" ]; then
         continue
     fi
-    limit=$default_limit
+    limit=$(path_limit "$path")
     lines=$(wc -l <"$path")
     lines=$(printf '%s' "$lines" | awk '{$1=$1; print}')
     if [ "$lines" -gt "$limit" ]; then
@@ -100,4 +109,4 @@ if [ "$failed" -ne 0 ]; then
     exit 1
 fi
 
-echo "Source layout ratchet passed (new files: at most $default_limit lines)."
+echo "Source layout ratchet passed (sources: at most $default_limit lines; executable entry points: at most $entrypoint_limit lines)."

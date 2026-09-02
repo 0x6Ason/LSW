@@ -269,7 +269,12 @@ the GUI matrix last. WinPE seed generation, VM planning, runtime/progress,
 control-media creation, and safe host I/O are now separate bounded modules, so
 the former WinPE source-size exception is removed. Installation-seed
 orchestration, unattended generation, and guest setup payload generation are
-also separate bounded modules. Slice 4.5 remains open until
+also separate bounded modules. CLI and daemon entry points, agent service and
+session handling, Windows capture/input/discovery, ISO download, manifest/PE
+tests, and both Windows E2E harnesses now have explicit bounded modules. The
+source-layout baseline has no remaining exceptions and CI enforces 300-line
+executable entry points plus 1,000-line production and automation modules.
+Slice 4.5 remains open until
 the protected exact-candidate Windows/KVM run publishes a passing comparison
 artifact and the full
 preservation matrix passes at runtime.

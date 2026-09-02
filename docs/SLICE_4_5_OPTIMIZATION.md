@@ -35,10 +35,12 @@ ownership boundary:
 | Native host presenter | `crates/lsw-cli/src/gui_presenter.rs` | 1,900 |
 
 The immediate source-size gate is a ratchet: legacy exceptions cannot grow and
-new files cannot exceed 1,000 lines. Slice completion removes the exceptions,
-sets entry points below 300 lines, and keeps production modules below 1,000
-lines. Splitting code only to satisfy a number is not acceptance; each module
-must own one lifecycle or protocol responsibility and have focused tests.
+new files cannot exceed 1,000 lines. The source migration is now complete: the
+exception list is empty, executable entry points are below 300 lines, and all
+production and automation modules are below 1,000 lines. Splitting code only to
+satisfy a number is not acceptance; each module must own one lifecycle or
+protocol responsibility and have focused tests. Runtime closure still requires
+the protected exact-candidate Windows/KVM comparison and preservation gate.
 
 ## Applicable WSL and WSLg principles
 

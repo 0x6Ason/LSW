@@ -6,6 +6,7 @@
 compile_error!("lswd 1.0 beta currently requires a Unix host");
 
 mod qmp;
+mod runtime_config;
 #[allow(unsafe_code)]
 mod socket_activation;
 mod supervisor;
@@ -21,6 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 use lsw_core::{HostCapabilities, LaunchPhase, QemuPlanner, StateStore, DAEMON_PROTOCOL_VERSION};
+use runtime_config::*;
 use supervisor::Supervisor;
 
 const MAX_REQUEST_BYTES: u64 = 4096;
@@ -259,85 +261,5 @@ fn escape_line(value: &str) -> String {
         .replace('\n', "%0A")
 }
 
-fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(configured) = env::var_os("LSW_STATE_DIR") {
-        return Ok(PathBuf::from(configured));
-    }
-    let home = env::var_os("HOME").ok_or("HOME is not set; configure LSW_STATE_DIR")?;
-    Ok(PathBuf::from(home).join(".local/share/lsw"))
-}
-
-fn socket_path(store: &StateStore) -> PathBuf {
-    if let Some(configured) = env::var_os("LSW_DAEMON_SOCKET") {
-        return PathBuf::from(configured);
-    }
-    store.root().join("run/lswd.sock")
-}
-
-fn daemon_idle_exit() -> Result<Duration, Box<dyn std::error::Error>> {
-    let seconds = match env::var("LSW_DAEMON_IDLE_SECONDS") {
-        Ok(value) => value
-            .parse::<u64>()
-            .map_err(|_| "LSW_DAEMON_IDLE_SECONDS must be an integer")?,
-        Err(env::VarError::NotPresent) => return Ok(DEFAULT_IDLE_EXIT),
-        Err(error) => return Err(error.into()),
-    };
-    if !(1..=3600).contains(&seconds) {
-        return Err("LSW_DAEMON_IDLE_SECONDS must be between 1 and 3600".into());
-    }
-    Ok(Duration::from_secs(seconds))
-}
-
-fn current_rss_kib() -> Option<u64> {
-    fs::read_to_string("/proc/self/status")
-        .ok()?
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("VmRSS:")?
-                .split_ascii_whitespace()
-                .next()?
-                .parse()
-                .ok()
-        })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn supervisor() -> Supervisor {
-        Supervisor::new(
-            StateStore::new(std::env::temp_dir().join("lswd-dispatch-test")),
-            HostCapabilities::unavailable(lsw_core::HostPlatform::Linux),
-        )
-    }
-
-    #[test]
-    fn ping_protocol_is_versioned() {
-        let response = dispatch("PING", &mut supervisor()).expect("ping should work");
-        assert_eq!(response.len(), 5);
-        assert_eq!(response[0], "PONG");
-        assert_eq!(response[1], format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"));
-        assert_eq!(
-            response[2],
-            "FEATURES=suspend,resume,hibernate,balloon,idle-exit"
-        );
-        assert_eq!(response[3], format!("PID={}", std::process::id()));
-        assert!(response[4]
-            .strip_prefix("RSS_KIB=")
-            .is_some_and(|value| value.parse::<u64>().is_ok()));
-    }
-
-    #[test]
-    fn line_escaping_preserves_protocol_boundaries() {
-        assert_eq!(escape_line("one\ntwo%"), "one%0Atwo%25");
-    }
-
-    #[test]
-    fn mutating_commands_are_strictly_parsed() {
-        assert!(dispatch("STOP everything now", &mut supervisor()).is_err());
-        assert!(dispatch("START x invalid", &mut supervisor()).is_err());
-        assert!(dispatch("SUSPEND x now", &mut supervisor()).is_err());
-        assert!(dispatch("RESUME", &mut supervisor()).is_err());
-    }
-}
+mod tests;

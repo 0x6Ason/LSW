@@ -1,15 +1,2 @@
-# Temporary Slice 4.5 exceptions. A listed file may shrink but must not grow.
-# Remove an entry as soon as the file is split below the 1,000-line default.
-crates/lsw-agent/src/desktop_companion.rs|1628
-crates/lsw-agent/src/main.rs|3614
-crates/lsw-agent/src/tests.rs|2012
-crates/lsw-agent/src/windows_capture.rs|4368
-crates/lsw-cli/src/installation.rs|1023
-crates/lsw-cli/src/main.rs|2673
-crates/lsw-core/src/iso_download.rs|1898
-crates/lsw-core/src/manifest.rs|1442
-crates/lsw-core/src/pe.rs|1093
-crates/lsw-daemon/src/supervisor.rs|1306
-scripts/check-windows-kvm-e2e.sh|1989
-scripts/check-windows-seamless-e2e.sh|2443
-scripts/windows-seamless-host.ps1|1095
+# Slice 4.5 source-size exceptions.
+# Intentionally empty: production sources have no legacy size exemptions.

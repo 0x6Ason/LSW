@@ -1,0 +1,899 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+use super::*;
+
+#[cfg(unix)]
+fn send_session_options(stream: &mut TcpStream) {
+    let options = SessionOptions {
+        cancel_on_disconnect: true,
+    };
+    write_frame(
+        stream,
+        &Frame::new(FrameKind::SessionOptions, options.encode()),
+    )
+    .expect("session options should be sent");
+}
+
+#[cfg(unix)]
+fn send_session_lease(stream: &mut TcpStream, timeout_millis: u32) {
+    let lease = SessionLease::new(timeout_millis).expect("test lease should be valid");
+    write_frame(stream, &Frame::new(FrameKind::SessionLease, lease.encode()))
+        .expect("session lease should be sent");
+}
+
+#[cfg(unix)]
+fn send_exec(stream: &mut TcpStream, argv: &[&str]) {
+    let request = StartRequest {
+        kind: SessionKind::Exec,
+        argv: argv.iter().map(|argument| (*argument).to_owned()).collect(),
+        working_directory: None,
+    };
+    write_frame(
+        stream,
+        &Frame::new(FrameKind::Start, request.encode().unwrap()),
+    )
+    .expect("start should be sent");
+}
+
+#[cfg(unix)]
+fn send_waiting_descendant_tree(stream: &mut TcpStream) {
+    // outer sh -> inner sh -> sleep. Every process inherits the session
+    // output pipes; killing only the outer process would make bridge joins
+    // and the session slot hang until sleep exits.
+    send_exec(
+        stream,
+        &[
+            "sh",
+            "-c",
+            "sh -c 'sleep 30 & printf tree-ready; wait' & wait",
+        ],
+    );
+    let ready = read_frame(stream).expect("descendant readiness should arrive");
+    assert_eq!(ready.kind, FrameKind::Stdout);
+    assert_eq!(ready.payload, b"tree-ready");
+}
+
+#[cfg(unix)]
+fn collect_process(stream: &mut TcpStream) -> (Vec<u8>, i32) {
+    let mut stdout = Vec::new();
+    loop {
+        let frame = read_frame(stream).expect("process response should arrive");
+        match frame.kind {
+            FrameKind::Stdout => stdout.extend(frame.payload),
+            FrameKind::Stderr => {}
+            FrameKind::Exit => return (stdout, lsw_core::decode_exit(&frame.payload).unwrap()),
+            other => panic!("unexpected process frame {other:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_session_released(done: Receiver<Result<(), String>>, active_sessions: Arc<AtomicUsize>) {
+    done.recv_timeout(Duration::from_secs(2))
+        .expect("server session should finish promptly")
+        .expect("server session should succeed");
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_cancel_terminates_a_controlled_process() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("d".repeat(64));
+    send_session_options(&mut stream);
+    send_waiting_descendant_tree(&mut stream);
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionCancel, Vec::new()),
+    )
+    .expect("cancel should be sent");
+
+    assert_eq!(
+        collect_process(&mut stream),
+        (Vec::new(), SESSION_CANCEL_EXIT_CODE)
+    );
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_environment_and_working_directory_reach_the_child() {
+    let root = std::env::temp_dir().join(format!("lsw-agent-env-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("working directory should be created");
+    let (mut stream, done, active_sessions) = controlled_test_connection("e".repeat(64));
+    send_session_options(&mut stream);
+    let environment = ProcessEnvironment::new(vec![(
+        "LSW_TEST_ENV".to_owned(),
+        "environment-ok".to_owned(),
+    )])
+    .expect("environment should validate");
+    write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::ProcessEnvironment,
+            environment.encode().expect("environment should encode"),
+        ),
+    )
+    .expect("environment should be sent");
+    let request = StartRequest {
+        kind: SessionKind::Exec,
+        argv: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf '%s|%s' \"$LSW_TEST_ENV\" \"$PWD\"".to_owned(),
+        ],
+        working_directory: Some(root.to_string_lossy().into_owned()),
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Start, request.encode().unwrap()),
+    )
+    .expect("start should be sent");
+    let (stdout, code) = collect_process(&mut stream);
+    assert_eq!(code, 0);
+    assert_eq!(
+        String::from_utf8(stdout).expect("output should be UTF-8"),
+        format!("environment-ok|{}", root.display())
+    );
+    drop(stream);
+    assert_session_released(done, active_sessions);
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_signal_terminates_the_process_tree_with_exact_status() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("f".repeat(64));
+    send_session_options(&mut stream);
+    send_waiting_descendant_tree(&mut stream);
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionSignal, SessionSignal::Interrupt.encode()),
+    )
+    .expect("signal should be sent");
+    assert_eq!(collect_process(&mut stream).1, 130);
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn detached_run_survives_the_client_disconnect_until_completion() {
+    let root = std::env::temp_dir().join(format!("lsw-agent-detach-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir(&root).expect("fixture directory should be created");
+    let marker = root.join("complete.marker");
+    let (mut stream, done, active_sessions) = controlled_test_connection("a".repeat(64));
+    write_frame(
+        &mut stream,
+        &Frame::new(
+            FrameKind::SessionOptions,
+            SessionOptions {
+                cancel_on_disconnect: false,
+            }
+            .encode(),
+        ),
+    )
+    .expect("session options should be sent");
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionDetach, Vec::new()),
+    )
+    .expect("detach request should be sent");
+    let request = StartRequest {
+        kind: SessionKind::Run,
+        argv: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!("sleep 1; printf complete > '{}'", marker.display()),
+        ],
+        working_directory: None,
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Start, request.encode().unwrap()),
+    )
+    .expect("start should be sent");
+    let started = read_frame(&mut stream).expect("start acknowledgement should arrive");
+    assert_eq!(started.kind, FrameKind::Started);
+    assert!(lsw_core::decode_process_id(&started.payload).unwrap() > 0);
+    drop(stream);
+    done.recv_timeout(Duration::from_millis(500))
+        .expect("detached start should release its connection slot promptly")
+        .expect("server session should succeed");
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(&marker).expect("detached process should write marker"),
+        "complete"
+    );
+    fs::remove_dir_all(root).expect("fixture should be removed");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_control_is_unavailable_before_authentication() {
+    let expected_token = "7".repeat(64);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("fixture should connect");
+        handle_connection(stream, &expected_token).map_err(|error| error.to_string())
+    });
+    let mut stream = TcpStream::connect(address).expect("client should connect");
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token: "8".repeat(64),
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Hello, hello.encode().unwrap()),
+    )
+    .expect("hello should be sent");
+    let response = read_frame(&mut stream).expect("authentication error should arrive");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("authentication"));
+    assert!(server
+        .join()
+        .expect("fixture should not panic")
+        .expect_err("authentication should fail")
+        .contains("authentication"));
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_disconnect_terminates_process_and_releases_slot() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("e".repeat(64));
+    send_session_options(&mut stream);
+    send_waiting_descendant_tree(&mut stream);
+    drop(stream);
+
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn leased_session_expires_and_releases_its_process_tree() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("4".repeat(64));
+    send_session_options(&mut stream);
+    send_session_lease(&mut stream, 1_000);
+    send_waiting_descendant_tree(&mut stream);
+
+    assert!(
+        read_frame(&mut stream).is_err(),
+        "lease expiry closes the half-open transport instead of risking a blocking error write"
+    );
+    assert!(done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("leased server session should finish promptly")
+        .expect_err("lease expiry should fail the session")
+        .contains("lease expired"));
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn lease_expiry_unblocks_output_backpressure_and_releases_slot() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("8".repeat(64));
+    send_session_options(&mut stream);
+    send_session_lease(&mut stream, 1_000);
+    send_exec(&mut stream, &["sh", "-c", "exec yes lsw-lease-output"]);
+
+    // Deliberately never read process output. The agent output bridge will
+    // eventually block in TCP write while holding its shared writer lock.
+    // Lease expiry must use socket shutdown, not that lock, to free it.
+    assert!(done
+        .recv_timeout(Duration::from_secs(3))
+        .expect("backpressured leased session should finish promptly")
+        .expect_err("lease expiry should fail the session")
+        .contains("lease expired"));
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    drop(stream);
+}
+
+#[cfg(unix)]
+#[test]
+fn timely_heartbeats_keep_an_idle_leased_session_alive() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("5".repeat(64));
+    send_session_options(&mut stream);
+    send_session_lease(&mut stream, 2_000);
+    send_waiting_descendant_tree(&mut stream);
+
+    // The total duration exceeds one lease, while every individual gap is
+    // comfortably below it. This proves idle-but-healthy sessions survive.
+    for _ in 0..9 {
+        thread::sleep(Duration::from_millis(250));
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::SessionHeartbeat, Vec::new()),
+        )
+        .expect("heartbeat should be sent");
+    }
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionCancel, Vec::new()),
+    )
+    .expect("cancel should be sent");
+    assert_eq!(
+        collect_process(&mut stream),
+        (Vec::new(), SESSION_CANCEL_EXIT_CODE)
+    );
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn heartbeat_requires_a_leased_session_and_empty_payload() {
+    for (token, with_lease, payload) in [("a", false, Vec::new()), ("b", true, vec![1])] {
+        let (mut stream, done, active_sessions) = controlled_test_connection(token.repeat(64));
+        send_session_options(&mut stream);
+        if with_lease {
+            send_session_lease(&mut stream, 5_000);
+        }
+        send_waiting_descendant_tree(&mut stream);
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::SessionHeartbeat, payload),
+        )
+        .expect("invalid heartbeat should be sent");
+
+        let response = read_frame(&mut stream).expect("protocol error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("requires a leased"));
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .is_err());
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lease_requires_options_and_can_appear_only_once_before_start() {
+    let (mut legacy, legacy_done, legacy_sessions) = controlled_test_connection("c".repeat(64));
+    send_session_lease(&mut legacy, 5_000);
+    let response = read_frame(&mut legacy).expect("legacy lease should be rejected");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("unsupported request"));
+    assert!(legacy_done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("legacy request should finish promptly")
+        .is_err());
+    assert_eq!(legacy_sessions.load(Ordering::Acquire), 0);
+
+    let (mut duplicate, duplicate_done, duplicate_sessions) =
+        controlled_test_connection("d".repeat(64));
+    send_session_options(&mut duplicate);
+    send_session_lease(&mut duplicate, 5_000);
+    send_session_lease(&mut duplicate, 5_000);
+    let response = read_frame(&mut duplicate).expect("duplicate lease should be rejected");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("one SESSION_LEASE"));
+    assert!(duplicate_done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("duplicate request should finish promptly")
+        .is_err());
+    assert_eq!(duplicate_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_frames_reject_nonempty_cancel_payloads() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("9".repeat(64));
+    send_session_options(&mut stream);
+    send_waiting_descendant_tree(&mut stream);
+    write_frame(&mut stream, &Frame::new(FrameKind::SessionCancel, [1]))
+        .expect("malformed cancel should be sent");
+
+    let response = read_frame(&mut stream).expect("protocol error should arrive");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("empty payload"));
+    assert!(done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server session should finish promptly")
+        .is_err());
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn normal_leader_exit_cleans_background_descendants_and_releases_slot() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("6".repeat(64));
+    send_session_options(&mut stream);
+    // The shell exits normally without waiting for this background sleep.
+    // The sleep inherits stdout/stderr, so an agent that owns only the
+    // leader blocks in its output bridge instead of sending EXIT.
+    send_exec(&mut stream, &["sh", "-c", "sleep 30 & printf normal-tree"]);
+
+    assert_eq!(collect_process(&mut stream), (b"normal-tree".to_vec(), 0));
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_options_only_prefix_process_start_requests() {
+    for invalid_kind in [
+        FrameKind::SessionOptions,
+        FrameKind::Ping,
+        FrameKind::FileGet,
+        FrameKind::FilePut,
+        FrameKind::SessionCancel,
+        FrameKind::StdinClose,
+    ] {
+        let token_byte = match invalid_kind {
+            FrameKind::SessionOptions => 'a',
+            FrameKind::Ping => 'b',
+            FrameKind::FileGet => 'c',
+            FrameKind::FilePut => 'd',
+            FrameKind::SessionCancel => 'e',
+            FrameKind::StdinClose => 'f',
+            _ => unreachable!(),
+        };
+        let (mut stream, done, active_sessions) =
+            controlled_test_connection(token_byte.to_string().repeat(64));
+        send_session_options(&mut stream);
+        let payload = if invalid_kind == FrameKind::SessionOptions {
+            SessionOptions {
+                cancel_on_disconnect: true,
+            }
+            .encode()
+        } else {
+            Vec::new()
+        };
+        write_frame(&mut stream, &Frame::new(invalid_kind, payload))
+            .expect("invalid controlled request should be sent");
+        let response = read_frame(&mut stream).expect("protocol error should arrive");
+        assert_eq!(response.kind, FrameKind::Error);
+        assert!(String::from_utf8_lossy(&response.payload).contains("must be followed"));
+        assert!(done
+            .recv_timeout(Duration::from_secs(2))
+            .expect("server session should finish promptly")
+            .is_err());
+        assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_session_option_flags_are_rejected_before_spawn() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("2".repeat(64));
+    write_frame(&mut stream, &Frame::new(FrameKind::SessionOptions, [2]))
+        .expect("unknown options should be sent");
+    let response = read_frame(&mut stream).expect("protocol error should arrive");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("unknown flags"));
+
+    assert!(done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server session should finish promptly")
+        .expect_err("unknown option flags should fail")
+        .contains("unknown flags"));
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_control_frame_is_rejected_without_starting_a_process() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("3".repeat(64));
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::SessionCancel, Vec::new()),
+    )
+    .expect("legacy cancel should be sent");
+    let response = read_frame(&mut stream).expect("protocol error should arrive");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("unsupported request"));
+    assert!(done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server session should finish promptly")
+        .is_err());
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_stdin_close_delivers_eof_without_cancelling() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("f".repeat(64));
+    send_session_options(&mut stream);
+    send_exec(
+        &mut stream,
+        &["sh", "-c", "IFS= read -r value; printf controlled-eof"],
+    );
+    write_frame(&mut stream, &Frame::new(FrameKind::StdinClose, Vec::new()))
+        .expect("stdin close should be sent");
+
+    assert_eq!(
+        collect_process(&mut stream),
+        (b"controlled-eof".to_vec(), 0)
+    );
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_child_stdin_failure_terminates_process_and_releases_slot() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("0".repeat(64));
+    // macOS can defer delivery of the peer-side EPIPE while reaping the
+    // exec'd shell. Keep the assertion bounded, but use the same five-second
+    // allowance as the loopback E2E fixtures instead of the generic
+    // two-second protocol timeout.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("stdin-failure timeout should apply");
+    send_session_options(&mut stream);
+    send_exec(
+        &mut stream,
+        &["sh", "-c", "exec 0<&-; printf ready; exec sleep 5"],
+    );
+
+    let ready = read_frame(&mut stream).expect("child readiness should arrive");
+    assert_eq!(ready.kind, FrameKind::Stdout);
+    assert_eq!(ready.payload, b"ready");
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Stdin, b"input after child closed stdin"),
+    )
+    .expect("stdin payload should be sent");
+
+    let response = read_frame(&mut stream).expect("protocol error should arrive");
+    assert_eq!(response.kind, FrameKind::Error);
+    assert!(String::from_utf8_lossy(&response.payload).contains("child stdin"));
+    drop(stream);
+    assert!(done
+        .recv_timeout(Duration::from_secs(2))
+        .expect("server session should finish promptly")
+        .expect_err("child stdin failure should fail the session")
+        .contains("child stdin"));
+    assert_eq!(active_sessions.load(Ordering::Acquire), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_half_close_remains_stdin_eof_not_cancellation() {
+    let (mut stream, done, active_sessions) = controlled_test_connection("1".repeat(64));
+    send_exec(
+        &mut stream,
+        &["sh", "-c", "IFS= read -r value; printf legacy-eof"],
+    );
+    stream
+        .shutdown(Shutdown::Write)
+        .expect("legacy write side should close");
+
+    assert_eq!(collect_process(&mut stream), (b"legacy-eof".to_vec(), 0));
+    drop(stream);
+    assert_session_released(done, active_sessions);
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_loopback_exec_streams_output_and_exit_status() {
+    let token = "a".repeat(64);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let expected_token = token.clone();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("fixture should connect");
+        handle_connection(stream, &expected_token).expect("agent request should succeed");
+    });
+
+    let mut stream = TcpStream::connect(address).expect("client should connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout should apply");
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token,
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Hello, hello.encode().unwrap()),
+    )
+    .expect("hello should be sent");
+    let response = read_frame(&mut stream).expect("hello response should arrive");
+    assert_eq!(response.kind, FrameKind::HelloOk);
+    ServerHello::decode(&response.payload).expect("server hello should decode");
+
+    let request = StartRequest {
+        kind: SessionKind::Exec,
+        argv: vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "printf stdout-bytes; printf stderr-bytes >&2; exit 7".to_owned(),
+        ],
+        working_directory: None,
+    };
+    write_frame(
+        &mut stream,
+        &Frame::new(FrameKind::Start, request.encode().unwrap()),
+    )
+    .expect("start should be sent");
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let exit = loop {
+        let frame = read_frame(&mut stream).expect("process frame should arrive");
+        match frame.kind {
+            FrameKind::Stdout => stdout.extend(frame.payload),
+            FrameKind::Stderr => stderr.extend(frame.payload),
+            FrameKind::Exit => break lsw_core::decode_exit(&frame.payload).unwrap(),
+            other => panic!("unexpected process frame {other:?}"),
+        }
+    };
+    assert_eq!(stdout, b"stdout-bytes");
+    assert_eq!(stderr, b"stderr-bytes");
+    assert_eq!(exit, 7);
+    drop(stream);
+    server.join().expect("agent fixture should finish");
+}
+
+#[test]
+fn nonblocking_accepted_socket_waits_for_the_bounded_handshake() {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let token = "a".repeat(64);
+    let server_token = token.clone();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("server should accept");
+        stream
+            .set_nonblocking(true)
+            .expect("fixture stream should become nonblocking");
+        handle_connection(stream, &server_token).expect("delayed handshake should succeed");
+    });
+
+    let mut client = std::net::TcpStream::connect(address).expect("client should connect");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let hello = ClientHello {
+        version: AGENT_PROTOCOL_VERSION,
+        token,
+    };
+    write_frame(
+        &mut client,
+        &Frame::new(
+            FrameKind::Hello,
+            hello.encode().expect("hello should encode"),
+        ),
+    )
+    .expect("client should write HELLO");
+    assert_eq!(
+        read_frame(&mut client).expect("server should answer").kind,
+        FrameKind::HelloOk
+    );
+    write_frame(&mut client, &Frame::new(FrameKind::Ping, Vec::new()))
+        .expect("client should write PING");
+    assert_eq!(
+        read_frame(&mut client).expect("server should answer").kind,
+        FrameKind::Pong
+    );
+    server.join().expect("server should not panic");
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_loopback_file_transfer_preserves_unicode_and_bytes() {
+    fn connect(token: &str) -> (TcpStream, thread::JoinHandle<Result<(), String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let expected_token = token.to_owned();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("fixture should connect");
+            handle_connection(stream, &expected_token).map_err(|error| error.to_string())
+        });
+        let mut stream = TcpStream::connect(address).expect("client should connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout should apply");
+        let hello = ClientHello {
+            version: AGENT_PROTOCOL_VERSION,
+            token: token.to_owned(),
+        };
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Hello, hello.encode().unwrap()),
+        )
+        .expect("hello should be sent");
+        let response = read_frame(&mut stream).expect("hello response should arrive");
+        assert_eq!(response.kind, FrameKind::HelloOk);
+        ServerHello::decode(&response.payload).expect("server hello should decode");
+        (stream, server)
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be valid")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("lsw-agent-e2e-{nonce}"));
+    fs::create_dir(&root).expect("fixture directory should be created");
+    let destination = root.join("résumé-данные.bin");
+    let destination_text = destination.to_string_lossy().into_owned();
+    let contents = b"binary\0payload\xff\nUTF-8:\xf0\x9f\x9a\x80";
+    let token = "b".repeat(64);
+
+    let (mut upload, upload_server) = connect(&token);
+    let put = FilePutRequest {
+        destination: destination_text.clone(),
+        length: contents.len() as u64,
+    };
+    write_frame(
+        &mut upload,
+        &Frame::new(FrameKind::FilePut, put.encode().unwrap()),
+    )
+    .expect("upload request should be sent");
+    assert_eq!(
+        read_frame(&mut upload)
+            .expect("upload ready should arrive")
+            .kind,
+        FrameKind::Pong
+    );
+    for chunk in contents.chunks(7) {
+        write_frame(
+            &mut upload,
+            &Frame::new(FrameKind::FileData, chunk.to_vec()),
+        )
+        .expect("upload data should be sent");
+    }
+    write_frame(
+        &mut upload,
+        &Frame::new(
+            FrameKind::FileDone,
+            encode_file_length(contents.len() as u64),
+        ),
+    )
+    .expect("upload completion should be sent");
+    let completion = read_frame(&mut upload).expect("upload completion should arrive");
+    assert_eq!(completion.kind, FrameKind::FileDone);
+    assert_eq!(
+        decode_file_length(&completion.payload).unwrap(),
+        contents.len() as u64
+    );
+    drop(upload);
+    upload_server
+        .join()
+        .expect("upload fixture should finish")
+        .expect("upload should succeed");
+    assert_eq!(fs::read(&destination).unwrap(), contents);
+
+    let (mut download, download_server) = connect(&token);
+    let get = FileGetRequest {
+        source: destination_text,
+    };
+    write_frame(
+        &mut download,
+        &Frame::new(FrameKind::FileGet, get.encode().unwrap()),
+    )
+    .expect("download request should be sent");
+    let mut received = Vec::new();
+    loop {
+        let frame = read_frame(&mut download).expect("download frame should arrive");
+        match frame.kind {
+            FrameKind::FileData => received.extend(frame.payload),
+            FrameKind::FileDone => {
+                assert_eq!(
+                    decode_file_length(&frame.payload).unwrap(),
+                    received.len() as u64
+                );
+                break;
+            }
+            other => panic!("unexpected download frame {other:?}"),
+        }
+    }
+    drop(download);
+    download_server
+        .join()
+        .expect("download fixture should finish")
+        .expect("download should succeed");
+    assert_eq!(received, contents);
+
+    fs::remove_dir_all(root).expect("fixture directory should be removable");
+}
+
+#[cfg(unix)]
+#[test]
+fn independent_authenticated_sessions_run_concurrently() {
+    fn connect(address: SocketAddr, token: &str) -> TcpStream {
+        let mut stream = TcpStream::connect(address).expect("client should connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout should apply");
+        let hello = ClientHello {
+            version: AGENT_PROTOCOL_VERSION,
+            token: token.to_owned(),
+        };
+        write_frame(
+            &mut stream,
+            &Frame::new(FrameKind::Hello, hello.encode().unwrap()),
+        )
+        .expect("hello should be sent");
+        assert_eq!(
+            read_frame(&mut stream)
+                .expect("hello response should arrive")
+                .kind,
+            FrameKind::HelloOk
+        );
+        stream
+    }
+
+    fn start(stream: &mut TcpStream, script: &str) {
+        let request = StartRequest {
+            kind: SessionKind::Exec,
+            argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            working_directory: None,
+        };
+        write_frame(
+            stream,
+            &Frame::new(FrameKind::Start, request.encode().unwrap()),
+        )
+        .expect("start should be sent");
+    }
+
+    fn collect(stream: &mut TcpStream) -> (Vec<u8>, i32) {
+        let mut stdout = Vec::new();
+        loop {
+            let frame = read_frame(stream).expect("process frame should arrive");
+            match frame.kind {
+                FrameKind::Stdout => stdout.extend(frame.payload),
+                FrameKind::Stderr => {}
+                FrameKind::Exit => return (stdout, lsw_core::decode_exit(&frame.payload).unwrap()),
+                other => panic!("unexpected process frame {other:?}"),
+            }
+        }
+    }
+
+    let token = "c".repeat(64);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let expected_token = token.clone();
+    let server = thread::spawn(move || {
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().expect("fixture should connect");
+            let token = expected_token.clone();
+            sessions.push(thread::spawn(move || {
+                handle_connection(stream, &token).map_err(|error| error.to_string())
+            }));
+        }
+        for session in sessions {
+            session
+                .join()
+                .expect("session should not panic")
+                .expect("session should succeed");
+        }
+    });
+
+    let mut blocked = connect(address, &token);
+    start(
+        &mut blocked,
+        "IFS= read -r value; printf 'first-%s' \"$value\"",
+    );
+
+    let mut independent = connect(address, &token);
+    start(&mut independent, "printf second");
+    assert_eq!(collect(&mut independent), (b"second".to_vec(), 0));
+
+    write_frame(
+        &mut blocked,
+        &Frame::new(FrameKind::Stdin, b"ready\n".to_vec()),
+    )
+    .expect("blocked session input should be sent");
+    assert_eq!(collect(&mut blocked), (b"first-ready".to_vec(), 0));
+    drop(independent);
+    drop(blocked);
+    server.join().expect("server fixture should finish");
+}
