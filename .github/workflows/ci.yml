@@ -64,6 +64,11 @@ jobs:
         run: >-
           cargo clippy --target x86_64-pc-windows-gnu -p lsw-agent --all-targets --locked
           -- -D warnings
+      - name: Build the host binaries for the QEMU smoke test
+        # `cargo test --all-targets` links the binaries only as test
+        # harnesses; this reuses the same dependency build to emit the real
+        # target/debug/lsw and target/debug/lswd executables.
+        run: cargo build --locked -p lsw-cli -p lsw-daemon
       - name: Share the host binaries with the QEMU smoke test
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
