@@ -8,20 +8,35 @@ runners used KVM or installed Windows.
 
 ## Local checks
 
-Use the Rust version declared by `rust-version` in the workspace manifest. The
-beta.7 workflows pin Rust 1.76.0 instead of treating the moving `stable`
-toolchain as the MSRV gate:
+`rust-toolchain.toml` pins Rust 1.76.0 with `rustfmt` and `clippy`; `rustup`
+installs and selects it for every `cargo` invocation in the checkout, so CI,
+release builds, and local checks all use the exact MSRV instead of the moving
+`stable` toolchain. Keep its `channel` equal to `rust-version` in the workspace
+manifest.
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo clippy --target x86_64-pc-windows-gnu -p lsw-agent --all-targets --locked -- -D warnings
+cargo deny check
 scripts/check-shell.sh
 scripts/check-source-layout.sh
 ```
 
+The Windows-target Clippy run type-checks the `cfg(windows)` half of the guest
+agent, including its FFI, on a Linux host; it needs only
+`rustup target add x86_64-pc-windows-gnu`, not a linker. `cargo deny`
+(`cargo install cargo-deny --locked`) enforces `deny.toml`: a GPL-compatible
+license allowlist, crates.io as the only source, no wildcard or yanked
+dependencies, and RustSec advisories. Advisories that cannot be fixed within
+the MSRV are listed there with the reason, never silently.
+
 `scripts/check-shell.sh` requires Bash, Dash, and ShellCheck. It parses every
-script with the shell named by its shebang before running ShellCheck.
+script with the shell named by its shebang before running ShellCheck, then
+lints each sourced `scripts/e2e/*.sh` library directly and rejects a library
+whose first line is not a `#` comment: a `//` line parses as a command and
+breaks every driver that sources the file.
 `scripts/check-source-layout.sh` rejects Rust and automation files above 1,000
 lines, executable `main.rs` entry points above 300 lines, and any reintroduced
 Slice 4.5 exception. The checked-in exception file is intentionally empty.
@@ -176,19 +191,37 @@ the offline Cargo source. The manifest covers the vendored tree too.
 
 ## GitHub Actions boundary
 
-`.github/workflows/ci.yml` runs formatting, unit tests, Clippy, shell checks,
-the MinGW agent cross-build plus PE-format inspection, and Windows-native MSVC
-Job/ConPTY setup tests plus an executable load smoke on ordinary pushes and pull
-requests. It also installs distribution QEMU/OVMF/swtpm packages and runs both
-the timeout-bounded TCG firmware smoke and the non-skippable product-lifecycle
-gate described above. All Rust jobs use the declared 1.76.0 MSRV. The native
-Windows job does not boot a managed guest or exercise a service-backed ConPTY
-shell end to end;
-the QEMU jobs use no Windows ISO. CI also builds, installs, and verifies a
-disposable release bundle without publishing it. `BUILDINFO.txt` identifies all
-four shipped binaries by SHA-256, and the bundle also carries an `lswg` runtime
-sidecar. Verification checks its ELF target, shared version/protocol identity,
-and installed bytes.
+`.github/workflows/ci.yml` runs on ordinary pushes and pull requests; a newer
+push to the same branch or pull request cancels the superseded run, every job
+has a timeout, and the Rust toolchain comes from `rust-toolchain.toml`. Its
+jobs are:
+
+- `lint`: formatting, shell syntax and ShellCheck, the source-layout ratchet,
+  and the profile-comparison self-test, with no Rust build.
+- `rust`: unit tests and Clippy from a shared dependency cache, plus Clippy on
+  the `x86_64-pc-windows-gnu` target so the guest agent's Windows-only code is
+  linted on every push. It publishes the debug `lsw`/`lswd` binaries as a
+  short-lived artifact.
+- `supply-chain`: `cargo deny check` against `deny.toml`.
+- `stable`: an advisory-only `cargo check` on current stable Rust, so compiler
+  breakage is visible before the MSRV moves; it never blocks a merge.
+- `windows-agent-native`: MSVC Job/ConPTY setup tests, a dev-profile build,
+  an executable load smoke, two SCM start/stop cycles against that binary, and
+  a parse of every PowerShell script. It does not boot a managed guest or
+  exercise a service-backed ConPTY shell end to end.
+- `qemu-smoke`: installs distribution QEMU/OVMF/swtpm, reuses the `rust` job's
+  binaries, and runs the systemd socket-activation check, the timeout-bounded
+  TCG firmware smoke, and the non-skippable product-lifecycle gate described
+  above. It uses no Windows ISO.
+- `package`: on a pinned `ubuntu-24.04` image, builds, installs, and verifies
+  a disposable release bundle without publishing it, then inspects the
+  cross-built guest-agent PE. `BUILDINFO.txt` identifies all four shipped
+  binaries by SHA-256, and the bundle also carries an `lswg` runtime sidecar.
+  Verification checks its ELF target, shared version/protocol identity, and
+  installed bytes.
+
+`.github/dependabot.yml` proposes grouped weekly updates for the SHA-pinned
+actions and the exact-pinned crates.
 
 `.github/workflows/release.yml` runs only for version tags or a manual
 dispatch. It repeats the source gates, checks package determinism, verifies the

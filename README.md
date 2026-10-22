@@ -430,6 +430,14 @@ The project targets are:
 Targets are not release claims until the corresponding benchmark has passed on
 documented hardware.
 
+Under KVM the guest CPU is the host CPU with Hyper-V enlightenments, the
+invariant TSC, and a one-socket core topology, which is what Windows expects
+from its own hypervisor and what libvirt configures for Windows guests. If a
+distribution's QEMU or kernel rejects one of the `hv-*` features, start the
+daemon with `LSW_GUEST_CPU_TUNING=baseline` to use plain host passthrough;
+`lsw plan NAME` shows the resulting `-cpu` argument and a note naming the active
+tuning.
+
 ## Profiles
 
 | Profile | Behavior | Guest Secure Boot |
@@ -599,13 +607,15 @@ Explorer/shell-light safety boundary.
 
 The host resolver uses a small pinned Rust HTTP/TLS, URL, JSON and SHA-256
 dependency set; the Windows agent does not link that host-only stack. The MSRV
-is Rust 1.76, which is also pinned in CI:
+is Rust 1.76; `rust-toolchain.toml` pins that exact toolchain for every
+checkout and CI job, so `rustup` selects it automatically:
 
 ```bash
 cargo build --workspace
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo deny check   # dependency licenses, sources, and advisories (deny.toml)
 ```
 
 Build the Windows GNU guest agent with MinGW:

@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- Fixed the unsourceable `scripts/e2e/*.sh` libraries. Every library began
+  with a `//` SPDX line, which sh runs as a command, so the headless
+  Windows/KVM gate and the seamless GUI gate exited with status 126 at their
+  first `.` line and no new tag could pass the release gate. `check-shell.sh`
+  now lints each sourced library directly and rejects a non-comment header.
+- Exposed Hyper-V enlightenments, the invariant TSC, a one-socket core
+  topology, and RTC drift slewing to KVM guests. Windows uses the paravirtual
+  clocks, timers, TLB-shootdown and IPI hypercalls instead of emulated
+  devices, which is the largest Windows-on-KVM performance change available
+  without guest drivers. `LSW_GUEST_CPU_TUNING=baseline` restores plain host
+  passthrough; `lsw plan` names the active tuning.
+- Parsed QMP messages as JSON. The daemon previously classified replies by
+  substring, so an asynchronous event mentioning "error" or "return" could be
+  taken for the command response.
+- Collapsed the three copy-pasted Windows helper-service shells and the
+  agent service's own SCM bindings into one shared `windows_scm` module and
+  one generic demand-start helper, and removed the duplicated filesystem,
+  hex, unattend, QEMU argument, Windows path-component, and state-root
+  helpers across the host crates.
+- Pinned the toolchain once in `rust-toolchain.toml`, centralized every
+  external dependency in `[workspace.dependencies]`, dropped the unused
+  `ahash` dependency, and added a `cargo deny` policy. The audit moved the
+  ISO downloader's TLS stack to patched rustls, rustls-webpki, and
+  webpki-roots releases; the remaining idna and build-time quick-xml
+  advisories are recorded with reasons until the MSRV can move.
+- Restructured CI: superseded runs are cancelled, every job has a timeout,
+  dependencies are cached, tests and Clippy share one build, the guest
+  agent's Windows-only code is Clippy-checked on Linux through the GNU
+  target, the QEMU smoke reuses built binaries, the Windows job builds the
+  dev profile once, packaging runs on a pinned `ubuntu-24.04` image, a
+  `cargo deny` job and an advisory-only stable-Rust check were added, and
+  Dependabot tracks actions and crates. `verify-release.sh` derives the
+  vendored crate versions from the bundled lockfile instead of hard-coding
+  them.
 - Added the final-native same-ISO profile comparison gate. The ordinary slim
   install and a separate zero-mutation vanilla install now each publish three
   settled cold-boot samples bound to one Windows build, edition, memory size,

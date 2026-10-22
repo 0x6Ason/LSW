@@ -365,7 +365,16 @@ signing/enrollment workflow.
 
 ## Performance priorities
 
-- KVM with host CPU passthrough; TCG is a diagnostic fallback.
+- KVM with host CPU passthrough and Hyper-V enlightenments; TCG is a
+  diagnostic fallback. Windows polls its hypervisor through the Hyper-V
+  paravirtual interface and falls back to emulated timers, APIC accesses, and
+  IPIs when it is absent, so `QemuPlanner` passes the host CPU through with
+  `migratable=off` (invariant TSC) and the libvirt-default `hv-*` feature set
+  that every KVM kernel since Linux 5.0 and QEMU since 4.0 accept. vCPUs are
+  presented as cores of one socket so Windows socket licensing never idles a
+  vCPU, and the emulated RTC slews instead of jumping. `lswd` honors
+  `LSW_GUEST_CPU_TUNING=baseline` to fall back to plain `-cpu host` on a host
+  whose QEMU rejects an enlightenment; `lsw plan` names the active tuning.
 - Windows-inbox NVMe, e1000e and VGA for installability before optional drivers.
 - qcow2 overlays for disposable runs without modifying the base disk.
 - Separate control, process/file, and future graphics data paths.
