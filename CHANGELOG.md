@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Made release reproducibility meaningful. The builder now stages the
+  corresponding source first (git-tracked files, `SOURCE_COMMIT`, vendored
+  dependencies) and compiles every binary from that snapshot offline with the
+  source root remapped to `/lsw`, so the shipped bytes come from the shipped
+  source and rebuild identically from any directory. The reproducibility check
+  rebuilds from the first archive's `source/` instead of building the same
+  checkout twice, tagged releases refuse a dirty checkout, `BUILDINFO.txt`
+  records the commit, rustc, cargo, and Windows linker versions, and the
+  verifier inspects the agent with the repository's own tool rather than a
+  script from the archive under test.
 - Cut the Windows guest agent loose from `lsw-core`. The guest ports,
   boot-identity file names, credential scopes, and scoped-credential
   derivation moved into `lsw-protocol`, the ~70-symbol compatibility

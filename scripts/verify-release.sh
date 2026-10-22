@@ -135,6 +135,8 @@ for required_file in \
     systemd/lswd.service systemd/lswd.socket \
     docs/DEVELOPMENT.md docs/WINDOWS_KVM_E2E.md \
     source/Cargo.lock source/Cargo.toml source/LICENSE source/README.md \
+    source/SOURCE_COMMIT source/deny.toml source/rust-toolchain.toml \
+    source/scripts/lib/reproducible-build.sh \
     source/ROADMAP.md \
     source/THIRD_PARTY_NOTICES.md \
     source/contrib/systemd/lswd.service source/contrib/systemd/lswd.socket \
@@ -193,6 +195,19 @@ case "$release_version" in
         exit 1
         ;;
 esac
+source_commit=$(sed -n '1p' "$bundle/source/SOURCE_COMMIT")
+case "$source_commit" in
+    unknown|*-dirty)
+        echo "error: release bundle does not correspond to a clean commit: $source_commit" >&2
+        exit 1
+        ;;
+esac
+if ! grep -Fx "SOURCE_COMMIT=$source_commit" "$bundle/BUILDINFO.txt" >/dev/null \
+    || ! grep -E '^RUSTC_VERSION=[0-9]+\.[0-9]+\.[0-9]+' "$bundle/BUILDINFO.txt" >/dev/null \
+    || ! grep -E '^WINDOWS_LINKER=(mingw|zig)' "$bundle/BUILDINFO.txt" >/dev/null; then
+    echo "error: BUILDINFO does not record the source commit and toolchain" >&2
+    exit 1
+fi
 if ! grep -Fx 'LICENSE=GPL-3.0-or-later' "$bundle/BUILDINFO.txt" >/dev/null \
     || ! grep -Fx 'CORRESPONDING_SOURCE=source/' "$bundle/BUILDINFO.txt" >/dev/null \
     || ! grep -Fx 'HOST_TARGET=x86_64-unknown-linux-gnu' "$bundle/BUILDINFO.txt" >/dev/null \
@@ -279,8 +294,10 @@ if ! file "$bundle/lsw-agent.exe" | grep -E 'PE32\+ executable.*x86-64' >/dev/nu
     echo "error: archive guest agent is not a Windows x86_64 PE executable" >&2
     exit 1
 fi
-python3 "$bundle/source/scripts/normalize-pe-timestamp.py" \
-    --check "$bundle/lsw-agent.exe"
+# Inspect the agent with this checkout's tool, never with a script from the
+# archive under test.
+verifier_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+python3 "$verifier_directory/normalize-pe-timestamp.py" --check "$bundle/lsw-agent.exe"
 
 # Legal media boundaries are also enforced at package verification time. The
 # source and release bundle must not acquire an OS installer or VM disk image.

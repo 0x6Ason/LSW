@@ -29,13 +29,13 @@ for script in scripts/*.sh; do
     esac
 done
 
-# The e2e libraries are sourced by the gate drivers rather than executed, so
+# The e2e and lib libraries are sourced by other scripts rather than executed, so
 # they carry a `shell=sh` directive instead of a shebang and are only linted
 # through the driver's --external-sources above. Lint each one directly as
 # well: a stray `//` comment line parses as a command, breaks every driver
 # that sources the file, and would otherwise surface only on the dedicated
 # Windows/KVM runner.
-for library in scripts/e2e/*.sh; do
+for library in scripts/e2e/*.sh scripts/lib/*.sh; do
     case "$(head -n 1 "$library")" in
         '# SPDX-License-Identifier: '*) ;;
         *)

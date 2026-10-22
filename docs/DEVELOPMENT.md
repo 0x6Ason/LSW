@@ -150,10 +150,18 @@ a bounded small-file sample; the product benchmark defaults remain unchanged.
 ## Release bundle
 
 The release builder supports Linux x86_64 and requires GNU tar and Python 3.
-It builds the Linux CLI/daemon and Windows x86_64 agent from the checked-out
-source. Packaging never downloads or embeds an operating-system installer or
-guest image; the installed `lsw` runtime can resolve official media directly
-from Microsoft when a user explicitly starts an installation.
+It first stages the corresponding source: every git-tracked file of the
+checkout (local edits included, untracked files never), the commit it came
+from in `source/SOURCE_COMMIT`, and the exact dependency sources from
+`cargo vendor --locked --versioned-dirs`. It then compiles the Linux
+CLI/daemon/`lswg` and the Windows x86_64 agent **from that snapshot**, offline,
+with the snapshot root remapped to `/lsw` in every compiled artifact. The
+shipped binaries are therefore built from the shipped source, and a rebuild
+from `source/` in any directory produces the same bytes. A tagged release
+(`LSW_EXPECT_VERSION` set) refuses a checkout with modified tracked files.
+Packaging never downloads or embeds an operating-system installer or guest
+image; the installed `lsw` runtime can resolve official media directly from
+Microsoft when a user explicitly starts an installation.
 
 ```sh
 LSW_WINDOWS_LINKER=mingw scripts/build-release.sh
@@ -170,11 +178,14 @@ Useful controls are:
 - `SOURCE_DATE_EPOCH`: set the reproducible build environment and all archive
   member timestamps. The default is a fixed epoch. Archive ownership and modes
   are normalized, and gzip timestamps are disabled.
-- `scripts/check-release-reproducibility.sh`: perform two complete builds in
-  separate, initially empty Cargo target directories and require
-  byte-for-byte identical archives. This tests clean-build reproducibility for
-  the selected compiler and linker; it does not claim that different
-  toolchains produce identical binaries.
+- `scripts/check-release-reproducibility.sh`: build once from the checkout,
+  unpack that archive, build again from its shipped `source/` directory in a
+  different location with an empty Cargo target directory, and require
+  byte-for-byte identical archives. This proves that the published source
+  rebuilds the published bytes with the same compiler and linker; it does not
+  claim that different toolchains produce identical binaries.
+  `BUILDINFO.txt` records `SOURCE_COMMIT`, `RUSTC_VERSION`, `CARGO_VERSION`,
+  and `WINDOWS_LINKER` so a verifier knows which toolchain to reproduce with.
 
 The verifier checks the SHA-256 sidecar before extraction, rejects unsafe or
 multi-root archives and links/special files, validates executable formats and

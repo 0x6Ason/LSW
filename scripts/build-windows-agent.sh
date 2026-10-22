@@ -31,6 +31,14 @@ if [ ! -d "$rust_sysroot/lib/rustlib/$windows_target/lib" ]; then
     exit 1
 fi
 
+# shellcheck source=scripts/lib/reproducible-build.sh
+. "$workspace_root/scripts/lib/reproducible-build.sh"
+lsw_export_reproducible_rustflags "$workspace_root"
+cargo_offline=
+if lsw_source_is_vendored "$workspace_root"; then
+    cargo_offline=--offline
+fi
+
 windows_linker=${LSW_WINDOWS_LINKER:-auto}
 zig_binary=${LSW_ZIG:-zig}
 mingw_binary=${LSW_MINGW_CC:-x86_64-w64-mingw32-gcc}
@@ -54,6 +62,7 @@ case "$windows_linker" in
             exit 1
         fi
         export LSW_ZIG="$zig_binary"
+        linker_version=$("$zig_binary" version 2>/dev/null | sed -n '1p')
         export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$workspace_root/scripts/zig-windows-linker.sh"
         # Zig's PE linker cannot consume rustc's embedded ThinLTO objects. The
         # agent remains optimized; only cross-language LTO is disabled.
@@ -70,6 +79,7 @@ case "$windows_linker" in
             exit 1
         fi
         export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$mingw_binary"
+        linker_version=$("$mingw_binary" --version 2>/dev/null | sed -n '1p')
         ;;
     *)
         echo "error: LSW_WINDOWS_LINKER must be auto, zig, or mingw" >&2
@@ -78,7 +88,12 @@ case "$windows_linker" in
 esac
 
 echo "Building lsw-agent with the $windows_linker linker" >&2
-cargo build --locked --release --target "$windows_target" --bin lsw-agent
+if [ -n "${LSW_WINDOWS_LINKER_INFO:-}" ]; then
+    printf 'linker=%s\nversion=%s\n' "$windows_linker" "${linker_version:-unknown}" \
+        >"$LSW_WINDOWS_LINKER_INFO"
+fi
+# shellcheck disable=SC2086 # $cargo_offline is empty or one flag.
+cargo build --locked $cargo_offline --release --target "$windows_target" --bin lsw-agent
 
 agent="$cargo_target_directory/$windows_target/release/lsw-agent.exe"
 if [ ! -f "$agent" ]; then
