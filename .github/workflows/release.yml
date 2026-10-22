@@ -11,14 +11,23 @@ on:
 permissions:
   contents: read
 
+# Releases never cancel each other; a second tag waits for the first.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
 jobs:
   bundle:
     name: Build and verify Linux x86_64 bundle
-    runs-on: ubuntu-latest
+    # Pinned: the shipped glibc floor and MinGW toolchain follow this image,
+    # so a release must not silently move with ubuntu-latest.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     permissions:
       actions: read
       contents: write
@@ -160,18 +169,21 @@ jobs:
               echo "Exact legacy commit \`$GITHUB_SHA\` was validated by [run $matched_run]($gate_url)."
             fi
           } >>"$GITHUB_STEP_SUMMARY"
-      - name: Install Rust 1.76.0 and the Windows GNU target
-        run: |
-          rustup toolchain install 1.76.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.76.0
-          rustup target add x86_64-pc-windows-gnu
+      - name: Add the Windows GNU target
+        # The toolchain itself is pinned by rust-toolchain.toml.
+        run: rustup target add x86_64-pc-windows-gnu
       - name: Install release tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes gcc-mingw-w64-x86-64 file shellcheck
+          sudo apt-get install --yes --no-install-recommends \
+            gcc-mingw-w64-x86-64 file shellcheck
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
       - name: Run source gates
         run: |
           scripts/check-shell.sh
+          scripts/check-source-layout.sh
           cargo fmt --all -- --check
           cargo test --workspace --all-targets --locked
           cargo clippy --workspace --all-targets --locked -- -D warnings

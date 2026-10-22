@@ -10,126 +10,141 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request supersedes the running
+# check; tags and the default branch are never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
+# The Rust toolchain comes from rust-toolchain.toml; rustup installs it on the
+# first cargo invocation, so no job spells out a version.
 jobs:
-  shell:
-    name: Shell scripts
+  lint:
+    name: Format, shell, and layout gates
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install ShellCheck
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes shellcheck
-      - name: Check syntax and lint
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Check shell syntax and lint
         run: scripts/check-shell.sh
+      - name: Enforce the source-layout ratchet
+        run: scripts/check-source-layout.sh
       - name: Exercise the profile-comparison fail-closed thresholds
         run: python3 scripts/compare-windows-profile-audits.py --self-test
-      - name: Enforce the Slice 4.5 source-layout ratchet
-        run: scripts/check-source-layout.sh
 
   rust:
-    name: Rust ${{ matrix.check }}
+    name: Rust tests and Clippy
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        check:
-          - fmt
-          - test
-          - clippy
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install Rust 1.76.0
-        run: |
-          rustup toolchain install 1.76.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.76.0
-      - name: Check formatting
-        if: matrix.check == 'fmt'
-        run: cargo fmt --all -- --check
+      - name: Add the Windows GNU target for cross-checking the guest agent
+        run: rustup target add x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: dev
       - name: Run tests
-        if: matrix.check == 'test'
         run: cargo test --workspace --all-targets --locked
       - name: Run Clippy
-        if: matrix.check == 'clippy'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run Clippy on the Windows guest agent
+        # `cargo clippy --target` type-checks the cfg(windows) half of the
+        # agent, including its FFI, without needing a linker or a Windows runner.
+        run: >-
+          cargo clippy --target x86_64-pc-windows-gnu -p lsw-agent --all-targets --locked
+          -- -D warnings
+      - name: Share the host binaries with the QEMU smoke test
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lsw-host-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/debug/lsw
+            target/debug/lswd
+          if-no-files-found: error
+          retention-days: 1
 
-  windows-agent:
-    name: Windows guest-agent cross-build
+  supply-chain:
+    name: Dependency policy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install Rust 1.76.0 and the Windows GNU target
-        run: |
-          rustup toolchain install 1.76.0 --profile minimal
-          rustup default 1.76.0
-          rustup target add x86_64-pc-windows-gnu
-      - name: Install the MinGW linker and PE inspection tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64 file
-      - name: Build the guest agent
-        env:
-          LSW_WINDOWS_LINKER: mingw
-        run: scripts/build-windows-agent.sh
-      - name: Inspect the guest-agent artifact
-        run: |
-          file target/x86_64-pc-windows-gnu/release/lsw-agent.exe \
-            | grep -E 'PE32\+ executable.*x86-64'
-          x86_64-w64-mingw32-objdump -f \
-            target/x86_64-pc-windows-gnu/release/lsw-agent.exe \
-            | grep -F 'file format pei-x86-64'
-      - name: Record runtime-test boundary
-        run: |
-          echo "Cross-build and PE inspection passed."
-          echo "This job does not claim to run Windows, KVM, or an installed guest."
+      - name: Check licenses, sources, bans, and advisories against deny.toml
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --locked
+
+  stable:
+    name: Check on current stable Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Advisory only: the MSRV lane is the contract. This surfaces compiler
+    # breakage early without blocking merges on a toolchain the project
+    # does not yet ship with.
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: stable
+      - name: Type-check the workspace
+        run: cargo check --workspace --all-targets --locked
 
   windows-agent-native:
     name: Windows guest-agent native smoke test
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install Rust 1.76.0
-        shell: pwsh
-        run: |
-          rustup toolchain install 1.76.0 --profile minimal
-          rustup default 1.76.0
-      - name: Build the MSVC guest agent
-        shell: pwsh
-        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin lsw-agent
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: windows-dev
       - name: Exercise native process-tree ownership and ConPTY setup
         shell: pwsh
-        run: cargo test --locked --target x86_64-pc-windows-msvc -p lsw-agent -- --test-threads=1
+        run: cargo test --locked -p lsw-agent -- --test-threads=1
+      - name: Build the MSVC guest agent
+        shell: pwsh
+        run: cargo build --locked -p lsw-agent --bin lsw-agent
       - name: Load the executable and parse its command line
         shell: pwsh
         run: |
-          & .\target\x86_64-pc-windows-msvc\release\lsw-agent.exe --help
+          & .\target\debug\lsw-agent.exe --help
           if ($LASTEXITCODE -ne 0) {
             throw "lsw-agent --help failed with exit code $LASTEXITCODE"
           }
       - name: Exercise the Windows service lifecycle
         shell: powershell
         timeout-minutes: 5
+        env:
+          LSW_AGENT_BINARY: target\debug\lsw-agent.exe
         run: .\scripts\check-windows-agent-service.ps1
-      - name: Parse the Windows profile audit fixture
+      - name: Parse every PowerShell script
         shell: powershell
         run: |
-          foreach ($Path in @(
-            '.\scripts\check-windows-slim-profile.ps1',
-            '.\scripts\measure-windows-profile.ps1'
-          )) {
-            $Source = Get-Content $Path -Raw
+          foreach ($Path in Get-ChildItem -Path .\scripts -Filter '*.ps1' -Recurse) {
+            $Source = Get-Content $Path.FullName -Raw
             [scriptblock]::Create($Source) | Out-Null
           }
       - name: Record runtime-test boundary
@@ -140,8 +155,9 @@ jobs:
 
   qemu-smoke:
     name: Headless QEMU integration smoke test
+    needs: rust
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -149,13 +165,15 @@ jobs:
       - name: Install QEMU, OVMF, and software TPM
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ovmf python3-minimal qemu-system-x86 qemu-utils swtpm
-      - name: Install Rust 1.76.0
-        run: |
-          rustup toolchain install 1.76.0 --profile minimal
-          rustup default 1.76.0
-      - name: Build the LSW host runtime
-        run: cargo build --locked -p lsw-cli -p lsw-daemon
+          sudo apt-get install --yes --no-install-recommends \
+            ovmf qemu-system-x86 qemu-utils swtpm
+      - name: Receive the host binaries built by the Rust job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: lsw-host-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/debug
+      - name: Restore executable bits lost in the artifact round trip
+        run: chmod 755 target/debug/lsw target/debug/lswd
       - name: Exercise systemd socket activation
         run: scripts/check-systemd-socket-activation.sh
       - name: Boot a transport-adapted OVMF and vTPM VM under TCG
@@ -167,20 +185,23 @@ jobs:
 
   package:
     name: Release bundle smoke test
-    runs-on: ubuntu-latest
+    # Pinned: the bundle's glibc floor and MinGW toolchain follow the image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Install Rust 1.76.0 and the Windows GNU target
-        run: |
-          rustup toolchain install 1.76.0 --profile minimal
-          rustup default 1.76.0
-          rustup target add x86_64-pc-windows-gnu
-      - name: Install release tools
+      - name: Add the Windows GNU target
+        run: rustup target add x86_64-pc-windows-gnu
+      - name: Install the MinGW linker and PE inspection tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes gcc-mingw-w64-x86-64 file
+          sudo apt-get install --yes --no-install-recommends \
+            binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64 file
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: release
       - name: Build and verify a disposable bundle
         env:
           LSW_WINDOWS_LINKER: mingw
@@ -194,3 +215,14 @@ jobs:
             exit 1
           fi
           scripts/verify-release.sh "$archive"
+      - name: Inspect the cross-built guest-agent artifact
+        run: |
+          file target/x86_64-pc-windows-gnu/release/lsw-agent.exe \
+            | grep -E 'PE32\+ executable.*x86-64'
+          x86_64-w64-mingw32-objdump -f \
+            target/x86_64-pc-windows-gnu/release/lsw-agent.exe \
+            | grep -F 'file format pei-x86-64'
+      - name: Record runtime-test boundary
+        run: |
+          echo "Cross-build, packaging, and PE inspection passed."
+          echo "This job does not claim to run Windows, KVM, or an installed guest."

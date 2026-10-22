@@ -11,7 +11,10 @@ $ListenPort = 47653
 $TestRoot = Join-Path $env:RUNNER_TEMP 'lsw agent service smoke'
 $AgentPath = Join-Path $TestRoot 'lsw-agent.exe'
 $TokenPath = Join-Path $TestRoot 'agent.token'
-$BuiltAgent = (Resolve-Path '.\target\x86_64-pc-windows-msvc\release\lsw-agent.exe').Path
+# LSW_AGENT_BINARY selects the build under test; CI points it at the dev
+# profile binary it just tested so the service smoke needs no second build.
+$BuiltAgentPath = if ($env:LSW_AGENT_BINARY) { $env:LSW_AGENT_BINARY } else { '.\target\x86_64-pc-windows-msvc\release\lsw-agent.exe' }
+$BuiltAgent = (Resolve-Path $BuiltAgentPath).Path
 $BinaryCommand = "`"$AgentPath`" --service --token-file `"$TokenPath`" --listen ${ListenAddress}:$ListenPort"
 $OwnService = $false
 $PrimaryFailure = $null
