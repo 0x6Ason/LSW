@@ -24,7 +24,7 @@ The real problems are structural:
   cancellation, and no timeouts;
 - a reproducibility story that only holds on one machine.
 
-## Fixed on this branch
+## Fixed on master
 
 | Area | Change |
 | --- | --- |
@@ -34,6 +34,45 @@ The real problems are structural:
 | Duplication | One `windows_scm` module and one generic helper-service shell replace four copies; shared `fs_checks`, hex, unattend, QEMU argument, path-component, and state-root helpers replace their copies. |
 | Dependencies | `rust-toolchain.toml`, `[workspace.dependencies]`, unused `ahash` removed, `deny.toml` added; rustls/rustls-webpki/webpki-roots upgraded to patched releases within the MSRV. |
 | CI | Caching, cancellation, timeouts, one Rust build shared by tests and Clippy, Windows-target Clippy on Linux, binaries reused by the QEMU smoke, dev-profile-only Windows job, pinned `ubuntu-24.04` packaging, `cargo deny` job, advisory stable lane, Dependabot. `verify-release.sh` reads vendored versions from the lockfile. |
+| Crate boundaries | The guest agent depends only on `lsw-protocol` (plus `windows` and `xml-rs`); the host-guest contract lives in `lsw_protocol::contract`; the 70-symbol re-export shim is gone and every crate imports the protocol directly. |
+| Reproducibility | Releases are built from the staged, vendored source snapshot with the root remapped to `/lsw`; the check rebuilds from the shipped `source/` and the archives match byte for byte; `BUILDINFO.txt` records commit and toolchain. |
+| Daemon protocol | Typed `DaemonRequest`/`DaemonResponse` over bounded JSON lines (protocol 3) with a typed `DaemonError` in `lsw-host`; the CLI text and the scripts that grep it are unchanged. |
+
+## Handover: what still needs real hardware
+
+Everything above was validated on Linux without KVM (unit tests, Clippy on
+both targets, the TCG lifecycle gate, the release rebuild) and by GitHub CI.
+Three things can only be proven on a machine with `/dev/kvm` and, for the
+last, a real `systemd --user` session:
+
+1. **Hyper-V enlightenments on real KVM.** Start any installed instance and
+   confirm QEMU accepts the model:
+
+   ```sh
+   lsw plan win-dev run | grep -- '-cpu '          # shows host,migratable=off,hv-...
+   lsw start win-dev && lsw status win-dev          # STATE=running QMP=running
+   tail -n 20 ~/.local/share/lsw/instances/win-dev/qemu.log
+   ```
+
+   If `qemu.log` reports an unsupported `hv-*` property, run the daemon with
+   `LSW_GUEST_CPU_TUNING=baseline`, note the kernel and QEMU versions, and
+   open an issue so the default set can be narrowed. Inside the guest,
+   `Get-ComputerInfo | Select HyperV*` and Task Manager's idle CPU are the
+   quick checks; the `lsw bench` targets in the README are the real ones.
+
+2. **The Windows/KVM gate after the `//` header fix.** Dispatch
+   `windows-kvm-e2e.yml` from master with the exact SHA. Its first useful
+   signal is simply that `check-windows-kvm-e2e.sh` gets past sourcing the
+   `scripts/e2e` libraries; before the fix it exited 126 there. Run the
+   native Wayland variant as well before the next tag.
+
+3. **The systemd units.** On a desktop session, `lsw daemon enable`, then
+   exercise `lsw push /tmp/some-file`, `lsw share add ... --read-write` for
+   a directory outside `~/.local/share/lsw`, and `systemctl --user stop
+   lswd` while a guest is running. `PrivateTmp`, `ProtectHome=read-only`,
+   and the 15-second stop timeout in `contrib/systemd/lswd.service` are the
+   directives under suspicion; relax whichever breaks and say so in the
+   unit.
 
 ## Remaining work, by priority
 
