@@ -4,8 +4,9 @@ use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
-use lsw_core::{
-    validate_windows_user_name, StateStore, UserCreateRequest, UserSetRoleRequest, WindowsUserRole,
+use lsw_core::StateStore;
+use lsw_protocol::{
+    validate_windows_user_name, UserCreateRequest, UserSetRoleRequest, WindowsUserRole,
 };
 
 use super::{connect_agent, resolve_name};

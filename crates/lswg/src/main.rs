@@ -10,11 +10,9 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use lsw_core::{
-    read_frame, FolderShareTransport, FrameKind, GuiStartRequest, StateStore,
-    CAPABILITY_GUI_WINDOW_V3,
-};
+use lsw_core::{FolderShareTransport, StateStore};
 use lsw_host::AgentClient;
+use lsw_protocol::{read_frame, FrameKind, GuiStartRequest, CAPABILITY_GUI_WINDOW_V3};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1).collect()) {

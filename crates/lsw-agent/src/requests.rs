@@ -493,10 +493,12 @@ pub(super) fn live_share_configure(
         }
     };
     #[cfg(windows)]
-    let result =
-        lsw_core::derive_scoped_credential(expected_token, lsw_core::LIVE_SHARE_CREDENTIAL_SCOPE)
-            .map_err(|error| error.into())
-            .and_then(|credential| windows_live_share::configure(request.enable, &credential));
+    let result = lsw_protocol::derive_scoped_credential(
+        expected_token,
+        lsw_protocol::LIVE_SHARE_CREDENTIAL_SCOPE,
+    )
+    .map_err(|error| error.into())
+    .and_then(|credential| windows_live_share::configure(request.enable, &credential));
     #[cfg(not(windows))]
     let result: Result<(), Box<dyn std::error::Error>> = {
         let _ = (expected_token, request);

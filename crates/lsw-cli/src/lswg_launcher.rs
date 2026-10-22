@@ -5,10 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use lsw_core::{
-    sha256_file, write_frame, Frame, FrameKind, GuiStartRequest, StateStore,
-    CAPABILITY_GUI_WINDOW_V3,
-};
+use lsw_core::{sha256_file, StateStore};
+use lsw_protocol::{write_frame, Frame, FrameKind, GuiStartRequest, CAPABILITY_GUI_WINDOW_V3};
 
 const MAX_LSWG_OUTPUT_BYTES: usize = 1024;
 

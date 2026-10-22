@@ -109,7 +109,7 @@ pub(super) fn create_local_user(
     password: &[u8],
     administrator: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    lsw_core::validate_windows_user_name(user_name)?;
+    lsw_protocol::validate_windows_user_name(user_name)?;
     let password = std::str::from_utf8(password).map_err(|_| "password must be valid UTF-8")?;
     if password.is_empty() || password.contains('\0') || password.encode_utf16().count() > 256 {
         return Err("password must contain 1-256 UTF-16 code units and no NUL".into());
@@ -171,14 +171,14 @@ pub(super) fn create_local_user(
 
 pub(super) fn set_local_user_role(
     user_name: &str,
-    role: lsw_core::WindowsUserRole,
+    role: lsw_protocol::WindowsUserRole,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    lsw_core::validate_windows_user_name(user_name)?;
+    lsw_protocol::validate_windows_user_name(user_name)?;
     let mut user_name = wide(user_name);
     add_to_users(&mut user_name)?;
     match role {
-        lsw_core::WindowsUserRole::Standard => remove_from_administrators(&mut user_name),
-        lsw_core::WindowsUserRole::Administrator => add_to_administrators(&mut user_name),
+        lsw_protocol::WindowsUserRole::Standard => remove_from_administrators(&mut user_name),
+        lsw_protocol::WindowsUserRole::Administrator => add_to_administrators(&mut user_name),
     }
 }
 

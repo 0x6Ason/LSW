@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 
-use lsw_core::{GuiInputEvent, GuiPointerButton, GuiWindowAction, GuiWindowDragHint};
 use lsw_host::GuiWindowWriter;
+use lsw_protocol::{GuiInputEvent, GuiPointerButton, GuiWindowAction, GuiWindowDragHint};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{MouseButton, MouseScrollDelta};
 use winit::keyboard::KeyCode;

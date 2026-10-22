@@ -3,7 +3,8 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
 
-use lsw_core::{StateStore, WindowsSudoMode, WindowsSudoStatus};
+use lsw_core::StateStore;
+use lsw_protocol::{WindowsSudoMode, WindowsSudoStatus};
 
 use super::{connect_agent, resolve_name};
 

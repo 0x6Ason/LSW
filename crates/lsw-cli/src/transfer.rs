@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lsw_core::{ProcessEnvironment, SessionKind, StartRequest, StateStore};
+use lsw_core::StateStore;
+use lsw_protocol::{ProcessEnvironment, SessionKind, StartRequest};
 
 use super::{connect_agent, resolve_name};
 

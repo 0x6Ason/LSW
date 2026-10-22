@@ -14,3 +14,4 @@ path = "src/main.rs"
 [dependencies]
 lsw-core.workspace = true
 lsw-host.workspace = true
+lsw-protocol.workspace = true

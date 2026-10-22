@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lsw_core::{
+use lsw_protocol::{
     read_frame, write_frame, ClientHello, Frame, FrameKind, ProcessEnvironment, ServerHello,
     SessionKind, StartRequest, AGENT_PROTOCOL_VERSION,
 };
@@ -53,7 +53,7 @@ fn closed_window_ack_preserves_observed_code_without_failing_a_draining_launcher
 fn initially_maximized_guest_requests_an_idempotent_host_state() {
     assert_eq!(
         initial_window_state_action(true),
-        Some(lsw_core::GuiWindowAction::Maximize)
+        Some(lsw_protocol::GuiWindowAction::Maximize)
     );
     assert_eq!(initial_window_state_action(false), None);
 }

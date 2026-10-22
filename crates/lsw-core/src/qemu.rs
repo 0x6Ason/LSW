@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     FolderShareTransport, GuestCpuTuning, HostCapabilities, InstanceManifest, NetworkMode,
-    QemuBackend, Result, AGENT_GUEST_PORT,
+    QemuBackend, Result,
 };
+use lsw_protocol::AGENT_GUEST_PORT;
 
 pub const LIVE_SMB_RUNTIME_DIRECTORY: &str = "live-smb";
 pub const LIVE_SMB_CONFIG_FILE: &str = "smb.conf";

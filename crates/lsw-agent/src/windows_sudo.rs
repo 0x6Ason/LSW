@@ -11,7 +11,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::ptr;
 
-use lsw_core::{WindowsSudoMode, WindowsSudoStatus};
+use lsw_protocol::{WindowsSudoMode, WindowsSudoStatus};
 
 const SUDO_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Sudo";
 const SUDO_VALUE: &str = "Enabled";

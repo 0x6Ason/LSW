@@ -514,7 +514,7 @@ pub(super) fn spawn_input_bridge(
                     );
                     return;
                 }
-                Err(lsw_core::LswError::Io(_)) => {
+                Err(lsw_protocol::ProtocolError::Io(_)) => {
                     drop(child_stdin.take());
                     if session_mode.cancel_on_disconnect() {
                         let _ = control_sender.send(SessionControlEvent::Disconnect);
@@ -659,7 +659,7 @@ pub(super) fn spawn_terminal_input_bridge(
                     }
                     return Err(message);
                 }
-                Err(lsw_core::LswError::Io(_)) => {
+                Err(lsw_protocol::ProtocolError::Io(_)) => {
                     drop(input.take());
                     if session_mode.cancel_on_disconnect() {
                         let _ = control_sender.send(SessionControlEvent::Disconnect);

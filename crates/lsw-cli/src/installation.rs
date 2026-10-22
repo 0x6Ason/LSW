@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 use lsw_core::{
     HostCapabilities, ImageManager, InstallSeedBuilder, InstanceManifest, InstanceSpec,
     InstanceState, IsoDownloadEngine, IsoDownloadProgressStage, IsoDownloader, LaunchPhase,
-    LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, Provisioner, SessionKind, StartRequest,
-    StateStore, WinPeDismBackend, WinPeDismProgress, WinPeDismVmPhase, WindowsEdition,
-    WindowsMediaInspector, WindowsProfile, WINPE_VM_TIMEOUT,
+    LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, Provisioner, StateStore, WinPeDismBackend,
+    WinPeDismProgress, WinPeDismVmPhase, WindowsEdition, WindowsMediaInspector, WindowsProfile,
+    WINPE_VM_TIMEOUT,
 };
+use lsw_protocol::{SessionKind, StartRequest};
 
 use crate::progress::{ProgressEvent, ProgressRenderer};
 use lsw_host::AgentClient;

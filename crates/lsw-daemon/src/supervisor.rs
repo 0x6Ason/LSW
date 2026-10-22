@@ -11,10 +11,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
-    prepare_live_share_runtime, read_frame, write_frame, ClientHello, CommandInvocation, Frame,
-    FrameKind, GuestCpuTuning, HostCapabilities, IdlePolicy, InstanceManifest, InstanceState,
-    LaunchPhase, Provisioner, QemuPlanner, ServerHello, StateStore, WindowsProfile,
-    AGENT_PROTOCOL_VERSION, CAPABILITY_POWER_HIBERNATE_V1,
+    prepare_live_share_runtime, CommandInvocation, GuestCpuTuning, HostCapabilities, IdlePolicy,
+    InstanceManifest, InstanceState, LaunchPhase, Provisioner, QemuPlanner, StateStore,
+    WindowsProfile,
+};
+use lsw_protocol::{
+    read_frame, write_frame, ClientHello, Frame, FrameKind, ServerHello, AGENT_PROTOCOL_VERSION,
+    CAPABILITY_POWER_HIBERNATE_V1,
 };
 
 use crate::qmp::QmpClient;
@@ -190,7 +193,10 @@ impl Supervisor {
         if phase == LaunchPhase::Run {
             let token = self.store.read_agent_token(name)?;
             let credential = if manifest.scoped_live_share_credential {
-                lsw_core::derive_scoped_credential(&token, lsw_core::LIVE_SHARE_CREDENTIAL_SCOPE)?
+                lsw_protocol::derive_scoped_credential(
+                    &token,
+                    lsw_protocol::LIVE_SHARE_CREDENTIAL_SCOPE,
+                )?
             } else {
                 token
             };

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lsw_core::{
+use lsw_protocol::{
     decode_file_length, encode_file_length, read_frame, write_frame, FileGetRequest,
     FilePutRequest, Frame, FrameKind,
 };

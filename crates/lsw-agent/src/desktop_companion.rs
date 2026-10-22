@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lsw_core::{
+use lsw_protocol::{
     constant_time_token_eq, encode_process_id, read_frame, write_frame, ClientHello,
     DesktopLiveShareRequest, Frame, FrameKind, GuiIconRequest, GuiInputEvent, GuiStartRequest,
     GuiWindowAction, GuiWindowClosed, GuiWindowDragHint, GuiWindowResize, LiveShareStatus,
@@ -428,7 +428,7 @@ pub(super) fn run(arguments: &[OsString]) -> Result<(), Box<dyn std::error::Erro
     let live_share_token = required_scoped_environment(LIVE_SHARE_TOKEN_ENV)?;
     let expected_user =
         env::var(DESKTOP_USER_ENV).map_err(|_| "desktop companion user identity is missing")?;
-    lsw_core::validate_windows_user_name(&expected_user)?;
+    lsw_protocol::validate_windows_user_name(&expected_user)?;
 
     // windows-rs caches WinRT activation factories for the process. Keep one
     // apartment alive until the companion exits so a completed capture cannot

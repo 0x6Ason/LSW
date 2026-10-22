@@ -42,13 +42,13 @@ use arguments::{
 use installation::{find_windows_agent, install_instance};
 use license::{license, show_activation_notice_once};
 use lsw_core::{
-    FolderShareTransport, GuiStartRequest, HostCapabilities, IdlePolicy, ImageManager,
-    InstallSeedBuilder, InstallSeedOptions, InstanceManifest, InstanceSpec, InstanceState,
-    LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage, PeImportSymbol,
-    ProcessEnvironment, Provisioner, QemuBackend, QemuPlanner, SessionKind, StartRequest,
-    StateStore, VmAccelerator,
+    FolderShareTransport, HostCapabilities, IdlePolicy, ImageManager, InstallSeedBuilder,
+    InstallSeedOptions, InstanceManifest, InstanceSpec, InstanceState, LaunchPhase, LswError,
+    MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage, PeImportSymbol, Provisioner, QemuBackend,
+    QemuPlanner, StateStore, VmAccelerator,
 };
 use lsw_host::{agent_address, AgentClient, DaemonClient};
+use lsw_protocol::{GuiStartRequest, ProcessEnvironment, SessionKind, StartRequest};
 use progress::{ProgressEvent, ProgressRenderer};
 // Windows can spend several minutes servicing a cold boot, and removable
 // identity media can arrive after the automatic SCM agent starts.

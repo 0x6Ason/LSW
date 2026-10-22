@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lsw_core::{
+use lsw_protocol::{
     constant_time_token_eq, decode_file_length, decode_resize, encode_exit, encode_file_length,
     encode_process_id, read_frame, write_frame, ClientHello, DesktopLiveShareRequest,
     FileGetRequest, FilePutRequest, Frame, FrameKind, GuiIconRequest, GuiStartRequest,
@@ -29,7 +29,7 @@ use lsw_core::{
     CAPABILITY_SESSION_SIGNAL_V1, SESSION_CANCEL_EXIT_CODE,
 };
 #[cfg(windows)]
-use lsw_core::{
+use lsw_protocol::{
     DesktopUserRequest, GuiInputEvent, GuiWindowAction, GuiWindowClosed, GuiWindowDamage,
     GuiWindowDragHint, GuiWindowReady, GuiWindowResize, TerminalSize, CAPABILITY_CONPTY_V1,
     CAPABILITY_DESKTOP_COMPANION_V1, CAPABILITY_DESKTOP_LIVE_SHARE_V1, CAPABILITY_GUI_ICON_V1,
@@ -41,7 +41,6 @@ use lsw_core::{
     DESKTOP_COMPANION_CREDENTIAL_SCOPE, DESKTOP_COMPANION_GUEST_PORT, LICENSE_HELPER_GUEST_PORT,
     MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
 };
-
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STREAM_CHUNK_BYTES: usize = 32 * 1024;

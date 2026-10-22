@@ -15,7 +15,8 @@ use self::guest_setup::{install_agent_script, seed_readme};
 use self::unattend::{autounattend, generate_setup_account_password, unattend_password_value};
 pub(crate) use self::unattend::{validate_locale, windows_computer_name, xml_escape};
 use crate::profile_application::profile_script;
-use crate::{InstanceManifest, LswError, Result, AGENT_GUEST_PORT};
+use crate::{InstanceManifest, LswError, Result};
+use lsw_protocol::AGENT_GUEST_PORT;
 
 const MAX_AGENT_BINARY_BYTES: u64 = 64 * 1024 * 1024;
 const LICENSE_HELPER_SCRIPT: &[u8] = include_bytes!("../assets/license-helper.ps1");
@@ -289,9 +290,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::{
-        InstanceSpec, NetworkMode, WindowsProfile, LICENSE_HELPER_GUEST_PORT,
-        MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
+    use crate::{InstanceSpec, NetworkMode, WindowsProfile};
+    use lsw_protocol::{
+        LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT, USER_HELPER_GUEST_PORT,
     };
 
     use super::*;

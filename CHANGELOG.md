@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Cut the Windows guest agent loose from `lsw-core`. The guest ports,
+  boot-identity file names, credential scopes, and scoped-credential
+  derivation moved into `lsw-protocol`, the ~70-symbol compatibility
+  re-export block left `lsw-core`, and every crate now imports the wire
+  protocol directly. `lsw-agent.exe` depends only on `lsw-protocol`, the
+  `windows` bindings, and `xml-rs`; it no longer compiles the QEMU planner,
+  DISM orchestrator, PE parser, ISO downloader, serde, or the host TLS stack.
 - Fixed the unsourceable `scripts/e2e/*.sh` libraries. Every library began
   with a `//` SPDX line, which sh runs as a command, so the headless
   Windows/KVM gate and the seamless GUI gate exited with status 126 at their

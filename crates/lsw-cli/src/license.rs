@@ -13,7 +13,8 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use lsw_core::{SessionKind, StartRequest, StateStore};
+use lsw_core::StateStore;
+use lsw_protocol::{SessionKind, StartRequest};
 
 use super::{connect_agent, resolve_name};
 

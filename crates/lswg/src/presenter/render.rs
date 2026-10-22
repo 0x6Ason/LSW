@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::Instant;
 
-use lsw_core::{
+use lsw_protocol::{
     GuiWindowAction, GuiWindowDamage, GuiWindowReady, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION,
 };
 use softbuffer::Surface;

@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lsw_core::{
+use lsw_protocol::{
     GuiInputEvent, GuiPointerButton, GuiWindowAction, GuiWindowDragHint, GuiWindowReady,
     GuiWindowResize, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION,
 };

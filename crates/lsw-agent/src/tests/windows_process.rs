@@ -160,37 +160,37 @@ fn non_windows_agent_does_not_advertise_conpty() {
     let capabilities = agent_capabilities();
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_CONPTY_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_CONPTY_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_TERMINAL_RESIZE_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_TERMINAL_RESIZE_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_USER_ACCOUNT_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_USER_ACCOUNT_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_USER_ACCOUNT_ROLE_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_USER_ACCOUNT_ROLE_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_POWER_HIBERNATE_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_POWER_HIBERNATE_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_MAINTENANCE_TRIM_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_SHUTDOWN_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_MAINTENANCE_SHUTDOWN_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_WINDOWS_SUDO_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_WINDOWS_SUDO_V1));
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_GUI_LAUNCH_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_GUI_LAUNCH_V1));
     assert!(capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_SESSION_CONTROL_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_SESSION_CONTROL_V1));
     assert!(capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_SESSION_LEASE_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_SESSION_LEASE_V1));
 }
 
 #[cfg(windows)]
@@ -198,23 +198,23 @@ fn non_windows_agent_does_not_advertise_conpty() {
 fn windows_agent_advertises_native_os_operations() {
     let capabilities = agent_capabilities();
     for expected in [
-        lsw_core::CAPABILITY_CONPTY_V1,
-        lsw_core::CAPABILITY_TERMINAL_RESIZE_V1,
-        lsw_core::CAPABILITY_POWER_HIBERNATE_V1,
-        lsw_core::CAPABILITY_USER_ACCOUNT_V1,
-        lsw_core::CAPABILITY_USER_ACCOUNT_ROLE_V1,
-        lsw_core::CAPABILITY_MAINTENANCE_TRIM_V1,
-        lsw_core::CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
-        lsw_core::CAPABILITY_WINDOWS_SUDO_V1,
-        lsw_core::CAPABILITY_GUI_LAUNCH_V1,
-        lsw_core::CAPABILITY_GUI_ICON_V1,
-        lsw_core::CAPABILITY_DESKTOP_LIVE_SHARE_V1,
+        lsw_protocol::CAPABILITY_CONPTY_V1,
+        lsw_protocol::CAPABILITY_TERMINAL_RESIZE_V1,
+        lsw_protocol::CAPABILITY_POWER_HIBERNATE_V1,
+        lsw_protocol::CAPABILITY_USER_ACCOUNT_V1,
+        lsw_protocol::CAPABILITY_USER_ACCOUNT_ROLE_V1,
+        lsw_protocol::CAPABILITY_MAINTENANCE_TRIM_V1,
+        lsw_protocol::CAPABILITY_MAINTENANCE_SHUTDOWN_V1,
+        lsw_protocol::CAPABILITY_WINDOWS_SUDO_V1,
+        lsw_protocol::CAPABILITY_GUI_LAUNCH_V1,
+        lsw_protocol::CAPABILITY_GUI_ICON_V1,
+        lsw_protocol::CAPABILITY_DESKTOP_LIVE_SHARE_V1,
     ] {
         assert!(capabilities.iter().any(|capability| capability == expected));
     }
     assert!(!capabilities
         .iter()
-        .any(|capability| capability == lsw_core::CAPABILITY_MAINTENANCE_HIBERNATE_V1));
+        .any(|capability| capability == lsw_protocol::CAPABILITY_MAINTENANCE_HIBERNATE_V1));
 }
 
 #[test]
@@ -357,7 +357,7 @@ fn windows_conpty_shell_sends_exit_after_normal_completion() {
         match frame.kind {
             FrameKind::Stdout => output.extend(frame.payload),
             FrameKind::Exit => {
-                break lsw_core::decode_exit(&frame.payload).expect("exit should decode")
+                break lsw_protocol::decode_exit(&frame.payload).expect("exit should decode")
             }
             FrameKind::Error => panic!(
                 "terminal returned an error: {}",

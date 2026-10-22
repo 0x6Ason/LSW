@@ -403,7 +403,7 @@ pub(super) fn merge_session_results(
 
 pub(super) fn send_damages(
     stream: &mut TcpStream,
-    damages: Vec<lsw_core::GuiWindowDamage>,
+    damages: Vec<lsw_protocol::GuiWindowDamage>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for damage in damages {
         write_frame(

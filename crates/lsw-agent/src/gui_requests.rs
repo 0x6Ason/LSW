@@ -262,7 +262,7 @@ pub(super) fn forward_gui_start(
     )?;
     let response = read_frame(&mut stream)?;
     match response.kind {
-        FrameKind::Started => Ok(lsw_core::decode_process_id(&response.payload)?),
+        FrameKind::Started => Ok(lsw_protocol::decode_process_id(&response.payload)?),
         FrameKind::Error => Err(format!(
             "Windows desktop companion refused GUI launch: {}",
             String::from_utf8_lossy(&response.payload)
@@ -331,7 +331,7 @@ pub(super) fn connect_or_start_desktop_companion(
     required_capability: &str,
 ) -> Result<TcpStream, Box<dyn std::error::Error>> {
     let credential =
-        lsw_core::derive_scoped_credential(expected_token, DESKTOP_COMPANION_CREDENTIAL_SCOPE)?;
+        lsw_protocol::derive_scoped_credential(expected_token, DESKTOP_COMPANION_CREDENTIAL_SCOPE)?;
     if let Ok(stream) = connect_desktop_companion(&credential, required_capability) {
         return Ok(stream);
     }

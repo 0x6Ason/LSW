@@ -9,4 +9,5 @@ publish = false
 
 [dependencies]
 lsw-core.workspace = true
+lsw-protocol.workspace = true
 signal-hook.workspace = true

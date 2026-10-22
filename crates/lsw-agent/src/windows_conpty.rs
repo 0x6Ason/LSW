@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use lsw_core::{SessionKind, StartRequest, TerminalSize};
+use lsw_protocol::{SessionKind, StartRequest, TerminalSize};
 
 type Handle = RawHandle;
 type PseudoConsoleHandle = RawHandle;

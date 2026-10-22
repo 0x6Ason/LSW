@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use lsw_core::{
+use lsw_protocol::{
     decode_exit, decode_process_id, read_frame, write_frame, Frame, FrameKind, ProcessEnvironment,
     SessionKind, SessionLease, SessionOptions, SessionSignal, StartRequest, TerminalSize,
     TerminalStartRequest, CAPABILITY_CONPTY_V1, CAPABILITY_DETACHED_RUN_V1,
@@ -45,7 +45,7 @@ impl AgentClient {
         connect_stdin: bool,
         environment: &ProcessEnvironment,
     ) -> Result<i32, Box<dyn std::error::Error>> {
-        let shell_session = matches!(request.kind, lsw_core::SessionKind::Shell);
+        let shell_session = matches!(request.kind, lsw_protocol::SessionKind::Shell);
         let conpty_available = self.has_capability(CAPABILITY_CONPTY_V1);
         let controlled_session = self.has_capability(CAPABILITY_SESSION_CONTROL_V1);
         let session_lease =
@@ -254,7 +254,7 @@ impl AgentClient {
         output_limit: usize,
         environment: &ProcessEnvironment,
     ) -> Result<CapturedProcess, Box<dyn std::error::Error>> {
-        if matches!(request.kind, lsw_core::SessionKind::Shell) {
+        if matches!(request.kind, lsw_protocol::SessionKind::Shell) {
             return Err("captured sessions cannot be interactive shells".into());
         }
         let controlled_session = self.has_capability(CAPABILITY_SESSION_CONTROL_V1);
@@ -392,7 +392,7 @@ fn send_outbound(writer: &Arc<Mutex<TcpStream>>, frame: &Frame) -> io::Result<()
         .lock()
         .map_err(|_| io::Error::other("agent stream writer lock was poisoned"))?;
     write_frame(&mut *stream, frame).map_err(|error| match error {
-        lsw_core::LswError::Io(error) => error,
+        lsw_protocol::ProtocolError::Io(error) => error,
         other => io::Error::other(other.to_string()),
     })
 }

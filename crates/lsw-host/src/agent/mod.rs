@@ -7,9 +7,10 @@ mod transfer;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::time::Duration;
 
-use lsw_core::{
-    read_frame, write_frame, ClientHello, Frame, FrameKind, InstanceManifest,
-    LiveShareConfigureRequest, LiveShareStatus, ServerHello, UserCreateRequest, UserSetRoleRequest,
+use lsw_core::InstanceManifest;
+use lsw_protocol::{
+    read_frame, write_frame, ClientHello, Frame, FrameKind, LiveShareConfigureRequest,
+    LiveShareStatus, ServerHello, UserCreateRequest, UserSetRoleRequest,
     WindowsSudoConfigureRequest, WindowsSudoStatus, AGENT_PROTOCOL_VERSION, CAPABILITY_CONPTY_V1,
     CAPABILITY_LIVE_SHARE_V1, CAPABILITY_MAINTENANCE_SHUTDOWN_V1, CAPABILITY_MAINTENANCE_TRIM_V1,
     CAPABILITY_USER_ACCOUNT_ROLE_V1, CAPABILITY_USER_ACCOUNT_V1, CAPABILITY_WINDOWS_SUDO_V1,

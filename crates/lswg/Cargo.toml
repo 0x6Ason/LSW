@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 lsw-core.workspace = true
 lsw-host.workspace = true
+lsw-protocol.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 softbuffer.workspace = true

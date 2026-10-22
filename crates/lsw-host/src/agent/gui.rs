@@ -3,7 +3,7 @@
 use std::net::{Shutdown, TcpStream};
 use std::time::Duration;
 
-use lsw_core::{
+use lsw_protocol::{
     decode_process_id, read_frame, write_frame, DesktopLiveShareRequest, Frame, FrameKind,
     GuiIconRequest, GuiInputEvent, GuiStartRequest, GuiWindowAction, GuiWindowClosed,
     GuiWindowDamage, GuiWindowDragHint, GuiWindowReady, GuiWindowResize, LiveShareStatus,

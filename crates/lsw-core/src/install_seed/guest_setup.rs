@@ -2,8 +2,9 @@
 
 use super::unattend::SETUP_ACCOUNT_NAME;
 use super::InstallSeedOptions;
-use crate::{
-    InstanceManifest, AGENT_GUEST_PORT, LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT,
+use crate::InstanceManifest;
+use lsw_protocol::{
+    AGENT_GUEST_PORT, LICENSE_HELPER_GUEST_PORT, MAINTENANCE_HELPER_GUEST_PORT,
     USER_HELPER_GUEST_PORT,
 };
 

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use lsw_core::{
+use lsw_protocol::{
     read_frame, write_frame, Frame, FrameKind, GuiInputEvent, GuiStartRequest, GuiWindowAction,
     GuiWindowClosed, GuiWindowDamage, GuiWindowDragHint, GuiWindowReady, GuiWindowResize,
     LiveShareStatus, ProcessEnvironment, SessionKind, SessionLease, SessionOptions, StartRequest,
@@ -87,7 +87,7 @@ fn windows_sudo_status_is_capability_gated_and_strictly_decoded() {
     let address = listener.local_addr().expect("listener should have address");
     let expected = WindowsSudoStatus {
         available: true,
-        configured_mode: lsw_core::WindowsSudoMode::ForceNewWindow,
+        configured_mode: lsw_protocol::WindowsSudoMode::ForceNewWindow,
         policy_mode: None,
     };
     let server = thread::spawn(move || {
@@ -183,7 +183,7 @@ fn gui_operations_are_capability_gated_and_keep_the_user_explicit() {
         assert!(request.mount_live_share);
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Started, lsw_core::encode_process_id(8123)),
+            &Frame::new(FrameKind::Started, lsw_protocol::encode_process_id(8123)),
         )
         .expect("GUI response should be sent");
     });
@@ -454,7 +454,7 @@ fn controlled_run_sends_options_start_and_explicit_stdin_close() {
         assert!(stdin_close.payload.is_empty());
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            &Frame::new(FrameKind::Exit, lsw_protocol::encode_exit(0)),
         )
         .expect("exit should be sent");
     });
@@ -464,7 +464,7 @@ fn controlled_run_sends_options_start_and_explicit_stdin_close() {
         capabilities: vec![CAPABILITY_SESSION_CONTROL_V1.to_owned()],
     };
     let request = StartRequest {
-        kind: lsw_core::SessionKind::Exec,
+        kind: lsw_protocol::SessionKind::Exec,
         argv: vec!["fixture-command".to_owned()],
         working_directory: None,
     };
@@ -507,7 +507,7 @@ fn controlled_run_sends_environment_and_working_directory() {
         );
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Exit, lsw_core::encode_exit(17)),
+            &Frame::new(FrameKind::Exit, lsw_protocol::encode_exit(17)),
         )
         .expect("exit should be sent");
     });
@@ -559,7 +559,7 @@ fn detached_run_uses_the_explicit_handshake_and_returns_the_pid() {
         assert_eq!(start.kind, FrameKind::Start);
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Started, lsw_core::encode_process_id(4242)),
+            &Frame::new(FrameKind::Started, lsw_protocol::encode_process_id(4242)),
         )
         .expect("started response should be sent");
     });
@@ -620,7 +620,7 @@ fn captured_run_sends_private_input_and_bounds_separate_output_streams() {
         .expect("stderr should be sent");
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            &Frame::new(FrameKind::Exit, lsw_protocol::encode_exit(0)),
         )
         .expect("exit should be sent");
     });
@@ -630,7 +630,7 @@ fn captured_run_sends_private_input_and_bounds_separate_output_streams() {
         capabilities: vec![CAPABILITY_SESSION_CONTROL_V1.to_owned()],
     };
     let request = StartRequest {
-        kind: lsw_core::SessionKind::Exec,
+        kind: lsw_protocol::SessionKind::Exec,
         argv: vec!["license-client".to_owned()],
         working_directory: None,
     };
@@ -671,7 +671,7 @@ fn leased_run_sends_lease_between_options_and_start() {
         );
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            &Frame::new(FrameKind::Exit, lsw_protocol::encode_exit(0)),
         )
         .expect("exit should be sent");
     });
@@ -684,7 +684,7 @@ fn leased_run_sends_lease_between_options_and_start() {
         ],
     };
     let request = StartRequest {
-        kind: lsw_core::SessionKind::Exec,
+        kind: lsw_protocol::SessionKind::Exec,
         argv: vec!["fixture-command".to_owned()],
         working_directory: None,
     };
@@ -725,7 +725,7 @@ fn legacy_run_still_starts_without_session_options() {
         assert_eq!(start.kind, FrameKind::Start);
         write_frame(
             &mut stream,
-            &Frame::new(FrameKind::Exit, lsw_core::encode_exit(0)),
+            &Frame::new(FrameKind::Exit, lsw_protocol::encode_exit(0)),
         )
         .expect("exit should be sent");
     });
@@ -737,7 +737,7 @@ fn legacy_run_still_starts_without_session_options() {
         capabilities: vec![CAPABILITY_SESSION_LEASE_V1.to_owned()],
     };
     let request = StartRequest {
-        kind: lsw_core::SessionKind::Exec,
+        kind: lsw_protocol::SessionKind::Exec,
         argv: vec!["fixture-command".to_owned()],
         working_directory: None,
     };

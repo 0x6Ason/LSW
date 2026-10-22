@@ -6,3 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 description = "Versioned and bounded wire protocols shared by LSW host and Windows guest"
 publish = false
+
+[dependencies]
+# The only dependency: a pure-Rust SHA-256 for scoped credential derivation.
+sha2.workspace = true

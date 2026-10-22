@@ -12,12 +12,12 @@ pub(super) fn user_command(
         Some("promote") => user_setup::set_role(
             store,
             &arguments[1..],
-            lsw_core::WindowsUserRole::Administrator,
+            lsw_protocol::WindowsUserRole::Administrator,
         ),
         Some("demote") => user_setup::set_role(
             store,
             &arguments[1..],
-            lsw_core::WindowsUserRole::Standard,
+            lsw_protocol::WindowsUserRole::Standard,
         ),
         _ => Err(
             "usage: lsw user <setup|add> [NAME] [--username USER] [--password-stdin] [--administrator] | lsw user <promote|demote> [NAME]"

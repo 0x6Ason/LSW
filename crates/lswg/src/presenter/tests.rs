@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use lsw_core::{GuiPointerButton, GuiWindowDamage, GuiWindowDragHint, GuiWindowReady};
+use lsw_protocol::{GuiPointerButton, GuiWindowDamage, GuiWindowDragHint, GuiWindowReady};
 use winit::keyboard::KeyCode;
 use winit::window::ResizeDirection;
 

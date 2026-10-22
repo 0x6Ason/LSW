@@ -61,7 +61,7 @@ fn collect_process(stream: &mut TcpStream) -> (Vec<u8>, i32) {
         match frame.kind {
             FrameKind::Stdout => stdout.extend(frame.payload),
             FrameKind::Stderr => {}
-            FrameKind::Exit => return (stdout, lsw_core::decode_exit(&frame.payload).unwrap()),
+            FrameKind::Exit => return (stdout, lsw_protocol::decode_exit(&frame.payload).unwrap()),
             other => panic!("unexpected process frame {other:?}"),
         }
     }
@@ -197,7 +197,7 @@ fn detached_run_survives_the_client_disconnect_until_completion() {
     .expect("start should be sent");
     let started = read_frame(&mut stream).expect("start acknowledgement should arrive");
     assert_eq!(started.kind, FrameKind::Started);
-    assert!(lsw_core::decode_process_id(&started.payload).unwrap() > 0);
+    assert!(lsw_protocol::decode_process_id(&started.payload).unwrap() > 0);
     drop(stream);
     done.recv_timeout(Duration::from_millis(500))
         .expect("detached start should release its connection slot promptly")
@@ -627,7 +627,7 @@ fn authenticated_loopback_exec_streams_output_and_exit_status() {
         match frame.kind {
             FrameKind::Stdout => stdout.extend(frame.payload),
             FrameKind::Stderr => stderr.extend(frame.payload),
-            FrameKind::Exit => break lsw_core::decode_exit(&frame.payload).unwrap(),
+            FrameKind::Exit => break lsw_protocol::decode_exit(&frame.payload).unwrap(),
             other => panic!("unexpected process frame {other:?}"),
         }
     };
@@ -848,7 +848,9 @@ fn independent_authenticated_sessions_run_concurrently() {
             match frame.kind {
                 FrameKind::Stdout => stdout.extend(frame.payload),
                 FrameKind::Stderr => {}
-                FrameKind::Exit => return (stdout, lsw_core::decode_exit(&frame.payload).unwrap()),
+                FrameKind::Exit => {
+                    return (stdout, lsw_protocol::decode_exit(&frame.payload).unwrap())
+                }
                 other => panic!("unexpected process frame {other:?}"),
             }
         }

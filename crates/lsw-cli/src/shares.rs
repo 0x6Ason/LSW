@@ -8,10 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lsw_core::{
-    DesktopLiveShareRequest, FolderShare, FolderShareMode, FolderShareTransport, HostCapabilities,
-    InstanceState, LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
+    FolderShare, FolderShareMode, FolderShareTransport, HostCapabilities, InstanceState,
+    LaunchPhase, StateStore, LIVE_SMB_RUNTIME_DIRECTORY,
 };
 use lsw_host::{AgentClient, DaemonClient};
+use lsw_protocol::DesktopLiveShareRequest;
 
 use super::{
     absolute_path, connect_agent, fix_host_dependencies, resolve_name, start_named_instance,
@@ -194,7 +195,11 @@ fn live_samba_failure_context(store: &StateStore, name: &str) -> String {
     let credential = store.read_agent_token(name).ok().and_then(|token| {
         let manifest = store.load(name).ok()?;
         if manifest.scoped_live_share_credential {
-            lsw_core::derive_scoped_credential(&token, lsw_core::LIVE_SHARE_CREDENTIAL_SCOPE).ok()
+            lsw_protocol::derive_scoped_credential(
+                &token,
+                lsw_protocol::LIVE_SHARE_CREDENTIAL_SCOPE,
+            )
+            .ok()
         } else {
             Some(token)
         }
@@ -408,7 +413,7 @@ fn configure_desktop_mapping_if_signed_in(
         Err(error)
             if error
                 .to_string()
-                .contains(lsw_core::CAPABILITY_DESKTOP_LIVE_SHARE_V1) =>
+                .contains(lsw_protocol::CAPABILITY_DESKTOP_LIVE_SHARE_V1) =>
         {
             eprintln!(
                 "lsw: this guest agent predates desktop Linux (L:) mapping; terminal tools still use the live share."

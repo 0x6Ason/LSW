@@ -4,6 +4,7 @@
 
 mod codec;
 mod constants;
+mod contract;
 mod error;
 mod frame;
 mod gui;
@@ -15,6 +16,7 @@ mod user;
 
 pub use codec::constant_time_token_eq;
 pub use constants::*;
+pub use contract::*;
 pub use error::{ProtocolError, Result};
 pub use frame::*;
 pub use gui::*;

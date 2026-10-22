@@ -8,7 +8,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lsw_core::{GuiIconRequest, GuiStartRequest, ProcessEnvironment, StartRequest, StateStore};
+use lsw_core::StateStore;
+use lsw_protocol::{GuiIconRequest, GuiStartRequest, ProcessEnvironment, StartRequest};
 
 use super::{connect_agent, parse_guest_environment, resolve_name};
 
@@ -238,7 +239,7 @@ impl InstallArguments {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let request = StartRequest {
-            kind: lsw_core::SessionKind::Run,
+            kind: lsw_protocol::SessionKind::Run,
             argv,
             working_directory,
         };
@@ -487,7 +488,7 @@ mod tests {
     #[test]
     fn launcher_exec_is_quoted_and_keeps_file_field_code_outside_quotes() {
         let request = StartRequest {
-            kind: lsw_core::SessionKind::Run,
+            kind: lsw_protocol::SessionKind::Run,
             argv: vec!["C:\\Program Files\\Viewer\\view.exe".to_owned()],
             working_directory: Some("C:\\Work Tree".to_owned()),
         };

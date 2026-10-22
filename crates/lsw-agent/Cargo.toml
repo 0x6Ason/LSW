@@ -12,7 +12,7 @@ name = "lsw-agent"
 path = "src/main.rs"
 
 [dependencies]
-lsw-core.workspace = true
+lsw-protocol.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [

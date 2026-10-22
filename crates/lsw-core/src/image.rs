@@ -12,7 +12,10 @@ use crate::fs_checks::hex_encode;
 use crate::store::{generate_agent_token, write_atomic};
 use crate::{
     sha256_file, HostCapabilities, InstanceManifest, InstanceSpec, InstanceState, LswError, Result,
-    StateStore, CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
+    StateStore,
+};
+use lsw_protocol::{
+    CLONE_IDENTITY_MARKER_FILE, CLONE_IDENTITY_NAME_FILE, CLONE_IDENTITY_TOKEN_FILE,
 };
 
 const IMAGE_FORMAT_VERSION: u32 = 1;

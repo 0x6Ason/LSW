@@ -6,7 +6,8 @@ use std::fs;
 use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use lsw_core::{FolderShareTransport, ProcessEnvironment, SessionKind, StartRequest, StateStore};
+use lsw_core::{FolderShareTransport, StateStore};
+use lsw_protocol::{ProcessEnvironment, SessionKind, StartRequest};
 
 use super::{connect_agent, resolve_name, transfer};
 

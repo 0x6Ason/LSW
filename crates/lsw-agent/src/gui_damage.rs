@@ -2,7 +2,9 @@
 
 //! CPU correctness path for bounded, damage-aware seamless-window frames.
 
-use lsw_core::{GuiWindowDamage, LswError, Result, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION};
+use lsw_protocol::{
+    GuiWindowDamage, ProtocolError, Result, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION,
+};
 
 const TILE_SIDE: usize = 128;
 
@@ -69,25 +71,28 @@ fn validate_frame(width: u32, height: u32, bgra: &[u8]) -> Result<(usize, usize,
         || width > MAX_GUI_WINDOW_DIMENSION
         || height > MAX_GUI_WINDOW_DIMENSION
     {
-        return Err(LswError::Protocol(format!(
+        return Err(ProtocolError::Protocol(format!(
             "captured GUI dimensions must be between 1 and {MAX_GUI_WINDOW_DIMENSION}"
         )));
     }
     let width = usize::try_from(width)
-        .map_err(|_| LswError::Protocol("captured GUI width does not fit usize".to_owned()))?;
-    let height = usize::try_from(height)
-        .map_err(|_| LswError::Protocol("captured GUI height does not fit usize".to_owned()))?;
+        .map_err(|_| ProtocolError::Protocol("captured GUI width does not fit usize".to_owned()))?;
+    let height = usize::try_from(height).map_err(|_| {
+        ProtocolError::Protocol("captured GUI height does not fit usize".to_owned())
+    })?;
     let frame_bytes = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| LswError::Protocol("captured GUI frame length overflowed".to_owned()))?;
+        .ok_or_else(|| {
+            ProtocolError::Protocol("captured GUI frame length overflowed".to_owned())
+        })?;
     if frame_bytes > MAX_GUI_FRAME_BYTES {
-        return Err(LswError::Protocol(format!(
+        return Err(ProtocolError::Protocol(format!(
             "captured GUI frame exceeds the {MAX_GUI_FRAME_BYTES} byte limit"
         )));
     }
     if bgra.len() != frame_bytes {
-        return Err(LswError::Protocol(format!(
+        return Err(ProtocolError::Protocol(format!(
             "captured GUI frame contains {} bytes; expected {frame_bytes}",
             bgra.len()
         )));

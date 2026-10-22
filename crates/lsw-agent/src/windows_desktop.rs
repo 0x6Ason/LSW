@@ -11,7 +11,7 @@ use std::mem;
 use std::path::Path;
 use std::ptr;
 
-use lsw_core::{
+use lsw_protocol::{
     derive_scoped_credential, DESKTOP_COMPANION_CREDENTIAL_SCOPE, DESKTOP_COMPANION_GUEST_PORT,
     LIVE_SHARE_CREDENTIAL_SCOPE,
 };
@@ -150,7 +150,7 @@ pub(super) fn launch_companion(
     user_name: &str,
     agent_token: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    lsw_core::validate_windows_user_name(user_name)?;
+    lsw_protocol::validate_windows_user_name(user_name)?;
     let expected_sid = local_account_sid(user_name)?;
     let token = active_user_token(user_name, &expected_sid)?;
     let _token = OwnedHandle(token);

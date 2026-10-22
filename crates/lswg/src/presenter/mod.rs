@@ -13,8 +13,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use lsw_core::{GuiInputEvent, GuiWindowAction, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION};
 use lsw_host::{GuiWindowEvent, GuiWindowReader, GuiWindowSession, GuiWindowWriter};
+use lsw_protocol::{GuiInputEvent, GuiWindowAction, MAX_GUI_FRAME_BYTES, MAX_GUI_WINDOW_DIMENSION};
 use softbuffer::{Context, Surface};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, MouseButton, WindowEvent};
