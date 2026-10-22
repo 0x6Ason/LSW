@@ -5,7 +5,10 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use serde_json::Value;
+
 const MAX_QMP_MESSAGE_BYTES: u64 = 256 * 1024;
+const MAX_QMP_REQUEST_BYTES: usize = 4096;
 const QMP_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct QmpClient {
@@ -28,7 +31,7 @@ impl QmpClient {
             writer,
         };
         let greeting = client.read_message()?;
-        if !greeting.contains("\"QMP\"") {
+        if !greeting.get("QMP").is_some_and(Value::is_object) {
             return Err("QMP socket returned an invalid greeting".into());
         }
         client.execute("qmp_capabilities")?;
@@ -37,7 +40,10 @@ impl QmpClient {
 
     pub fn status(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let response = self.execute("query-status")?;
-        json_string_field(&response, "status")
+        response
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
             .ok_or_else(|| "QMP query-status response did not contain a status".into())
     }
 
@@ -57,15 +63,15 @@ impl QmpClient {
     }
 
     pub fn balloon(&mut self, target_bytes: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let request =
-            format!("{{\"execute\":\"balloon\",\"arguments\":{{\"value\":{target_bytes}}}}}");
-        self.execute_document(&request)?;
+        self.execute_document(&serde_json::json!({
+            "execute": "balloon",
+            "arguments": { "value": target_bytes },
+        }))?;
         Ok(())
     }
 
     pub fn quit(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        writeln!(self.writer, "{{\"execute\":\"quit\"}}")?;
-        self.writer.flush()?;
+        self.send(&serde_json::json!({ "execute": "quit" }))?;
         // QEMU is allowed to close the socket before sending the final response.
         match self.read_response() {
             Ok(_) => Ok(()),
@@ -74,48 +80,64 @@ impl QmpClient {
         }
     }
 
-    fn execute(&mut self, command: &str) -> Result<String, Box<dyn std::error::Error>> {
+    /// Executes an argument-free command and returns its `return` value.
+    fn execute(&mut self, command: &str) -> Result<Value, Box<dyn std::error::Error>> {
         if !command
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || matches!(byte, b'-' | b'_'))
         {
             return Err("invalid QMP command name".into());
         }
-        self.execute_document(&format!("{{\"execute\":\"{command}\"}}"))
+        self.execute_document(&serde_json::json!({ "execute": command }))
     }
 
-    fn execute_document(&mut self, document: &str) -> Result<String, Box<dyn std::error::Error>> {
-        if document.contains(['\r', '\n']) || document.len() > 4096 {
-            return Err("invalid QMP request document".into());
-        }
-        writeln!(self.writer, "{document}")?;
-        self.writer.flush()?;
+    fn execute_document(&mut self, document: &Value) -> Result<Value, Box<dyn std::error::Error>> {
+        self.send(document)?;
         self.read_response()
     }
 
-    fn read_response(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+    fn send(&mut self, document: &Value) -> Result<(), Box<dyn std::error::Error>> {
+        let encoded = serde_json::to_string(document)?;
+        if encoded.len() > MAX_QMP_REQUEST_BYTES {
+            return Err("QMP request document is too large".into());
+        }
+        writeln!(self.writer, "{encoded}")?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Reads messages until the command response arrives, skipping the
+    /// asynchronous events QEMU may interleave.
+    fn read_response(&mut self) -> Result<Value, Box<dyn std::error::Error>> {
         loop {
-            let message = self.read_message()?;
-            if message.contains("\"error\"") {
-                return Err(format!("QMP command failed: {message}").into());
+            let mut message = self.read_message()?;
+            if let Some(error) = message.get("error") {
+                return Err(format!("QMP command failed: {error}").into());
             }
-            if message.contains("\"return\"") {
-                return Ok(message);
+            if let Some(value) = message.get_mut("return") {
+                return Ok(value.take());
             }
-            // Asynchronous QMP events can arrive between a command and response.
+            if message.get("event").is_none() {
+                return Err(format!("unexpected QMP message: {message}").into());
+            }
         }
     }
 
-    fn read_message(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        let mut message = String::new();
+    fn read_message(&mut self) -> Result<Value, Box<dyn std::error::Error>> {
+        let mut line = String::new();
         let bytes = (&mut self.reader)
             .take(MAX_QMP_MESSAGE_BYTES + 1)
-            .read_line(&mut message)?;
+            .read_line(&mut line)?;
         if bytes == 0 {
             return Err("QMP socket closed unexpectedly".into());
         }
-        if bytes as u64 > MAX_QMP_MESSAGE_BYTES || !message.ends_with('\n') {
+        if bytes as u64 > MAX_QMP_MESSAGE_BYTES || !line.ends_with('\n') {
             return Err("QMP message was too large or unterminated".into());
+        }
+        let message: Value = serde_json::from_str(&line)
+            .map_err(|error| format!("QMP message was not valid JSON: {error}"))?;
+        if !message.is_object() {
+            return Err("QMP message was not a JSON object".into());
         }
         Ok(message)
     }
@@ -128,62 +150,90 @@ fn is_disconnect(error: &dyn std::error::Error) -> bool {
         || message.contains("Connection reset")
 }
 
-fn json_string_field(document: &str, field: &str) -> Option<String> {
-    let needle = format!("\"{field}\"");
-    let mut remaining = document.get(document.find(&needle)? + needle.len()..)?;
-    remaining = remaining.trim_start();
-    remaining = remaining.strip_prefix(':')?.trim_start();
-    remaining = remaining.strip_prefix('"')?;
-
-    let mut result = String::new();
-    let mut escaped = false;
-    for character in remaining.chars() {
-        if escaped {
-            match character {
-                '"' | '\\' | '/' => result.push(character),
-                'b' => result.push('\u{0008}'),
-                'f' => result.push('\u{000c}'),
-                'n' => result.push('\n'),
-                'r' => result.push('\r'),
-                't' => result.push('\t'),
-                _ => return None,
-            }
-            escaped = false;
-        } else {
-            match character {
-                '\\' => escaped = true,
-                '"' => return Some(result),
-                control if control.is_control() => return None,
-                other => result.push(other),
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::thread;
 
+    fn negotiate(server: &mut UnixStream) -> BufReader<UnixStream> {
+        writeln!(server, "{{\"QMP\":{{\"version\":{{}}}}}}").expect("greeting should be sent");
+        let mut reader = BufReader::new(server.try_clone().expect("server should clone"));
+        let mut command = String::new();
+        reader
+            .read_line(&mut command)
+            .expect("capabilities should be read");
+        assert_eq!(command, "{\"execute\":\"qmp_capabilities\"}\n");
+        writeln!(server, "{{\"return\":{{}}}}").expect("capabilities response should be sent");
+        reader
+    }
+
     #[test]
-    fn extracts_qmp_status_without_accepting_invalid_json_strings() {
-        assert_eq!(
-            json_string_field(
-                "{\"return\":{\"running\":true,\"status\":\"running\"}}",
-                "status"
-            ),
-            Some("running".to_owned())
-        );
-        assert_eq!(
-            json_string_field("{\"status\":\"guest\\\"paused\"}", "status"),
-            Some("guest\"paused".to_owned())
-        );
-        assert_eq!(
-            json_string_field("{\"status\":\"unterminated}", "status"),
-            None
-        );
+    fn qmp_client_rejects_an_invalid_greeting() {
+        let (client, mut server) = UnixStream::pair().expect("socket pair should be created");
+        let server_thread = thread::spawn(move || {
+            writeln!(server, "{{\"return\":{{}}}}").expect("message should be sent");
+        });
+        let Err(error) = QmpClient::from_stream(client) else {
+            panic!("greeting must be a QMP object");
+        };
+        assert!(error.to_string().contains("invalid greeting"));
+        server_thread.join().expect("server fixture should finish");
+    }
+
+    #[test]
+    fn qmp_client_reports_command_errors_and_ignores_error_text_inside_events() {
+        let (client, mut server) = UnixStream::pair().expect("socket pair should be created");
+        let server_thread = thread::spawn(move || {
+            let mut reader = negotiate(&mut server);
+            let mut command = String::new();
+            reader
+                .read_line(&mut command)
+                .expect("status query should be read");
+            // An event whose payload mentions "error" and "return" must not be
+            // mistaken for the command response.
+            writeln!(
+                server,
+                "{{\"event\":\"BLOCK_JOB_COMPLETED\",\"data\":{{\"error\":\"x\",\"return\":1}}}}"
+            )
+            .expect("event should be sent");
+            writeln!(
+                server,
+                "{{\"error\":{{\"class\":\"GenericError\",\"desc\":\"boom\"}}}}"
+            )
+            .expect("error should be sent");
+        });
+        let mut qmp = QmpClient::from_stream(client).expect("QMP should negotiate");
+        let error = qmp.status().expect_err("QMP error must surface");
+        assert!(error.to_string().contains("GenericError"));
+        server_thread.join().expect("server fixture should finish");
+    }
+
+    #[test]
+    fn qmp_status_decodes_json_escapes_and_rejects_missing_fields() {
+        let (client, mut server) = UnixStream::pair().expect("socket pair should be created");
+        let server_thread = thread::spawn(move || {
+            let mut reader = negotiate(&mut server);
+            let mut command = String::new();
+            for response in [
+                "{\"return\":{\"running\":false,\"status\":\"guest-\\u0070anicked\"}}",
+                "{\"return\":{\"running\":true}}",
+            ] {
+                command.clear();
+                reader
+                    .read_line(&mut command)
+                    .expect("status query should be read");
+                writeln!(server, "{response}").expect("status should be sent");
+            }
+        });
+        let mut qmp = QmpClient::from_stream(client).expect("QMP should negotiate");
+        assert_eq!(qmp.status().expect("status should parse"), "guest-panicked");
+        assert!(qmp
+            .status()
+            .expect_err("missing status must fail")
+            .to_string()
+            .contains("did not contain a status"));
+        server_thread.join().expect("server fixture should finish");
     }
 
     #[test]
