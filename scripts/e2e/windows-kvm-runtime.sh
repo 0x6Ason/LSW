@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # shellcheck shell=sh
 # ConPTY, transfer, sharing, restart, and release-attestation scenario.
 # shellcheck disable=SC2154

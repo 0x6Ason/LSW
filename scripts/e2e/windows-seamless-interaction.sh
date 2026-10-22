@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # shellcheck shell=sh
 # Marker, HWND, input, image, resize, and chrome assertions.
 # shellcheck disable=SC2154

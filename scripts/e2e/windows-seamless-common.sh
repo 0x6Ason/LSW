@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # shellcheck shell=sh
 # Candidate attestation, command wrappers, artifact ownership, and cleanup.
 # shellcheck disable=SC2154

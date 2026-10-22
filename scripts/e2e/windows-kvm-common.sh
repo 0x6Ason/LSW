@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: GPL-3.0-or-later
 # shellcheck shell=sh
 # Shared lifecycle, cleanup, attestation, and GUI-handoff helpers.
 # shellcheck disable=SC2154
