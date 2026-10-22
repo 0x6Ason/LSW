@@ -61,20 +61,19 @@ pub(super) fn bench(
     }
 
     if json {
-        let mut output = String::from("{");
-        write!(
-            output,
-            "\"version\":\"{}\",\"accelerator\":\"{}\",\"capability_scan_us\":{}",
-            env!("CARGO_PKG_VERSION"),
-            QemuBackend::select(&capabilities).accelerator(),
-            capability_scan_us
-        )?;
-        push_optional_number(&mut output, "daemon_ping_us", daemon_ping_us);
-        push_optional_number(&mut output, "manifest_load_us", manifest_load_us);
-        push_optional_number(&mut output, "agent_probe_us", agent_probe_us);
-        output.push_str(
-            ",\"targets\":{\"warm_shell_p95_ms\":300,\"cold_boot_p95_ms\":15000,\"resume_p95_ms\":3000}}",
-        );
+        let output = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "accelerator": QemuBackend::select(&capabilities).accelerator().to_string(),
+            "capability_scan_us": capability_scan_us,
+            "daemon_ping_us": daemon_ping_us,
+            "manifest_load_us": manifest_load_us,
+            "agent_probe_us": agent_probe_us,
+            "targets": {
+                "warm_shell_p95_ms": 300,
+                "cold_boot_p95_ms": 15000,
+                "resume_p95_ms": 3000,
+            },
+        });
         println!("{output}");
     } else {
         println!("LSW performance baseline");
@@ -89,15 +88,6 @@ pub(super) fn bench(
         println!("Use --json to record a machine-readable baseline.");
     }
     Ok(())
-}
-
-pub(super) fn push_optional_number(output: &mut String, key: &str, value: Option<u128>) {
-    write!(output, ",\"{key}\":").expect("writing to a String cannot fail");
-    if let Some(value) = value {
-        write!(output, "{value}").expect("writing to a String cannot fail");
-    } else {
-        output.push_str("null");
-    }
 }
 
 pub(super) fn format_microseconds(value: Option<u128>) -> String {

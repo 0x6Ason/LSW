@@ -27,7 +27,6 @@ mod windows_sudo;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};

@@ -584,6 +584,7 @@ dependencies = [
  "lsw-core",
  "lsw-host",
  "lsw-protocol",
+ "serde_json",
 ]
 
 [[package]]

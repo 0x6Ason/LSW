@@ -314,16 +314,3 @@ fn runtime_configuration_units_are_strict_and_stable() {
     assert_eq!(format_duration(600), "10m");
     assert!(parse_duration_seconds("ten minutes").is_err());
 }
-
-#[test]
-fn pe_json_strings_escape_protocol_sensitive_characters() {
-    let mut output = String::new();
-    push_json_string(
-        &mut output,
-        "quote=\" slash=\\ line=\n tab=\t control=\u{0001} café 🚀",
-    );
-    assert_eq!(
-        output,
-        "\"quote=\\\" slash=\\\\ line=\\n tab=\\t control=\\u0001 café 🚀\""
-    );
-}

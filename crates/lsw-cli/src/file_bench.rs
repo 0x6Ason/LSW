@@ -376,41 +376,24 @@ fn render_json(
     live: &TargetResult,
     mirror_sync_ms: u64,
 ) -> String {
-    format!(
-        "{{\"schema\":1,\"instance\":{},\"dataset\":{{\"sequential_mib\":{size_mib},\"small_files\":{small_files}}},\"guest_local\":{},\"live_smb\":{},\"agent_mirror\":{{\"available\":true,\"dataset_sync_ms\":{mirror_sync_ms}}}}}",
-        json_string(instance),
-        target_json(guest_local),
-        target_json(live),
-    )
+    serde_json::json!({
+        "schema": 1,
+        "instance": instance,
+        "dataset": { "sequential_mib": size_mib, "small_files": small_files },
+        "guest_local": target_json(guest_local),
+        "live_smb": target_json(live),
+        "agent_mirror": { "available": true, "dataset_sync_ms": mirror_sync_ms },
+    })
+    .to_string()
 }
 
-fn target_json(result: &TargetResult) -> String {
-    let mut output = format!("{{\"available\":{}", result.available);
+fn target_json(result: &TargetResult) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("available".to_owned(), result.available.into());
     for (key, value) in &result.values {
-        output.push_str(&format!(",\"{}\":", key.to_ascii_lowercase()));
-        match value {
-            Some(value) => output.push_str(&value.to_string()),
-            None => output.push_str("null"),
-        }
+        object.insert(key.to_ascii_lowercase(), (*value).into());
     }
-    output.push('}');
-    output
-}
-
-fn json_string(value: &str) -> String {
-    let mut output = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '\"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            character if character.is_control() => {
-                output.push_str(&format!("\\u{:04x}", character as u32));
-            }
-            character => output.push(character),
-        }
-    }
-    output.push('\"');
-    output
+    serde_json::Value::Object(object)
 }
 
 fn parse_dimension(
@@ -448,10 +431,14 @@ mod tests {
             available: true,
             values,
         };
-        let json = render_json("windows", 1024, 4096, &target, &target, 9);
-        assert!(json.contains("\"schema\":1"));
-        assert!(json.contains("\"git_status_ms\":null"));
-        assert!(json.contains("\"dataset_sync_ms\":9"));
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json("windows", 1024, 4096, &target, &target, 9))
+                .expect("benchmark output is valid JSON");
+        assert_eq!(json["schema"], 1);
+        assert_eq!(json["dataset"]["sequential_mib"], 1024);
+        assert_eq!(json["guest_local"]["seq_write_ms"], 1);
+        assert!(json["guest_local"]["git_status_ms"].is_null());
+        assert_eq!(json["agent_mirror"]["dataset_sync_ms"], 9);
     }
 
     #[test]

@@ -556,126 +556,62 @@ pub(super) fn print_pe_report(path: &Path, image: &PeImage, show_imports: bool) 
 
 pub(super) fn pe_json(path: &Path, image: &PeImage) -> String {
     let assessment = image.assess_for_beta();
-    let mut output = String::new();
-    output.push('{');
-    push_json_field(&mut output, "file", &path.to_string_lossy(), false);
-    push_json_field(&mut output, "format", &image.kind.to_string(), true);
-    push_json_field(&mut output, "machine", &image.machine.to_string(), true);
-    push_json_field(
-        &mut output,
-        "machine_code",
-        &format!("0x{:04x}", image.machine.raw()),
-        true,
-    );
-    push_json_field(&mut output, "subsystem", &image.subsystem.to_string(), true);
-    write!(
-        output,
-        ",\"subsystem_code\":{},\"timestamp\":{},\"characteristics\":{},\"entry_point_rva\":{},\"image_base\":{},\"size_of_image\":{},\"is_dll\":{},\"is_managed\":{},\"has_certificate_table\":{}",
-        image.subsystem.raw(),
-        image.timestamp,
-        image.characteristics,
-        image.entry_point_rva,
-        image.image_base,
-        image.size_of_image,
-        image.is_dll,
-        image.is_managed,
-        image.has_certificate_table
-    )
-    .expect("writing JSON to a String cannot fail");
-
-    output.push_str(",\"assessment\":{");
-    push_json_field(&mut output, "level", &assessment.level.to_string(), false);
-    output.push_str(",\"notes\":[");
-    for (index, note) in assessment.notes.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        push_json_string(&mut output, note);
-    }
-    output.push_str("]}");
-
-    output.push_str(",\"sections\":[");
-    for (index, section) in image.sections.iter().enumerate() {
-        if index != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        push_json_field(&mut output, "name", &section.name, false);
-        write!(
-            output,
-            ",\"virtual_address\":{},\"virtual_size\":{},\"raw_offset\":{},\"raw_size\":{},\"characteristics\":{}",
-            section.virtual_address,
-            section.virtual_size,
-            section.raw_offset,
-            section.raw_size,
-            section.characteristics
-        )
-        .expect("writing JSON to a String cannot fail");
-        output.push('}');
-    }
-    output.push(']');
-
-    output.push_str(",\"imports\":[");
-    for (import_index, import) in image.imports.iter().enumerate() {
-        if import_index != 0 {
-            output.push(',');
-        }
-        output.push('{');
-        push_json_field(&mut output, "dll", &import.dll, false);
-        output.push_str(",\"symbols\":[");
-        for (symbol_index, symbol) in import.symbols.iter().enumerate() {
-            if symbol_index != 0 {
-                output.push(',');
-            }
-            match symbol {
-                PeImportSymbol::Name { hint, name } => {
-                    output.push('{');
-                    push_json_field(&mut output, "kind", "name", false);
-                    push_json_field(&mut output, "name", name, true);
-                    write!(output, ",\"hint\":{hint}")
-                        .expect("writing JSON to a String cannot fail");
-                    output.push('}');
-                }
-                PeImportSymbol::Ordinal(value) => {
-                    write!(output, "{{\"kind\":\"ordinal\",\"ordinal\":{value}}}")
-                        .expect("writing JSON to a String cannot fail");
-                }
-            }
-        }
-        output.push_str("]}");
-    }
-    output.push_str("]}");
-    output
-}
-
-pub(super) fn push_json_field(output: &mut String, name: &str, value: &str, comma: bool) {
-    if comma {
-        output.push(',');
-    }
-    push_json_string(output, name);
-    output.push(':');
-    push_json_string(output, value);
-}
-
-pub(super) fn push_json_string(output: &mut String, value: &str) {
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\u{08}' => output.push_str("\\b"),
-            '\u{0c}' => output.push_str("\\f"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            control if control <= '\u{1f}' => {
-                write!(output, "\\u{:04x}", control as u32)
-                    .expect("writing JSON to a String cannot fail");
-            }
-            other => output.push(other),
-        }
-    }
-    output.push('"');
+    let sections: Vec<serde_json::Value> = image
+        .sections
+        .iter()
+        .map(|section| {
+            serde_json::json!({
+                "name": section.name,
+                "virtual_address": section.virtual_address,
+                "virtual_size": section.virtual_size,
+                "raw_offset": section.raw_offset,
+                "raw_size": section.raw_size,
+                "characteristics": section.characteristics,
+            })
+        })
+        .collect();
+    let imports: Vec<serde_json::Value> = image
+        .imports
+        .iter()
+        .map(|import| {
+            let symbols: Vec<serde_json::Value> = import
+                .symbols
+                .iter()
+                .map(|symbol| match symbol {
+                    PeImportSymbol::Name { hint, name } => {
+                        serde_json::json!({ "kind": "name", "name": name, "hint": hint })
+                    }
+                    PeImportSymbol::Ordinal(value) => {
+                        serde_json::json!({ "kind": "ordinal", "ordinal": value })
+                    }
+                })
+                .collect();
+            serde_json::json!({ "dll": import.dll, "symbols": symbols })
+        })
+        .collect();
+    serde_json::json!({
+        "file": path.to_string_lossy(),
+        "format": image.kind.to_string(),
+        "machine": image.machine.to_string(),
+        "machine_code": format!("0x{:04x}", image.machine.raw()),
+        "subsystem": image.subsystem.to_string(),
+        "subsystem_code": image.subsystem.raw(),
+        "timestamp": image.timestamp,
+        "characteristics": image.characteristics,
+        "entry_point_rva": image.entry_point_rva,
+        "image_base": image.image_base,
+        "size_of_image": image.size_of_image,
+        "is_dll": image.is_dll,
+        "is_managed": image.is_managed,
+        "has_certificate_table": image.has_certificate_table,
+        "assessment": {
+            "level": assessment.level.to_string(),
+            "notes": assessment.notes,
+        },
+        "sections": sections,
+        "imports": imports,
+    })
+    .to_string()
 }
 
 pub(super) fn create(
