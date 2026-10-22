@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# cargo-deny policy: https://embarkstudios.github.io/cargo-deny/
+# CI runs `cargo deny check bans licenses sources` as a blocking gate and
+# `cargo deny check advisories` as a non-blocking report, so a newly published
+# advisory is visible without turning every unrelated push red.
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "x86_64-pc-windows-gnu",
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # idna 0.5 Punycode acceptance. url 2.5.0 is pinned because the idna 1.x
+    # line drags in the ICU stack, whose litemap needs rustc 1.81 and the
+    # workspace MSRV is 1.76. LSW only parses allowlisted Microsoft download
+    # hosts, never attacker-chosen IDN names, and verifies every ISO by
+    # SHA-256 afterwards. Revisit when the MSRV moves past 1.81.
+    { id = "RUSTSEC-2024-0421", reason = "url 2.5.0 pinned for MSRV 1.76; only allowlisted ASCII hosts are parsed" },
+    # quick-xml is used only by wayland-scanner to parse the Wayland protocol
+    # XML that ships inside the wayland-protocols crates at build time. No
+    # untrusted XML reaches it; the fixed 0.41 line needs the winit 0.30 stack.
+    { id = "RUSTSEC-2026-0194", reason = "build-time only via wayland-scanner on trusted protocol XML" },
+    { id = "RUSTSEC-2026-0195", reason = "build-time only via wayland-scanner on trusted protocol XML" },
+]
+
+[licenses]
+version = 2
+# LSW itself is GPL-3.0-or-later; every dependency must be compatible with it.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # webpki-roots ships Mozilla's root store data under CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates reference each other by path without a version.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

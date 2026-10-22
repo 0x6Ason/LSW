@@ -150,14 +150,28 @@ for required_file in \
     source/scripts/build-release.sh source/scripts/build-windows-agent.sh \
     source/scripts/check-systemd-socket-activation.sh \
     source/scripts/normalize-pe-timestamp.py \
-    source/scripts/zig-windows-linker.sh \
-    source/vendor/serde-1.0.203/Cargo.toml \
-    source/vendor/serde_json-1.0.117/Cargo.toml \
-    source/vendor/ureq-2.10.1/Cargo.toml \
-    source/vendor/rustls-0.23.5/Cargo.toml \
-    source/vendor/webpki-roots-0.26.1/Cargo.toml; do
+    source/scripts/zig-windows-linker.sh; do
     if [ ! -f "$bundle/$required_file" ]; then
         echo "error: archive is missing $required_file" >&2
+        exit 1
+    fi
+done
+
+# The vendored source tree must carry the exact crate versions the bundled
+# Cargo.lock resolves, so spot-check the crates that matter most for the
+# network and serialization paths at whatever version the lockfile names.
+for vendored_crate in serde serde_json ureq rustls webpki-roots; do
+    vendored_version=$(awk -v crate="$vendored_crate" '
+        $1 == "name" && $3 == "\"" crate "\"" { want = 1; next }
+        want && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+        want && /^\[\[package\]\]/ { want = 0 }
+    ' "$bundle/source/Cargo.lock")
+    if [ -z "$vendored_version" ]; then
+        echo "error: bundled Cargo.lock does not resolve $vendored_crate" >&2
+        exit 1
+    fi
+    if [ ! -f "$bundle/source/vendor/$vendored_crate-$vendored_version/Cargo.toml" ]; then
+        echo "error: archive is missing vendored $vendored_crate $vendored_version" >&2
         exit 1
     fi
 done

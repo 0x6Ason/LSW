@@ -12,5 +12,5 @@ name = "lswd"
 path = "src/main.rs"
 
 [dependencies]
-lsw-core = { path = "../lsw-core" }
-serde_json = "=1.0.117"
+lsw-core.workspace = true
+serde_json.workspace = true

@@ -8,5 +8,5 @@ description = "Reusable Linux host clients for the LSW daemon and Windows guest 
 publish = false
 
 [dependencies]
-lsw-core = { path = "../lsw-core" }
-signal-hook = "=0.3.17"
+lsw-core.workspace = true
+signal-hook.workspace = true

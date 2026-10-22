@@ -12,5 +12,5 @@ name = "lsw"
 path = "src/main.rs"
 
 [dependencies]
-lsw-core = { path = "../lsw-core" }
-lsw-host = { path = "../lsw-host" }
+lsw-core.workspace = true
+lsw-host.workspace = true

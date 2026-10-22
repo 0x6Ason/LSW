@@ -8,13 +8,13 @@ description = "Core manifest, installer, protocol, and QEMU planning logic for L
 publish = false
 
 [dependencies]
-getrandom = "=0.2.15"
-lsw-protocol = { path = "../lsw-protocol" }
-serde = { version = "=1.0.203", features = ["derive"] }
-serde_json = "=1.0.117"
-sha2 = "=0.10.8"
+getrandom.workspace = true
+lsw-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 
 [target.'cfg(not(windows))'.dependencies]
-md4 = "=0.10.2"
-ureq = { version = "=2.10.1", default-features = false, features = ["tls"] }
-url = "=2.5.0"
+md4.workspace = true
+ureq.workspace = true
+url.workspace = true
