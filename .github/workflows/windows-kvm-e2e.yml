@@ -78,7 +78,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.76.0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -123,7 +123,7 @@ jobs:
           fi
 
       - name: Transfer only the short-lived request to the KVM runner
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-media-request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/windows-media-request.lsw
@@ -168,7 +168,7 @@ jobs:
           } >>"$GITHUB_ENV"
 
       - name: Receive the private Microsoft media request
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-media-request-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.LSW_BUILD_ROOT }}/media-request
@@ -239,7 +239,7 @@ jobs:
             printf 'LSW_WINDOWS_ISO_SHA256=%s\n' "$media_sha"
           } >>"$GITHUB_ENV"
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -567,7 +567,7 @@ jobs:
 
       - name: Upload redacted gate evidence
         if: ${{ always() && env.LSW_BUILD_ROOT != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-kvm-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.LSW_BUILD_ROOT }}/artifacts
@@ -638,12 +638,12 @@ jobs:
           } >>"$GITHUB_ENV"
 
       - name: Receive accepted headless KVM evidence
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows-kvm-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.LSW_GUI_BUILD_ROOT }}/headless-evidence
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -748,7 +748,7 @@ jobs:
 
       - name: Upload redacted GUI gate evidence
         if: ${{ always() && env.LSW_GUI_BUILD_ROOT != '' }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-seamless-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.LSW_GUI_BUILD_ROOT }}/artifacts
