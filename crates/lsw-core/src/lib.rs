@@ -25,7 +25,10 @@ mod windows_media;
 mod winpe_dism;
 mod winpe_profile;
 
-pub use backend::{AcceleratorCapabilities, HostPlatform, QemuBackend, VmAccelerator};
+pub use backend::{
+    AcceleratorCapabilities, GuestCpuTuning, HostPlatform, QemuBackend, VmAccelerator,
+    KVM_ENLIGHTENED_CPU_MODEL,
+};
 pub use capabilities::HostCapabilities;
 pub use customization::{
     AppxRemoval, CustomizationPlan, ProductUninstaller, RegistryHive, RegistryPolicy,

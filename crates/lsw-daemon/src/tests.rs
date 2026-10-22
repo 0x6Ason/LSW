@@ -6,6 +6,7 @@ fn supervisor() -> Supervisor {
     Supervisor::new(
         StateStore::new(std::env::temp_dir().join("lswd-dispatch-test")),
         HostCapabilities::unavailable(lsw_core::HostPlatform::Linux),
+        GuestCpuTuning::default(),
     )
 }
 

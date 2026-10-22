@@ -31,6 +31,15 @@ pub(super) fn daemon_idle_exit() -> Result<Duration, Box<dyn std::error::Error>>
     Ok(Duration::from_secs(seconds))
 }
 
+/// `LSW_GUEST_CPU_TUNING` selects the guest CPU model; unset means enlightened.
+pub(super) fn guest_cpu_tuning() -> Result<GuestCpuTuning, Box<dyn std::error::Error>> {
+    match env::var("LSW_GUEST_CPU_TUNING") {
+        Ok(value) => Ok(GuestCpuTuning::parse(&value)?),
+        Err(env::VarError::NotPresent) => Ok(GuestCpuTuning::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(super) fn current_rss_kib() -> Option<u64> {
     fs::read_to_string("/proc/self/status")
         .ok()?

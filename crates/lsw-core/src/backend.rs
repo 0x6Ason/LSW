@@ -76,6 +76,64 @@ impl fmt::Display for VmAccelerator {
     }
 }
 
+/// How aggressively the guest CPU model is tuned for a Windows guest.
+///
+/// Windows polls its hypervisor through the Hyper-V paravirtual interface and
+/// falls back to expensive emulated timers, APIC accesses, and IPIs when that
+/// interface is absent. KVM implements the same interface, so exposing it is the
+/// single largest Windows-on-KVM performance win and is what libvirt does by
+/// default for Windows guests. `Baseline` keeps the plain passthrough model for
+/// kernels or QEMU builds that reject an enlightenment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GuestCpuTuning {
+    #[default]
+    Enlightened,
+    Baseline,
+}
+
+impl GuestCpuTuning {
+    /// Parses the `LSW_GUEST_CPU_TUNING` setting.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "enlightened" | "default" => Ok(Self::Enlightened),
+            "baseline" | "compat" => Ok(Self::Baseline),
+            other => Err(LswError::InvalidValue {
+                field: "guest CPU tuning",
+                reason: format!("{other:?} is not one of enlightened or baseline"),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for GuestCpuTuning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Enlightened => "enlightened",
+            Self::Baseline => "baseline",
+        })
+    }
+}
+
+/// Host passthrough plus the Hyper-V enlightenments that every KVM kernel since
+/// Linux 5.0 and every QEMU since 4.0 implement.
+///
+/// - `migratable=off` exposes the invariant TSC so Windows uses it as a stable
+///   clock source instead of emulated timers. LSW never live-migrates a guest.
+/// - `hv-relaxed`, `hv-vapic`, `hv-spinlocks` remove timer-check, APIC, and
+///   spinlock exits on the hot path.
+/// - `hv-vpindex`, `hv-runtime`, `hv-time`, `hv-synic`, `hv-stimer`,
+///   `hv-stimer-direct` give Windows paravirtual clocks and timers.
+/// - `hv-reset`, `hv-frequencies`, `hv-reenlightenment` keep the TSC-based clock
+///   correct across guest resets and host frequency changes.
+/// - `hv-tlbflush`, `hv-ipi` turn multi-CPU TLB shootdowns and IPIs into single
+///   hypercalls, which matters most for the `-smp` counts a developer VM uses.
+///
+/// Intel-only `hv-evmcs` and the newer `hv-avic` are deliberately omitted so
+/// one model works on both vendors and on older stable distributions.
+pub const KVM_ENLIGHTENED_CPU_MODEL: &str = "host,migratable=off,\
+hv-relaxed,hv-vapic,hv-spinlocks=0x1fff,hv-vpindex,hv-runtime,hv-time,hv-synic,\
+hv-stimer,hv-stimer-direct,hv-reset,hv-frequencies,hv-reenlightenment,hv-tlbflush,hv-ipi";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AcceleratorCapabilities {
     kvm: bool,
@@ -156,10 +214,23 @@ impl QemuBackend {
     pub(crate) const fn acceleration_arguments(self) -> &'static [&'static str] {
         match self.accelerator {
             // Keep the beta's established KVM spelling for stable dry-run output.
-            VmAccelerator::Kvm => &["-enable-kvm", "-cpu", "host"],
-            VmAccelerator::Hvf => &["-accel", "hvf", "-cpu", "host"],
-            VmAccelerator::Whpx => &["-accel", "whpx", "-cpu", "max"],
-            VmAccelerator::Tcg => &["-accel", "tcg,thread=multi", "-cpu", "max"],
+            VmAccelerator::Kvm => &["-enable-kvm"],
+            VmAccelerator::Hvf => &["-accel", "hvf"],
+            VmAccelerator::Whpx => &["-accel", "whpx"],
+            VmAccelerator::Tcg => &["-accel", "tcg,thread=multi"],
+        }
+    }
+
+    /// The `-cpu` model for this backend.
+    ///
+    /// Under KVM the host CPU is passed through with the Hyper-V enlightenments
+    /// Windows expects from its own hypervisor; see [`GuestCpuTuning`].
+    pub(crate) const fn cpu_model(self, tuning: GuestCpuTuning) -> &'static str {
+        match (self.accelerator, tuning) {
+            (VmAccelerator::Kvm, GuestCpuTuning::Enlightened) => KVM_ENLIGHTENED_CPU_MODEL,
+            (VmAccelerator::Kvm | VmAccelerator::Hvf, GuestCpuTuning::Baseline)
+            | (VmAccelerator::Hvf, GuestCpuTuning::Enlightened) => "host",
+            (VmAccelerator::Whpx | VmAccelerator::Tcg, _) => "max",
         }
     }
 
@@ -292,40 +363,92 @@ mod tests {
             HostPlatform::Linux,
             AcceleratorCapabilities::none().with_available(VmAccelerator::Kvm),
         );
+        let kvm_backend = QemuBackend::select(&kvm);
+        assert_eq!(kvm_backend.acceleration_arguments(), ["-enable-kvm"]);
         assert_eq!(
-            QemuBackend::select(&kvm).acceleration_arguments(),
-            ["-enable-kvm", "-cpu", "host"]
+            kvm_backend.cpu_model(GuestCpuTuning::Enlightened),
+            KVM_ENLIGHTENED_CPU_MODEL
         );
+        assert_eq!(kvm_backend.cpu_model(GuestCpuTuning::Baseline), "host");
 
         let tcg = capabilities(HostPlatform::Linux, AcceleratorCapabilities::none());
+        let tcg_backend = QemuBackend::select(&tcg);
         assert_eq!(
-            QemuBackend::select(&tcg).acceleration_arguments(),
-            ["-accel", "tcg,thread=multi", "-cpu", "max"]
+            tcg_backend.acceleration_arguments(),
+            ["-accel", "tcg,thread=multi"]
         );
+        for tuning in [GuestCpuTuning::Enlightened, GuestCpuTuning::Baseline] {
+            assert_eq!(tcg_backend.cpu_model(tuning), "max");
+        }
+    }
+
+    #[test]
+    fn enlightened_model_is_a_single_cpu_option_with_satisfied_dependencies() {
+        assert!(!KVM_ENLIGHTENED_CPU_MODEL.contains(char::is_whitespace));
+        assert!(KVM_ENLIGHTENED_CPU_MODEL.starts_with("host,migratable=off,"));
+        let features: Vec<&str> = KVM_ENLIGHTENED_CPU_MODEL.split(',').collect();
+        // QEMU rejects a model whose Hyper-V features lack their prerequisites.
+        for (feature, requirement) in [
+            ("hv-synic", "hv-vpindex"),
+            ("hv-stimer", "hv-synic"),
+            ("hv-stimer", "hv-time"),
+            ("hv-stimer-direct", "hv-stimer"),
+            ("hv-tlbflush", "hv-vpindex"),
+            ("hv-ipi", "hv-vpindex"),
+        ] {
+            assert!(features.contains(&feature), "{feature} is missing");
+            assert!(
+                features.contains(&requirement),
+                "{feature} requires {requirement}"
+            );
+        }
+        assert!(!features.contains(&"hv-evmcs"), "hv-evmcs is Intel only");
+        assert!(!features.contains(&"hv-passthrough"));
+    }
+
+    #[test]
+    fn cpu_tuning_parses_documented_spellings_only() {
+        assert_eq!(
+            GuestCpuTuning::parse(" Enlightened ").expect("documented spelling"),
+            GuestCpuTuning::Enlightened
+        );
+        assert_eq!(
+            GuestCpuTuning::parse("baseline").expect("documented spelling"),
+            GuestCpuTuning::Baseline
+        );
+        assert!(matches!(
+            GuestCpuTuning::parse("fast"),
+            Err(LswError::InvalidValue {
+                field: "guest CPU tuning",
+                ..
+            })
+        ));
+        assert_eq!(GuestCpuTuning::default(), GuestCpuTuning::Enlightened);
     }
 
     #[test]
     fn future_native_accelerators_have_explicit_qemu_arguments() {
-        for (platform, accelerator, expected) in [
+        for (platform, accelerator, expected_accel, expected_cpu) in [
             (
                 HostPlatform::MacOs,
                 VmAccelerator::Hvf,
-                ["-accel", "hvf", "-cpu", "host"],
+                ["-accel", "hvf"],
+                "host",
             ),
             (
                 HostPlatform::Windows,
                 VmAccelerator::Whpx,
-                ["-accel", "whpx", "-cpu", "max"],
+                ["-accel", "whpx"],
+                "max",
             ),
         ] {
             let capabilities = capabilities(
                 platform,
                 AcceleratorCapabilities::none().with_available(accelerator),
             );
-            assert_eq!(
-                QemuBackend::select(&capabilities).acceleration_arguments(),
-                expected
-            );
+            let backend = QemuBackend::select(&capabilities);
+            assert_eq!(backend.acceleration_arguments(), expected_accel);
+            assert_eq!(backend.cpu_model(GuestCpuTuning::Enlightened), expected_cpu);
         }
     }
 }

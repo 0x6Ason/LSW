@@ -21,7 +21,9 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use lsw_core::{HostCapabilities, LaunchPhase, QemuPlanner, StateStore, DAEMON_PROTOCOL_VERSION};
+use lsw_core::{
+    GuestCpuTuning, HostCapabilities, LaunchPhase, StateStore, DAEMON_PROTOCOL_VERSION,
+};
 use runtime_config::*;
 use supervisor::Supervisor;
 
@@ -56,7 +58,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     listener.set_nonblocking(true)?;
     println!("lswd listening on {}", socket_path.display());
 
-    let mut supervisor = Supervisor::new(store, HostCapabilities::detect());
+    let mut supervisor = Supervisor::new(store, HostCapabilities::detect(), guest_cpu_tuning()?);
     let idle_exit = daemon_idle_exit()?;
     let mut last_request = std::time::Instant::now();
     loop {
@@ -228,8 +230,7 @@ fn plan(
     let phase = parse_phase(phase)?;
     let manifest = supervisor.store().load(name)?;
     let instance_dir = supervisor.store().instance_dir(name)?;
-    let plan =
-        QemuPlanner::new(HostCapabilities::detect()).plan(&manifest, &instance_dir, phase)?;
+    let plan = supervisor.planner().plan(&manifest, &instance_dir, phase)?;
     let mut response = plan
         .helper_commands
         .iter()

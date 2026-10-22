@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
     prepare_live_share_runtime, read_frame, write_frame, ClientHello, CommandInvocation, Frame,
-    FrameKind, HostCapabilities, IdlePolicy, InstanceManifest, InstanceState, LaunchPhase,
-    Provisioner, QemuPlanner, ServerHello, StateStore, WindowsProfile, AGENT_PROTOCOL_VERSION,
-    CAPABILITY_POWER_HIBERNATE_V1,
+    FrameKind, GuestCpuTuning, HostCapabilities, IdlePolicy, InstanceManifest, InstanceState,
+    LaunchPhase, Provisioner, QemuPlanner, ServerHello, StateStore, WindowsProfile,
+    AGENT_PROTOCOL_VERSION, CAPABILITY_POWER_HIBERNATE_V1,
 };
 
 use crate::qmp::QmpClient;
@@ -33,18 +33,28 @@ struct ManagedVm {
 pub struct Supervisor {
     store: StateStore,
     capabilities: HostCapabilities,
+    cpu_tuning: GuestCpuTuning,
     processes: BTreeMap<String, ManagedVm>,
     last_policy_poll: Instant,
 }
 
 impl Supervisor {
-    pub fn new(store: StateStore, capabilities: HostCapabilities) -> Self {
+    pub fn new(
+        store: StateStore,
+        capabilities: HostCapabilities,
+        cpu_tuning: GuestCpuTuning,
+    ) -> Self {
         Self {
             store,
             capabilities,
+            cpu_tuning,
             processes: BTreeMap::new(),
             last_policy_poll: Instant::now(),
         }
+    }
+
+    pub fn planner(&self) -> QemuPlanner {
+        QemuPlanner::new(self.capabilities.clone()).with_cpu_tuning(self.cpu_tuning)
     }
 
     pub fn store(&self) -> &StateStore {
@@ -190,8 +200,7 @@ impl Supervisor {
             self.prepare_ephemeral_overlay(&instance_dir, manifest.state)?;
         }
 
-        let plan =
-            QemuPlanner::new(self.capabilities.clone()).plan(&manifest, &instance_dir, phase)?;
+        let plan = self.planner().plan(&manifest, &instance_dir, phase)?;
         if !plan.missing_capabilities.is_empty() {
             return Err(format!(
                 "cannot start instance; missing {}",

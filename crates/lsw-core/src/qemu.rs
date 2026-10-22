@@ -7,8 +7,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    FolderShareTransport, HostCapabilities, InstanceManifest, NetworkMode, QemuBackend, Result,
-    AGENT_GUEST_PORT,
+    FolderShareTransport, GuestCpuTuning, HostCapabilities, InstanceManifest, NetworkMode,
+    QemuBackend, Result, AGENT_GUEST_PORT,
 };
 
 pub const LIVE_SMB_RUNTIME_DIRECTORY: &str = "live-smb";
@@ -61,6 +61,7 @@ impl CommandPlan {
 pub struct QemuPlanner {
     capabilities: HostCapabilities,
     backend: QemuBackend,
+    cpu_tuning: GuestCpuTuning,
 }
 
 impl QemuPlanner {
@@ -69,6 +70,7 @@ impl QemuPlanner {
         Self {
             capabilities,
             backend,
+            cpu_tuning: GuestCpuTuning::default(),
         }
     }
 
@@ -77,11 +79,23 @@ impl QemuPlanner {
         Ok(Self {
             capabilities,
             backend,
+            cpu_tuning: GuestCpuTuning::default(),
         })
+    }
+
+    /// Overrides the guest CPU tuning; see [`GuestCpuTuning`].
+    #[must_use]
+    pub const fn with_cpu_tuning(mut self, cpu_tuning: GuestCpuTuning) -> Self {
+        self.cpu_tuning = cpu_tuning;
+        self
     }
 
     pub const fn backend(&self) -> QemuBackend {
         self.backend
+    }
+
+    pub const fn cpu_tuning(&self) -> GuestCpuTuning {
+        self.cpu_tuning
     }
 
     pub fn plan(
@@ -116,7 +130,17 @@ impl QemuPlanner {
                 "q35,usb=on"
             },
         );
-        push_pair(&mut arguments, "-smp", manifest.spec.cpus.to_string());
+        // Windows licenses a socket count (Home: 1, Pro: 2) and schedules per
+        // core, so present every vCPU as a core of one socket instead of
+        // leaving the topology to QEMU's version-dependent default.
+        push_pair(
+            &mut arguments,
+            "-smp",
+            format!(
+                "{cpus},sockets=1,cores={cpus},threads=1",
+                cpus = manifest.spec.cpus
+            ),
+        );
         push_pair(
             &mut arguments,
             "-m",
@@ -129,8 +153,28 @@ impl QemuPlanner {
                 .iter()
                 .map(OsString::from),
         );
+        push_pair(
+            &mut arguments,
+            "-cpu",
+            self.backend.cpu_model(self.cpu_tuning),
+        );
+        // The unattend installs Windows with a UTC clock; slew the emulated RTC
+        // instead of letting it jump when the host is busy.
+        push_pair(&mut arguments, "-rtc", "base=utc,driftfix=slew");
         if let Some(note) = self.backend.fallback_note() {
             notes.push(note);
+        }
+        if self.backend.accelerator() == crate::VmAccelerator::Kvm {
+            notes.push(match self.cpu_tuning {
+                GuestCpuTuning::Enlightened => {
+                    "guest CPU: host passthrough with Hyper-V enlightenments; set LSW_GUEST_CPU_TUNING=baseline if QEMU rejects an hv-* feature"
+                        .to_owned()
+                }
+                GuestCpuTuning::Baseline => {
+                    "guest CPU: baseline host passthrough without Hyper-V enlightenments"
+                        .to_owned()
+                }
+            });
         }
 
         let firmware_code = self
@@ -612,8 +656,46 @@ mod tests {
             .expect("plan should be built");
         assert_eq!(planner.backend(), backend);
         assert_eq!(plan.backend, backend);
-        assert!(plan.display_command().contains("-enable-kvm -cpu host"));
-        assert!(!plan.display_command().contains("-accel tcg"));
+        let command = plan.display_command();
+        assert!(command.contains("-enable-kvm -cpu host,migratable=off,hv-relaxed,"));
+        assert!(command.contains(",hv-stimer-direct,"));
+        assert!(!command.contains("-accel tcg"));
+        assert!(plan
+            .notes
+            .iter()
+            .any(|note| note.contains("Hyper-V enlightenments")));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn baseline_cpu_tuning_keeps_plain_host_passthrough() {
+        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
+        let mut capabilities = headless_capabilities();
+        capabilities.accelerators =
+            crate::AcceleratorCapabilities::none().with_available(crate::VmAccelerator::Kvm);
+        let planner =
+            QemuPlanner::new(capabilities).with_cpu_tuning(crate::GuestCpuTuning::Baseline);
+        assert_eq!(planner.cpu_tuning(), crate::GuestCpuTuning::Baseline);
+        let plan = planner
+            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
+            .expect("plan should be built");
+        let command = plan.display_command();
+        assert!(command.contains("-enable-kvm -cpu host -rtc"));
+        assert!(!command.contains("hv-"));
+        fs::remove_file(iso).expect("temporary ISO should be removable");
+    }
+
+    #[test]
+    fn planner_presents_vcpus_as_cores_of_one_socket() {
+        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
+        let plan = QemuPlanner::new(headless_capabilities())
+            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
+            .expect("plan should be built");
+        let command = plan.display_command();
+        assert!(command.contains("-smp 4,sockets=1,cores=4,threads=1"));
+        assert!(command.contains("-rtc base=utc,driftfix=slew"));
+        // TCG never advertises Hyper-V features it cannot accelerate.
+        assert!(command.contains("-accel tcg,thread=multi -cpu max"));
         fs::remove_file(iso).expect("temporary ISO should be removable");
     }
 
