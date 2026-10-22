@@ -5,76 +5,21 @@
 //! SCM callbacks cannot carry Rust state directly. The mutex-protected handoff
 //! and atomics below keep callback state bounded while preserving stop ordering.
 
-#![deny(clippy::undocumented_unsafe_blocks)]
-
 use std::ffi::c_void;
 use std::io;
-use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::Mutex;
 
+use super::windows_scm::{
+    self, ServiceStatus, ServiceStatusHandle, ERROR_CALL_NOT_IMPLEMENTED,
+    ERROR_SERVICE_SPECIFIC_ERROR, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
+    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_WIN32_OWN_PROCESS,
+};
 use super::{run_agent, Configuration};
 
-const SERVICE_NAME: [u16; 9] = [
-    b'L' as u16,
-    b'S' as u16,
-    b'W' as u16,
-    b'A' as u16,
-    b'g' as u16,
-    b'e' as u16,
-    b'n' as u16,
-    b't' as u16,
-    0,
-];
-
-const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
-const SERVICE_STOPPED: u32 = 0x0000_0001;
-const SERVICE_START_PENDING: u32 = 0x0000_0002;
-const SERVICE_STOP_PENDING: u32 = 0x0000_0003;
-const SERVICE_RUNNING: u32 = 0x0000_0004;
-const SERVICE_ACCEPT_STOP: u32 = 0x0000_0001;
-const SERVICE_ACCEPT_SHUTDOWN: u32 = 0x0000_0004;
-const SERVICE_CONTROL_STOP: u32 = 0x0000_0001;
-const SERVICE_CONTROL_INTERROGATE: u32 = 0x0000_0004;
-const SERVICE_CONTROL_SHUTDOWN: u32 = 0x0000_0005;
-const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
-const ERROR_SERVICE_SPECIFIC_ERROR: u32 = 1066;
-
-type ServiceMainFunction = extern "system" fn(u32, *mut *mut u16);
-type HandlerFunction = extern "system" fn(u32, u32, *mut c_void, *mut c_void) -> u32;
-type ServiceStatusHandle = *mut c_void;
-
-#[repr(C)]
-struct ServiceTableEntryW {
-    service_name: *mut u16,
-    service_main: Option<ServiceMainFunction>,
-}
-
-#[repr(C)]
-struct ServiceStatus {
-    service_type: u32,
-    current_state: u32,
-    controls_accepted: u32,
-    win32_exit_code: u32,
-    service_specific_exit_code: u32,
-    checkpoint: u32,
-    wait_hint: u32,
-}
-
-#[link(name = "advapi32")]
-extern "system" {
-    fn StartServiceCtrlDispatcherW(service_table: *const ServiceTableEntryW) -> i32;
-    fn RegisterServiceCtrlHandlerExW(
-        service_name: *const u16,
-        handler: Option<HandlerFunction>,
-        context: *mut c_void,
-    ) -> ServiceStatusHandle;
-    fn SetServiceStatus(
-        status_handle: ServiceStatusHandle,
-        service_status: *const ServiceStatus,
-    ) -> i32;
-}
+const SERVICE_NAME: &str = "LSWAgent";
 
 static CONFIGURATION: Mutex<Option<Configuration>> = Mutex::new(None);
 static STOP_SENDER: Mutex<Option<SyncSender<()>>> = Mutex::new(None);
@@ -96,28 +41,13 @@ pub(super) fn run(configuration: Configuration) -> Result<(), Box<dyn std::error
     STATUS_HANDLE.store(0, Ordering::Release);
     CURRENT_STATE.store(SERVICE_STOPPED as usize, Ordering::Release);
 
-    let mut service_name = SERVICE_NAME.to_vec();
-    let service_table = [
-        ServiceTableEntryW {
-            service_name: service_name.as_mut_ptr(),
-            service_main: Some(service_main),
-        },
-        ServiceTableEntryW {
-            service_name: ptr::null_mut(),
-            service_main: None,
-        },
-    ];
-    // SAFETY: the table is null-terminated, its UTF-16 name and callbacks stay
-    // alive for the blocking dispatcher call, and SCM owns no Rust allocation.
-    let dispatched = unsafe { StartServiceCtrlDispatcherW(service_table.as_ptr()) };
-    if dispatched == 0 {
+    if let Err(error) = windows_scm::dispatch(SERVICE_NAME, service_main) {
         if let Ok(mut configuration) = CONFIGURATION.lock() {
             configuration.take();
         }
         return Err(format!(
-            "could not connect LSWAgent to the Windows Service Control Manager: {}; \
-             --service must be started by SCM",
-            io::Error::last_os_error()
+            "could not connect LSWAgent to the Windows Service Control Manager: {error}; \
+             --service must be started by SCM"
         )
         .into());
     }
@@ -159,22 +89,10 @@ extern "system" fn service_main(_argument_count: u32, _arguments: *mut *mut u16)
 }
 
 fn service_main_inner() -> Result<(), Box<dyn std::error::Error>> {
-    // SAFETY: SERVICE_NAME has static storage and a trailing NUL; the callback
-    // and null context remain valid for the registered service lifetime.
-    let status_handle = unsafe {
-        RegisterServiceCtrlHandlerExW(
-            SERVICE_NAME.as_ptr(),
-            Some(service_control_handler),
-            ptr::null_mut(),
-        )
-    };
-    if status_handle.is_null() {
-        return Err(format!(
-            "could not register the LSWAgent service control handler: {}",
-            io::Error::last_os_error()
-        )
-        .into());
-    }
+    let status_handle =
+        windows_scm::register_control_handler(SERVICE_NAME, service_control_handler).map_err(
+            |error| format!("could not register the LSWAgent service control handler: {error}"),
+        )?;
     STATUS_HANDLE.store(status_handle as usize, Ordering::Release);
     report_status(SERVICE_START_PENDING, 0, 0, 0, 1, 10_000)?;
 
@@ -244,23 +162,18 @@ fn report_status(
         .lock()
         .map_err(|_| io::Error::other("service status lock was poisoned"))?;
     let status_handle = STATUS_HANDLE.load(Ordering::Acquire) as ServiceStatusHandle;
-    if status_handle.is_null() {
-        return Err(io::Error::other("service status handle is not initialized"));
-    }
-    let status = ServiceStatus {
-        service_type: SERVICE_WIN32_OWN_PROCESS,
-        current_state: state,
-        controls_accepted,
-        win32_exit_code,
-        service_specific_exit_code,
-        checkpoint,
-        wait_hint,
-    };
-    // SAFETY: SCM returned the live status handle and `status` remains readable
-    // for the complete synchronous call.
-    if unsafe { SetServiceStatus(status_handle, &status) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    windows_scm::set_status(
+        status_handle,
+        &ServiceStatus {
+            service_type: SERVICE_WIN32_OWN_PROCESS,
+            current_state: state,
+            controls_accepted,
+            win32_exit_code,
+            service_specific_exit_code,
+            checkpoint,
+            wait_hint,
+        },
+    )?;
     CURRENT_STATE.store(state as usize, Ordering::Release);
     Ok(())
 }

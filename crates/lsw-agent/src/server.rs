@@ -36,9 +36,15 @@ pub(super) fn run(arguments: Vec<std::ffi::OsString>) -> Result<(), Box<dyn std:
         {
             return match configuration.service_kind {
                 ServiceKind::Agent => windows_service::run(configuration),
-                ServiceKind::LicenseHelper => windows_license_service::run(configuration),
-                ServiceKind::UserHelper => windows_user_service::run(configuration),
-                ServiceKind::MaintenanceHelper => windows_maintenance_service::run(configuration),
+                ServiceKind::LicenseHelper => {
+                    windows_helper_service::run(HelperService::License, configuration)
+                }
+                ServiceKind::UserHelper => {
+                    windows_helper_service::run(HelperService::User, configuration)
+                }
+                ServiceKind::MaintenanceHelper => {
+                    windows_helper_service::run(HelperService::Maintenance, configuration)
+                }
             };
         }
         #[cfg(not(windows))]

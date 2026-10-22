@@ -113,18 +113,18 @@ mod windows_conpty;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
-mod windows_license_service;
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
 mod windows_live_share;
 
 #[cfg(windows)]
-#[allow(unsafe_code)]
-mod windows_maintenance_service;
+mod windows_helper_service;
+#[cfg(windows)]
+use windows_helper_service::HelperService;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
+mod windows_scm;
+
+#[cfg(windows)]
 mod windows_service;
 
 #[cfg(windows)]
@@ -138,10 +138,6 @@ mod windows_path;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_user;
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-mod windows_user_service;
 
 #[cfg(unix)]
 #[path = "process_tree_unix.rs"]
