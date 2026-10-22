@@ -546,7 +546,7 @@ fn normalized_relative_path(path: &Path) -> Result<String, Box<dyn std::error::E
         match component {
             Component::Normal(value) => {
                 let value = value.to_str().ok_or("tree paths must be valid UTF-8")?;
-                if !windows_component_is_safe(value) {
+                if !lsw_core::windows_path_component_is_safe(value) {
                     return Err(format!(
                         "{} cannot be represented as a safe Windows path component",
                         path.display()
@@ -567,7 +567,7 @@ fn normalized_relative_path(path: &Path) -> Result<String, Box<dyn std::error::E
 fn relative_path(value: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut path = PathBuf::new();
     for component in value.split(['/', '\\']) {
-        if !windows_component_is_safe(component) {
+        if !lsw_core::windows_path_component_is_safe(component) {
             return Err(format!("unsafe relative transfer path {value:?}").into());
         }
         path.push(component);
@@ -576,45 +576,6 @@ fn relative_path(value: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Err("relative transfer path must not be empty".into());
     }
     Ok(path)
-}
-
-fn windows_component_is_safe(component: &str) -> bool {
-    if component.is_empty()
-        || component == "."
-        || component == ".."
-        || component.ends_with([' ', '.'])
-        || component
-            .chars()
-            .any(|character| character <= '\u{1f}' || "<>:\"/\\|?*".contains(character))
-    {
-        return false;
-    }
-    let stem = component
-        .split_once('.')
-        .map_or(component, |(stem, _)| stem)
-        .to_ascii_uppercase();
-    !matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        && !matches!(
-            stem.as_str(),
-            "COM1"
-                | "COM2"
-                | "COM3"
-                | "COM4"
-                | "COM5"
-                | "COM6"
-                | "COM7"
-                | "COM8"
-                | "COM9"
-                | "LPT1"
-                | "LPT2"
-                | "LPT3"
-                | "LPT4"
-                | "LPT5"
-                | "LPT6"
-                | "LPT7"
-                | "LPT8"
-                | "LPT9"
-        )
 }
 
 fn join_windows_path(root: &str, relative: &str) -> Result<String, Box<dyn std::error::Error>> {

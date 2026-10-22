@@ -3,11 +3,7 @@
 use super::*;
 
 pub(super) fn state_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    if let Some(configured) = env::var_os("LSW_STATE_DIR") {
-        return Ok(PathBuf::from(configured));
-    }
-    let home = env::var_os("HOME").ok_or("HOME is not set; configure LSW_STATE_DIR")?;
-    Ok(PathBuf::from(home).join(".local/share/lsw"))
+    Ok(lsw_core::default_state_root()?)
 }
 
 pub(super) fn socket_path(store: &StateStore) -> PathBuf {

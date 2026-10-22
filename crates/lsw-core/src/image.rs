@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -9,6 +8,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
+use crate::fs_checks::hex_encode;
 use crate::store::{generate_agent_token, write_atomic};
 use crate::{
     sha256_file, HostCapabilities, InstanceManifest, InstanceSpec, InstanceState, LswError, Result,
@@ -424,11 +424,7 @@ fn image_key(iso: &str, profile: &str, agent: &str, firmware: &str, disk: &str) 
         digest.update(value.as_bytes());
         digest.update(b"\n");
     }
-    let mut output = String::with_capacity(64);
-    for byte in digest.finalize() {
-        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    output
+    hex_encode(&digest.finalize())
 }
 
 fn write_clone_identity(store: &StateStore, name: &str, instance_dir: &Path) -> Result<()> {
@@ -466,15 +462,7 @@ fn stage_identity(name: &str, instance_dir: &Path, token: &str) -> Result<()> {
 }
 
 fn require_regular_file(path: &Path, field: &'static str) -> Result<PathBuf> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
-            Ok(path.to_path_buf())
-        }
-        _ => Err(LswError::InvalidValue {
-            field,
-            reason: format!("{} is not a regular non-symlink file", path.display()),
-        }),
-    }
+    crate::fs_checks::require_regular_file(path, field).map(|()| path.to_path_buf())
 }
 
 fn create_private_directory_all(path: &Path) -> Result<()> {

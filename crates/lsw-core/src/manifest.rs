@@ -866,7 +866,7 @@ fn validate_windows_absolute_path(path: &str) -> Result<()> {
     let safe_components = drive_root
         && path[3..]
             .split(['\\', '/'])
-            .all(windows_share_component_is_safe);
+            .all(windows_path_component_is_safe);
     if drive_root && safe_components {
         Ok(())
     } else {
@@ -877,7 +877,9 @@ fn validate_windows_absolute_path(path: &str) -> Result<()> {
     }
 }
 
-fn windows_share_component_is_safe(component: &str) -> bool {
+/// Whether `component` is a safe single Windows path component: non-empty, not
+/// `.`/`..`, no trailing space or dot, no reserved characters or device names.
+pub fn windows_path_component_is_safe(component: &str) -> bool {
     if component.is_empty()
         || component == "."
         || component == ".."

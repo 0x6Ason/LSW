@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use md4::{Digest, Md4};
 
+use crate::fs_checks::require_real_directory;
 use crate::store::write_atomic;
 use crate::{
     FolderShareTransport, InstanceManifest, LswError, Result, LIVE_SMB_CONFIG_FILE,
@@ -206,17 +207,6 @@ fn ensure_private_runtime_directory(path: &Path) -> Result<()> {
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
-}
-
-fn require_real_directory(path: &Path, field: &'static str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-    Err(LswError::InvalidValue {
-        field,
-        reason: format!("{} must be a real directory", path.display()),
-    })
 }
 
 fn require_missing_or_regular_file(path: &Path) -> Result<()> {

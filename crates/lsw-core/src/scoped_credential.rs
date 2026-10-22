@@ -28,13 +28,7 @@ pub fn derive_scoped_credential(agent_token: &str, scope: &str) -> Result<String
     hash.update(scope.as_bytes());
     hash.update(b"\0");
     hash.update(agent_token.as_bytes());
-    let digest = hash.finalize();
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(output)
+    Ok(crate::fs_checks::hex_encode(&hash.finalize()))
 }
 
 fn validate_token(token: &str) -> Result<()> {

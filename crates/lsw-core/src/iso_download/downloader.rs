@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use super::*;
+use crate::fs_checks::{require_real_directory, require_regular_file};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Download implementation selected for an ISO transfer.
@@ -749,30 +750,6 @@ fn create_private_truncated_file(path: &Path) -> Result<fs::File> {
         .open(path)?;
     set_private_file_permissions(path)?;
     Ok(file)
-}
-
-fn require_real_directory(path: &Path, field: &'static str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(LswError::InvalidValue {
-            field,
-            reason: format!("{} is not a real directory", path.display()),
-        })
-    }
-}
-
-fn require_regular_file(path: &Path, field: &'static str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(LswError::InvalidValue {
-            field,
-            reason: format!("{} is not a regular file", path.display()),
-        })
-    }
 }
 
 #[cfg(unix)]

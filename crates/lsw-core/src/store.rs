@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
-use std::fmt::Write as FmtWrite;
 #[cfg(unix)]
 use std::io::Read;
 #[cfg(unix)]
@@ -21,6 +20,19 @@ const DEFAULT_INSTANCE_FILE: &str = "default-instance";
 #[derive(Clone, Debug)]
 pub struct StateStore {
     root: PathBuf,
+}
+
+/// The state root every LSW host binary shares: `$LSW_STATE_DIR`, or
+/// `~/.local/share/lsw` when it is unset.
+pub fn default_state_root() -> Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("LSW_STATE_DIR") {
+        return Ok(PathBuf::from(configured));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| LswError::InvalidValue {
+        field: "state directory",
+        reason: "HOME is not set; configure LSW_STATE_DIR".to_owned(),
+    })?;
+    Ok(PathBuf::from(home).join(".local/share/lsw"))
 }
 
 impl StateStore {
@@ -342,11 +354,7 @@ pub(crate) fn generate_agent_token() -> Result<String> {
     let mut random = fs::File::open("/dev/urandom")?;
     let mut bytes = [0_u8; 32];
     random.read_exact(&mut bytes)?;
-    let mut token = String::with_capacity(64);
-    for byte in bytes {
-        write!(token, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    Ok(token)
+    Ok(crate::fs_checks::hex_encode(&bytes))
 }
 
 #[cfg(not(unix))]

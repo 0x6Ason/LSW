@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use self::io::{set_private_directory_permissions, set_private_file_permissions};
+use crate::fs_checks::require_real_directory;
 use crate::install_seed::OFFLINE_PROFILE_MARKER_NAME;
+use crate::install_seed::{validate_locale, windows_computer_name, xml_escape};
 use crate::winpe_profile::prepare_script;
 use crate::{
     CommandInvocation, CustomizationPlan, InstanceManifest, LswError, PreparationPlan, QemuBackend,
@@ -392,7 +394,7 @@ impl WinPeDismBackend {
                 reason: "must be at least 1".to_owned(),
             });
         }
-        require_real_directory(instance_dir)?;
+        require_real_directory(instance_dir, "instance directory")?;
 
         let destination = instance_dir.join("winpe-seed");
         if fs::symlink_metadata(&destination).is_ok() {
@@ -487,7 +489,7 @@ impl WinPeDismBackend {
         setup_account_password_value: &str,
     ) -> Result<WinPeDismPlan> {
         manifest.spec.validate()?;
-        require_real_directory(install_seed)?;
+        require_real_directory(install_seed, "install seed directory")?;
         validate_locale(locale)?;
         validate_unattend_password_value(setup_account_password_value)?;
         let mut plan = Self::plan(manifest.spec.profile, edition_index, instance_dir)?;
@@ -526,7 +528,7 @@ impl WinPeDismBackend {
         instance_dir: &Path,
     ) -> Result<WinPeDismApplyPlan> {
         manifest.spec.validate()?;
-        require_real_directory(instance_dir)?;
+        require_real_directory(instance_dir, "instance directory")?;
 
         let destination = instance_dir.join("winpe-apply-seed");
         if fs::symlink_metadata(&destination).is_ok() {
@@ -875,43 +877,6 @@ fn read_seed_payload(path: &Path) -> Result<Option<Vec<u8>>> {
     Ok(Some(fs::read(path)?))
 }
 
-fn validate_locale(locale: &str) -> Result<()> {
-    if (2..=20).contains(&locale.len())
-        && locale
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        && locale.bytes().any(|byte| byte == b'-')
-    {
-        Ok(())
-    } else {
-        Err(LswError::InvalidValue {
-            field: "locale",
-            reason: "must look like en-US or zh-HK".to_owned(),
-        })
-    }
-}
-
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-fn windows_computer_name(instance: &str) -> String {
-    let mut name = format!("LSW-{}", instance.to_ascii_uppercase())
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .take(15)
-        .collect::<String>();
-    while name.ends_with('-') {
-        name.pop();
-    }
-    name
-}
-
 fn validate_appx_patterns(patterns: &[String]) -> Result<()> {
     if patterns.iter().all(|pattern| {
         !pattern.is_empty()
@@ -925,18 +890,6 @@ fn validate_appx_patterns(patterns: &[String]) -> Result<()> {
         Err(LswError::InvalidValue {
             field: "AppX removal pattern",
             reason: "must contain only ASCII letters, digits, dot, dash, or underscore".to_owned(),
-        })
-    }
-}
-
-fn require_real_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(LswError::InvalidValue {
-            field: "instance directory",
-            reason: format!("{} is not a real directory", path.display()),
         })
     }
 }

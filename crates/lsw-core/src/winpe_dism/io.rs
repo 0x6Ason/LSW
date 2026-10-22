@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+pub(super) use crate::fs_checks::require_regular_file;
 use crate::{LswError, Result};
 
 pub(super) fn path_is_missing(path: &Path, field: &'static str) -> Result<bool> {
@@ -20,18 +21,6 @@ pub(super) fn path_is_missing(path: &Path, field: &'static str) -> Result<bool> 
         Ok(_) => Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
-    }
-}
-
-pub(super) fn require_regular_file(path: &Path, field: &'static str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(LswError::InvalidValue {
-            field,
-            reason: format!("{} is not a regular file", path.display()),
-        })
     }
 }
 

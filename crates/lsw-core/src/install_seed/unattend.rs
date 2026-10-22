@@ -158,7 +158,7 @@ fn base64_encode(input: &[u8]) -> String {
     output
 }
 
-pub(super) fn validate_locale(locale: &str) -> Result<()> {
+pub(crate) fn validate_locale(locale: &str) -> Result<()> {
     if (2..=20).contains(&locale.len())
         && locale
             .bytes()
@@ -174,7 +174,7 @@ pub(super) fn validate_locale(locale: &str) -> Result<()> {
     }
 }
 
-fn xml_escape(value: &str) -> String {
+pub(crate) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -183,7 +183,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn windows_computer_name(instance: &str) -> String {
+pub(crate) fn windows_computer_name(instance: &str) -> String {
     let mut name = format!("LSW-{}", instance.to_ascii_uppercase())
         .chars()
         .filter(|character| character.is_ascii_alphanumeric() || *character == '-')

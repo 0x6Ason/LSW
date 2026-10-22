@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 
 use super::io::{path_is_missing, require_regular_file};
 use super::{
-    require_real_directory, WinPeControlMediaPlan, WinPeDismBackend, WinPeDismVmPhase,
-    WinPeDismVmPlan, WINPE_WORKSPACE_SIZE_GIB,
+    WinPeControlMediaPlan, WinPeDismBackend, WinPeDismVmPhase, WinPeDismVmPlan,
+    WINPE_WORKSPACE_SIZE_GIB,
 };
+use crate::fs_checks::require_real_directory;
+use crate::qemu::{push_pair, qemu_path};
 use crate::{
     CommandInvocation, HostCapabilities, InstanceManifest, PreparationPlan, PreparationStep,
     QemuBackend, Result,
@@ -22,9 +24,12 @@ impl WinPeDismBackend {
         phase: WinPeDismVmPhase,
     ) -> Result<WinPeDismVmPlan> {
         manifest.spec.validate_for_create()?;
-        require_real_directory(instance_dir)?;
-        require_real_directory(&instance_dir.join("run"))?;
-        require_real_directory(&instance_dir.join(phase.seed_directory()))?;
+        require_real_directory(instance_dir, "instance directory")?;
+        require_real_directory(&instance_dir.join("run"), "runtime directory")?;
+        require_real_directory(
+            &instance_dir.join(phase.seed_directory()),
+            "WinPE seed directory",
+        )?;
 
         let backend = QemuBackend::select(&capabilities);
         let program = capabilities
@@ -311,17 +316,4 @@ fn plan_new_firmware_vars(
         require_regular_file(destination, "WinPE firmware variable store")?;
     }
     Ok(())
-}
-
-fn push_pair(
-    arguments: &mut Vec<OsString>,
-    option: impl Into<OsString>,
-    value: impl Into<OsString>,
-) {
-    arguments.push(option.into());
-    arguments.push(value.into());
-}
-
-fn qemu_path(path: &Path) -> String {
-    path.to_string_lossy().replace(',', ",,")
 }

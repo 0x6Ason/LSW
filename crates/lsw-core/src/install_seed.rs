@@ -12,9 +12,8 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 
 use self::guest_setup::{install_agent_script, seed_readme};
-use self::unattend::{
-    autounattend, generate_setup_account_password, unattend_password_value, validate_locale,
-};
+use self::unattend::{autounattend, generate_setup_account_password, unattend_password_value};
+pub(crate) use self::unattend::{validate_locale, windows_computer_name, xml_escape};
 use crate::profile_application::profile_script;
 use crate::{InstanceManifest, LswError, Result, AGENT_GUEST_PORT};
 

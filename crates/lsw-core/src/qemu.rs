@@ -554,7 +554,7 @@ fn display_command(program: &OsStr, arguments: &[OsString]) -> String {
         .join(" ")
 }
 
-fn push_pair(
+pub(crate) fn push_pair(
     arguments: &mut Vec<OsString>,
     option: impl Into<OsString>,
     value: impl Into<OsString>,
@@ -563,7 +563,8 @@ fn push_pair(
     arguments.push(value.into());
 }
 
-fn qemu_path(path: &Path) -> String {
+/// Escapes a path for a QEMU option value, where `,` is the separator.
+pub(crate) fn qemu_path(path: &Path) -> String {
     path.to_string_lossy().replace(',', ",,")
 }
 

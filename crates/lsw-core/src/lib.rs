@@ -6,6 +6,7 @@ mod backend;
 mod capabilities;
 mod customization;
 mod error;
+mod fs_checks;
 #[cfg(not(windows))]
 mod image;
 mod install_seed;
@@ -45,10 +46,10 @@ pub use iso_download::{
     ResolvedWindowsIso, SecretDownloadUrl,
 };
 pub use manifest::{
-    control_port_for_instance, validate_windows_user_name, FolderShare, FolderShareMode,
-    FolderShareTransport, IdlePolicy, InstanceManifest, InstanceSpec, InstanceState, NetworkMode,
-    PortForward, WindowsUserRole, AGENT_CONTROL_PORT_END_EXCLUSIVE, AGENT_CONTROL_PORT_START,
-    DEFAULT_HIBERNATE_TIMEOUT_SECONDS,
+    control_port_for_instance, validate_windows_user_name, windows_path_component_is_safe,
+    FolderShare, FolderShareMode, FolderShareTransport, IdlePolicy, InstanceManifest, InstanceSpec,
+    InstanceState, NetworkMode, PortForward, WindowsUserRole, AGENT_CONTROL_PORT_END_EXCLUSIVE,
+    AGENT_CONTROL_PORT_START, DEFAULT_HIBERNATE_TIMEOUT_SECONDS,
 };
 pub use pe::{
     PeAssessment, PeImage, PeImport, PeImportSymbol, PeKind, PeMachine, PeSection, PeSubsystem,
@@ -65,7 +66,7 @@ pub use samba::prepare_live_share_runtime;
 pub use scoped_credential::{
     derive_scoped_credential, DESKTOP_COMPANION_CREDENTIAL_SCOPE, LIVE_SHARE_CREDENTIAL_SCOPE,
 };
-pub use store::StateStore;
+pub use store::{default_state_root, StateStore};
 pub use windows_media::{WindowsEdition, WindowsMediaInspector};
 pub use winpe_dism::{
     WinPeDismApplyPlan, WinPeDismApplyStage, WinPeDismBackend, WinPeDismPlan, WinPeDismProgress,

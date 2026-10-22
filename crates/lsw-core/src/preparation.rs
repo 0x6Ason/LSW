@@ -9,6 +9,7 @@ use std::process::Command;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::fs_checks::require_regular_file;
 use crate::{HostCapabilities, InstanceManifest, LswError, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,18 +189,6 @@ fn require_directory(path: &Path, field: &'static str) -> Result<()> {
         Err(LswError::InvalidValue {
             field,
             reason: format!("{} is not a real directory", path.display()),
-        })
-    }
-}
-
-fn require_regular_file(path: &Path, field: &'static str) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(LswError::from)?;
-    if metadata.file_type().is_file() {
-        Ok(())
-    } else {
-        Err(LswError::InvalidValue {
-            field,
-            reason: format!("{} is not a regular file", path.display()),
         })
     }
 }
