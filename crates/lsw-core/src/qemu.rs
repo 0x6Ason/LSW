@@ -113,22 +113,86 @@ impl QemuPlanner {
         } else {
             manifest.spec.validate()?;
         }
-        let security = manifest.spec.profile.security();
         let program = self
             .capabilities
             .qemu_system
             .clone()
             .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64"))
             .into_os_string();
-        let mut arguments = Vec::new();
-        let mut helper_commands = Vec::new();
-        let mut notes = Vec::new();
 
-        push_pair(&mut arguments, "-name", manifest.spec.name.as_str());
-        push_pair(
-            &mut arguments,
+        // Argument order is part of the dry-run contract `lsw plan` prints,
+        // so each device group is added in the order it has always appeared.
+        let mut launch = LaunchArguments::new(self, manifest, instance_dir, phase);
+        launch.machine_and_cpu();
+        launch.firmware();
+        launch.system_disk();
+        let live_share = launch.network()?;
+        launch.input_and_platform_devices();
+        launch.boot_media();
+        launch.install_seed()?;
+        launch.identity_seed()?;
+        launch.vtpm();
+        launch.control_sockets();
+        launch.profile_notes();
+        let missing_capabilities = launch.missing_capabilities(live_share);
+
+        Ok(CommandPlan {
+            backend: self.backend,
+            program,
+            arguments: launch.arguments,
+            helper_commands: launch.helper_commands,
+            notes: launch.notes,
+            missing_capabilities,
+        })
+    }
+}
+
+/// Accumulates one QEMU invocation, one device group at a time.
+struct LaunchArguments<'a> {
+    planner: &'a QemuPlanner,
+    manifest: &'a InstanceManifest,
+    instance_dir: &'a Path,
+    phase: LaunchPhase,
+    security: crate::SecuritySettings,
+    arguments: Vec<OsString>,
+    helper_commands: Vec<CommandInvocation>,
+    notes: Vec<String>,
+}
+
+impl<'a> LaunchArguments<'a> {
+    fn new(
+        planner: &'a QemuPlanner,
+        manifest: &'a InstanceManifest,
+        instance_dir: &'a Path,
+        phase: LaunchPhase,
+    ) -> Self {
+        Self {
+            planner,
+            manifest,
+            instance_dir,
+            phase,
+            security: manifest.spec.profile.security(),
+            arguments: Vec::new(),
+            helper_commands: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, option: &str, value: impl Into<OsString>) {
+        push_pair(&mut self.arguments, option, value);
+    }
+
+    fn note(&mut self, note: impl Into<String>) {
+        self.notes.push(note.into());
+    }
+
+    /// Machine type, vCPU topology, memory, accelerator, CPU model, and RTC.
+    fn machine_and_cpu(&mut self) {
+        let backend = self.planner.backend;
+        self.push("-name", self.manifest.spec.name.as_str());
+        self.push(
             "-machine",
-            if security.secure_boot {
+            if self.security.secure_boot {
                 "q35,usb=on,smm=on"
             } else {
                 "q35,usb=on"
@@ -137,86 +201,66 @@ impl QemuPlanner {
         // Windows licenses a socket count (Home: 1, Pro: 2) and schedules per
         // core, so present every vCPU as a core of one socket instead of
         // leaving the topology to QEMU's version-dependent default.
-        push_pair(
-            &mut arguments,
-            "-smp",
-            format!(
-                "{cpus},sockets=1,cores={cpus},threads=1",
-                cpus = manifest.spec.cpus
-            ),
-        );
-        push_pair(
-            &mut arguments,
-            "-m",
-            format!("{}M", manifest.spec.memory_mib),
-        );
-
-        arguments.extend(
-            self.backend
-                .acceleration_arguments()
-                .iter()
-                .map(OsString::from),
-        );
-        push_pair(
-            &mut arguments,
-            "-cpu",
-            self.backend.cpu_model(self.cpu_tuning),
-        );
+        let cpus = self.manifest.spec.cpus;
+        self.push("-smp", format!("{cpus},sockets=1,cores={cpus},threads=1"));
+        self.push("-m", format!("{}M", self.manifest.spec.memory_mib));
+        self.arguments
+            .extend(backend.acceleration_arguments().iter().map(OsString::from));
+        self.push("-cpu", backend.cpu_model(self.planner.cpu_tuning));
         // The unattend installs Windows with a UTC clock; slew the emulated RTC
         // instead of letting it jump when the host is busy.
-        push_pair(&mut arguments, "-rtc", "base=utc,driftfix=slew");
-        if let Some(note) = self.backend.fallback_note() {
-            notes.push(note);
+        self.push("-rtc", "base=utc,driftfix=slew");
+        if let Some(note) = backend.fallback_note() {
+            self.note(note);
         }
-        if self.backend.accelerator() == crate::VmAccelerator::Kvm {
-            notes.push(match self.cpu_tuning {
+        if backend.accelerator() == crate::VmAccelerator::Kvm {
+            self.note(match self.planner.cpu_tuning {
                 GuestCpuTuning::Enlightened => {
                     "guest CPU: host passthrough with Hyper-V enlightenments; set LSW_GUEST_CPU_TUNING=baseline if QEMU rejects an hv-* feature"
-                        .to_owned()
                 }
                 GuestCpuTuning::Baseline => {
                     "guest CPU: baseline host passthrough without Hyper-V enlightenments"
-                        .to_owned()
                 }
             });
         }
+    }
 
+    /// OVMF code and the instance's private variable store.
+    fn firmware(&mut self) {
         let firmware_code = self
+            .planner
             .capabilities
-            .firmware_code(manifest.spec.profile)
+            .firmware_code(self.manifest.spec.profile)
             .cloned()
             .unwrap_or_else(|| PathBuf::from("/path/to/OVMF_CODE.fd"));
-        let firmware_vars = instance_dir.join("OVMF_VARS.fd");
-        push_pair(
-            &mut arguments,
+        let firmware_vars = self.instance_dir.join("OVMF_VARS.fd");
+        self.push(
             "-drive",
             format!(
                 "if=pflash,format=raw,readonly=on,file={}",
                 qemu_path(&firmware_code)
             ),
         );
-        push_pair(
-            &mut arguments,
+        self.push(
             "-drive",
             format!("if=pflash,format=raw,file={}", qemu_path(&firmware_vars)),
         );
-        if security.secure_boot {
-            push_pair(
-                &mut arguments,
-                "-global",
-                "driver=cfi.pflash01,property=secure,value=on",
-            );
+        if self.security.secure_boot {
+            self.push("-global", "driver=cfi.pflash01,property=secure,value=on");
         }
+    }
 
-        let disk = if phase == LaunchPhase::Run
-            && manifest.spec.profile == crate::WindowsProfile::Ephemeral
+    /// The persistent system disk, or the per-run overlay of an ephemeral
+    /// instance, behind the Windows-inbox NVMe driver.
+    fn system_disk(&mut self) {
+        let disk = if self.phase == LaunchPhase::Run
+            && self.manifest.spec.profile == crate::WindowsProfile::Ephemeral
         {
-            instance_dir.join("run/ephemeral.qcow2")
+            self.instance_dir.join("run/ephemeral.qcow2")
         } else {
-            instance_dir.join("disk.qcow2")
+            self.instance_dir.join("disk.qcow2")
         };
-        push_pair(
-            &mut arguments,
+        self.push(
             "-drive",
             format!(
                 "file={},if=none,id=system,format=qcow2,discard=unmap,detect-zeroes=unmap",
@@ -225,28 +269,29 @@ impl QemuPlanner {
         );
         // NVMe and e1000e are recognized by stock Windows installation media.
         // VirtIO can be selected later after its signed guest drivers are present.
-        push_pair(
-            &mut arguments,
-            "-device",
-            "nvme,drive=system,serial=lsw-system",
-        );
-        let mut network = match manifest.spec.network {
-            NetworkMode::Nat => format!(
-                "user,id=net0,restrict=off,hostfwd=tcp:127.0.0.1:{}-:{}",
-                manifest.control_port, AGENT_GUEST_PORT
-            ),
-            NetworkMode::Offline => format!(
-                "user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:{}-:{}",
-                manifest.control_port, AGENT_GUEST_PORT
-            ),
+        self.push("-device", "nvme,drive=system,serial=lsw-system");
+    }
+
+    /// User-mode NAT with the loopback agent forward, published ports, and
+    /// the private SMB export of a live folder share. Returns whether a live
+    /// share is attached.
+    fn network(&mut self) -> Result<bool> {
+        let manifest = self.manifest;
+        let restrict = match manifest.spec.network {
+            NetworkMode::Nat => "off",
+            NetworkMode::Offline => "on",
         };
+        let mut network = format!(
+            "user,id=net0,restrict={restrict},hostfwd=tcp:127.0.0.1:{}-:{}",
+            manifest.control_port, AGENT_GUEST_PORT
+        );
         for forward in &manifest.spec.port_forwards {
             network.push_str(&format!(
                 ",hostfwd=tcp:127.0.0.1:{}-:{}",
                 forward.host_port, forward.guest_port
             ));
         }
-        let live_share = if phase == LaunchPhase::Run {
+        let live_share = if self.phase == LaunchPhase::Run {
             manifest
                 .folder_shares
                 .iter()
@@ -257,252 +302,259 @@ impl QemuPlanner {
         if let Some(share) = live_share {
             let root = canonical_live_share_root(&share.host_path)?;
             let smbd = self
+                .planner
                 .capabilities
                 .smbd
                 .as_deref()
                 .unwrap_or_else(|| Path::new("smbd"));
-            let command = live_smb_guest_forward_command(smbd, instance_dir);
+            let command = live_smb_guest_forward_command(smbd, self.instance_dir);
             for port in [139, 445] {
                 network.push_str(&format!(
                     ",guestfwd=tcp:10.0.2.4:{port}-cmd:{}",
                     qemu_option_text(&command)
                 ));
             }
-            notes.push(format!(
+            self.note(format!(
                 "live folder {:?}: private authenticated QEMU SMB exports {} read-write at \\\\10.0.2.4\\qemu",
                 share.name,
                 root.display()
             ));
         }
-        push_pair(&mut arguments, "-netdev", network);
-        push_pair(&mut arguments, "-device", "e1000e,netdev=net0");
-        notes.push(match manifest.spec.network {
+        self.push("-netdev", network);
+        self.push("-device", "e1000e,netdev=net0");
+        self.note(match manifest.spec.network {
             NetworkMode::Nat if manifest.spec.port_forwards.is_empty() => {
                 "network policy: user-mode NAT permits guest egress and exposes only the agent port on host loopback"
-                    .to_owned()
             }
             NetworkMode::Nat => {
                 "network policy: user-mode NAT permits guest egress; the agent and explicitly published TCP ports bind only to host loopback"
-                    .to_owned()
             }
             NetworkMode::Offline => {
                 "network policy: offline blocks guest egress while retaining the host-only agent forward"
-                    .to_owned()
             }
         });
         for forward in &manifest.spec.port_forwards {
-            notes.push(format!(
+            self.note(format!(
                 "published TCP port: 127.0.0.1:{} forwards to guest port {}",
                 forward.host_port, forward.guest_port
             ));
         }
-        push_pair(&mut arguments, "-device", "qemu-xhci");
-        push_pair(&mut arguments, "-device", "usb-kbd");
-        push_pair(&mut arguments, "-device", "usb-tablet");
-        push_pair(&mut arguments, "-device", "virtio-rng-pci");
-        push_pair(&mut arguments, "-device", "virtio-balloon-pci,id=balloon0");
-        // -nodefaults removes QEMU's implicit display adapter. Standard VGA is
-        // available to Windows Setup without an additional guest driver.
-        push_pair(&mut arguments, "-device", "VGA");
+        Ok(live_share.is_some())
+    }
 
-        if phase == LaunchPhase::Install {
-            push_pair(
-                &mut arguments,
+    /// USB input, entropy, balloon, and the driverless display adapter.
+    fn input_and_platform_devices(&mut self) {
+        for device in [
+            "qemu-xhci",
+            "usb-kbd",
+            "usb-tablet",
+            "virtio-rng-pci",
+            "virtio-balloon-pci,id=balloon0",
+            // -nodefaults removes QEMU's implicit display adapter. Standard VGA
+            // is available to Windows Setup without an additional guest driver.
+            "VGA",
+        ] {
+            self.push("-device", device);
+        }
+    }
+
+    /// The installer ISO on first boot only; the system disk afterwards.
+    fn boot_media(&mut self) {
+        if self.phase == LaunchPhase::Install {
+            self.push(
                 "-drive",
                 format!(
                     "media=cdrom,readonly=on,file={}",
-                    qemu_path(&manifest.spec.source_iso)
+                    qemu_path(&self.manifest.spec.source_iso)
                 ),
             );
             // Boot the installer only once. Rebooting an unattended guest back
             // into the ISO could otherwise wipe and reinstall its virtual disk.
-            push_pair(&mut arguments, "-boot", "once=d,menu=on");
+            self.push("-boot", "once=d,menu=on");
         } else {
-            push_pair(&mut arguments, "-boot", "order=c,menu=on");
+            self.push("-boot", "order=c,menu=on");
         }
+    }
 
-        let seed = instance_dir.join("seed");
-        match (phase, fs::symlink_metadata(&seed)) {
-            (LaunchPhase::Install, Ok(metadata))
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
-            {
-                push_pair(
-                    &mut arguments,
-                    "-drive",
-                    format!(
-                        "file=fat:ro:{},format=raw,if=none,id=lsw-seed,snapshot=on",
-                        qemu_path(&seed)
-                    ),
-                );
-                push_pair(
-                    &mut arguments,
-                    "-device",
-                    "usb-storage,drive=lsw-seed,removable=on",
-                );
-                notes.push(
-                    "the local installation seed is attached read-only as removable media"
-                        .to_owned(),
-                );
-            }
-            (LaunchPhase::Install, Ok(_)) => {
-                return Err(crate::LswError::InvalidValue {
-                    field: "install seed",
-                    reason: format!("{} must be a real directory", seed.display()),
-                })
-            }
-            (LaunchPhase::Install, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
-            (LaunchPhase::Install, Err(error)) => return Err(error.into()),
-            (LaunchPhase::Run, _) => {}
+    /// The transient installation payload, attached read-only as removable
+    /// USB media during the install phase.
+    fn install_seed(&mut self) -> Result<()> {
+        if self.phase != LaunchPhase::Install {
+            return Ok(());
         }
-
-        let identity_seed = instance_dir.join("identity-seed");
-        match (phase, fs::symlink_metadata(&identity_seed)) {
-            (LaunchPhase::Run, Ok(metadata))
-                if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
-            {
-                push_pair(
-                    &mut arguments,
-                    "-drive",
-                    format!(
-                        "file=fat:ro:{},format=raw,if=none,id=lsw-identity,snapshot=on",
-                        qemu_path(&identity_seed)
-                    ),
-                );
-                push_pair(&mut arguments, "-device", "ide-hd,drive=lsw-identity");
-                notes.push(
-                    "the boot identity uses an inbox IDE path, is attached read-only, and is consumed by the guest agent"
-                        .to_owned(),
-                );
-            }
-            (LaunchPhase::Run, Ok(_)) => {
-                return Err(crate::LswError::InvalidValue {
-                    field: "boot identity seed",
-                    reason: format!("{} must be a real directory", identity_seed.display()),
-                })
-            }
-            (_, Err(error)) if error.kind() == io::ErrorKind::NotFound => {}
-            (_, Err(error)) => return Err(error.into()),
-            (LaunchPhase::Install, Ok(_)) => {}
+        let seed = self.instance_dir.join("seed");
+        if !real_directory_exists(&seed, "install seed")? {
+            return Ok(());
         }
+        self.push(
+            "-drive",
+            format!(
+                "file=fat:ro:{},format=raw,if=none,id=lsw-seed,snapshot=on",
+                qemu_path(&seed)
+            ),
+        );
+        self.push("-device", "usb-storage,drive=lsw-seed,removable=on");
+        self.note("the local installation seed is attached read-only as removable media");
+        Ok(())
+    }
 
-        if security.vtpm {
-            let socket = instance_dir.join("run/swtpm.sock");
-            let swtpm_program = self
-                .capabilities
-                .swtpm
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("swtpm"));
-            helper_commands.push(CommandInvocation {
-                program: swtpm_program.into_os_string(),
-                arguments: vec![
-                    "socket".into(),
-                    "--tpm2".into(),
-                    "--tpmstate".into(),
-                    format!("dir={}", instance_dir.join("swtpm-state").display()).into(),
-                    "--ctrl".into(),
-                    format!("type=unixio,path={}", socket.display()).into(),
-                    "--log".into(),
-                    format!("file={}", instance_dir.join("swtpm.log").display()).into(),
-                    "--terminate".into(),
-                ],
-            });
-            push_pair(
-                &mut arguments,
-                "-chardev",
-                format!("socket,id=chrtpm,path={}", qemu_path(&socket)),
-            );
-            push_pair(&mut arguments, "-tpmdev", "emulator,id=tpm0,chardev=chrtpm");
-            push_pair(&mut arguments, "-device", "tpm-tis,tpmdev=tpm0");
+    /// The clone identity volume a running guest's agent consumes, attached
+    /// on the inbox IDE path during the run phase.
+    fn identity_seed(&mut self) -> Result<()> {
+        let identity_seed = self.instance_dir.join("identity-seed");
+        if self.phase != LaunchPhase::Run {
+            // The install phase never attaches it; only an unreadable path is
+            // worth reporting there.
+            match fs::symlink_metadata(&identity_seed) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return Ok(());
         }
+        if !real_directory_exists(&identity_seed, "boot identity seed")? {
+            return Ok(());
+        }
+        self.push(
+            "-drive",
+            format!(
+                "file=fat:ro:{},format=raw,if=none,id=lsw-identity,snapshot=on",
+                qemu_path(&identity_seed)
+            ),
+        );
+        self.push("-device", "ide-hd,drive=lsw-identity");
+        self.note(
+            "the boot identity uses an inbox IDE path, is attached read-only, and is consumed by the guest agent",
+        );
+        Ok(())
+    }
 
-        let qmp_socket = instance_dir.join("run/qmp.sock");
-        push_pair(
-            &mut arguments,
+    /// The swtpm helper and the TPM device bound to its socket.
+    fn vtpm(&mut self) {
+        if !self.security.vtpm {
+            return;
+        }
+        let socket = self.instance_dir.join("run/swtpm.sock");
+        let swtpm_program = self
+            .planner
+            .capabilities
+            .swtpm
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("swtpm"));
+        self.helper_commands.push(CommandInvocation {
+            program: swtpm_program.into_os_string(),
+            arguments: vec![
+                "socket".into(),
+                "--tpm2".into(),
+                "--tpmstate".into(),
+                format!("dir={}", self.instance_dir.join("swtpm-state").display()).into(),
+                "--ctrl".into(),
+                format!("type=unixio,path={}", socket.display()).into(),
+                "--log".into(),
+                format!("file={}", self.instance_dir.join("swtpm.log").display()).into(),
+                "--terminate".into(),
+            ],
+        });
+        self.push(
+            "-chardev",
+            format!("socket,id=chrtpm,path={}", qemu_path(&socket)),
+        );
+        self.push("-tpmdev", "emulator,id=tpm0,chardev=chrtpm");
+        self.push("-device", "tpm-tis,tpmdev=tpm0");
+    }
+
+    /// QMP, the PID file, no default devices, and the private recovery VNC.
+    fn control_sockets(&mut self) {
+        let qmp_socket = self.instance_dir.join("run/qmp.sock");
+        self.push(
             "-qmp",
             format!("unix:{},server=on,wait=off", qemu_path(&qmp_socket)),
         );
-        push_pair(
-            &mut arguments,
+        self.push(
             "-pidfile",
-            instance_dir.join("run/qemu.pid").as_os_str(),
+            self.instance_dir.join("run/qemu.pid").as_os_str(),
         );
-        arguments.push("-nodefaults".into());
-        push_pair(&mut arguments, "-monitor", "none");
-        push_pair(&mut arguments, "-display", "none");
-        push_pair(&mut arguments, "-serial", "none");
-        push_pair(
-            &mut arguments,
+        self.arguments.push("-nodefaults".into());
+        self.push("-monitor", "none");
+        self.push("-display", "none");
+        self.push("-serial", "none");
+        self.push(
             "-vnc",
             format!(
                 "unix:{}",
-                qemu_path(&instance_dir.join("run/recovery-vnc.sock"))
+                qemu_path(&self.instance_dir.join("run/recovery-vnc.sock"))
             ),
         );
+    }
 
-        if security.secure_boot {
-            notes.push(
-                "secure profile: prepare an OVMF variable store enrolled with production keys"
-                    .to_owned(),
+    fn profile_notes(&mut self) {
+        if self.security.secure_boot {
+            self.note(
+                "secure profile: prepare an OVMF variable store enrolled with production keys",
             );
-            notes.push("secure profile uses the driverless Windows capture path".to_owned());
+            self.note("secure profile uses the driverless Windows capture path");
         } else {
-            notes.push(
-                "seamless profile: guest Secure Boot is disabled; host Secure Boot is unchanged"
-                    .to_owned(),
+            self.note(
+                "seamless profile: guest Secure Boot is disabled; host Secure Boot is unchanged",
             );
-            notes.push(
-                "test-signed guest drivers are optional; the initial capture path remains driverless"
-                    .to_owned(),
-            );
+            self.note("test-signed guest drivers are optional; the initial capture path remains driverless");
         }
-        notes.push(
-            "the VNC Unix socket is reserved for installation and recovery; it is not the seamless application transport"
-                .to_owned(),
-        );
-        notes.push("start each helper command before starting QEMU".to_owned());
-        if manifest.spec.profile == crate::WindowsProfile::Ephemeral {
-            notes.push(
-                "ephemeral profile preserves the base disk and discards its per-run overlay when the guest stops"
-                    .to_owned(),
-            );
+        self.note("the VNC Unix socket is reserved for installation and recovery; it is not the seamless application transport");
+        self.note("start each helper command before starting QEMU");
+        if self.manifest.spec.profile == crate::WindowsProfile::Ephemeral {
+            self.note("ephemeral profile preserves the base disk and discards its per-run overlay when the guest stops");
         }
+    }
 
-        let mut missing_capabilities = self
+    /// Host tools and prepared instance files the launch still needs.
+    fn missing_capabilities(&mut self, live_share: bool) -> Vec<&'static str> {
+        let mut missing = self
+            .planner
             .capabilities
-            .missing_for_profile_launch(manifest.spec.profile);
-        if live_share.is_some() && self.capabilities.smbd.is_none() {
-            missing_capabilities.push("smbd (Samba user-mode server)");
+            .missing_for_profile_launch(self.manifest.spec.profile);
+        if live_share && self.planner.capabilities.smbd.is_none() {
+            missing.push("smbd (Samba user-mode server)");
         }
-        if !instance_dir.join("disk.qcow2").is_file() {
-            missing_capabilities.push("prepared system disk");
+        if !self.instance_dir.join("disk.qcow2").is_file() {
+            missing.push("prepared system disk");
         }
-        if phase == LaunchPhase::Run
-            && manifest.spec.profile == crate::WindowsProfile::Ephemeral
-            && !instance_dir.join("run/ephemeral.qcow2").is_file()
+        if self.phase == LaunchPhase::Run
+            && self.manifest.spec.profile == crate::WindowsProfile::Ephemeral
+            && !self.instance_dir.join("run/ephemeral.qcow2").is_file()
         {
-            missing_capabilities.push("prepared ephemeral overlay");
+            missing.push("prepared ephemeral overlay");
         }
-        if !instance_dir.join("OVMF_VARS.fd").is_file() {
-            missing_capabilities.push("prepared OVMF variable store");
+        if !self.instance_dir.join("OVMF_VARS.fd").is_file() {
+            missing.push("prepared OVMF variable store");
         }
-        if !instance_dir.join("run").is_dir() || !instance_dir.join("swtpm-state").is_dir() {
-            missing_capabilities.push("prepared runtime directories");
+        if !self.instance_dir.join("run").is_dir()
+            || !self.instance_dir.join("swtpm-state").is_dir()
+        {
+            missing.push("prepared runtime directories");
         }
-        if missing_capabilities
+        if missing
             .iter()
             .any(|missing| missing.starts_with("prepared "))
         {
-            notes.push("run `lsw prepare NAME --execute` before launching the guest".to_owned());
+            self.note("run `lsw prepare NAME --execute` before launching the guest");
         }
+        missing
+    }
+}
 
-        Ok(CommandPlan {
-            backend: self.backend,
-            program,
-            arguments,
-            helper_commands,
-            notes,
-            missing_capabilities,
-        })
+/// Whether `path` is a real directory; a missing path is `false`, and a
+/// symlink or non-directory is an error naming `field`.
+fn real_directory_exists(path: &Path, field: &'static str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(true)
+        }
+        Ok(_) => Err(crate::LswError::InvalidValue {
+            field,
+            reason: format!("{} must be a real directory", path.display()),
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -584,229 +636,4 @@ fn shell_quote(value: &OsStr) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::{
-        FolderShare, FolderShareMode, FolderShareTransport, InstanceSpec, NetworkMode,
-        WindowsProfile,
-    };
-
-    use super::*;
-
-    fn test_manifest(profile: WindowsProfile) -> (InstanceManifest, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock must be valid")
-            .as_nanos();
-        let iso = std::env::temp_dir().join(format!("lsw-qemu-test-{nonce}.iso"));
-        fs::write(&iso, b"test media").expect("temporary ISO should be writable");
-        let manifest = InstanceManifest::new(InstanceSpec {
-            name: "win-dev".to_owned(),
-            source_iso: iso.clone(),
-            profile,
-            cpus: 4,
-            memory_mib: 8192,
-            disk_gib: 64,
-            network: NetworkMode::Offline,
-            port_forwards: Vec::new(),
-            license_accepted: true,
-            allow_unsupported_requirements: false,
-        })
-        .expect("manifest should be valid");
-        (manifest, iso)
-    }
-
-    fn headless_capabilities() -> HostCapabilities {
-        HostCapabilities::unavailable(crate::HostPlatform::Linux)
-    }
-
-    #[test]
-    fn planner_uses_windows_inbox_install_devices() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        let planner = QemuPlanner::new(headless_capabilities());
-        let plan = planner
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Install)
-            .expect("plan should be built");
-        let command = plan.display_command();
-        assert!(command.contains("nvme,drive=system"));
-        assert!(command.contains("discard=unmap,detect-zeroes=unmap"));
-        assert!(command.contains("virtio-balloon-pci,id=balloon0"));
-        assert!(command.contains("e1000e,netdev=net0"));
-        assert!(command.contains("-device VGA"));
-        assert!(command.contains("-boot once=d,menu=on"));
-        assert!(command.contains("-accel tcg,thread=multi"));
-        assert_eq!(plan.backend.accelerator(), crate::VmAccelerator::Tcg);
-        assert!(command.contains("restrict=on"));
-        assert_eq!(plan.helper_commands.len(), 1);
-        assert!(plan.helper_commands[0]
-            .display_command()
-            .contains("swtpm socket --tpm2"));
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn planner_uses_an_explicit_validated_accelerator_selection() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        let mut capabilities = headless_capabilities();
-        capabilities.accelerators =
-            crate::AcceleratorCapabilities::none().with_available(crate::VmAccelerator::Kvm);
-        let backend = QemuBackend::require(&capabilities, crate::VmAccelerator::Kvm)
-            .expect("advertised KVM should be selectable");
-        let planner = QemuPlanner::with_backend(capabilities, backend)
-            .expect("the backend should match its capabilities");
-        let plan = planner
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("plan should be built");
-        assert_eq!(planner.backend(), backend);
-        assert_eq!(plan.backend, backend);
-        let command = plan.display_command();
-        assert!(command.contains("-enable-kvm -cpu host,migratable=off,hv-relaxed,"));
-        assert!(command.contains(",hv-stimer-direct,"));
-        assert!(!command.contains("-accel tcg"));
-        assert!(plan
-            .notes
-            .iter()
-            .any(|note| note.contains("Hyper-V enlightenments")));
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn baseline_cpu_tuning_keeps_plain_host_passthrough() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        let mut capabilities = headless_capabilities();
-        capabilities.accelerators =
-            crate::AcceleratorCapabilities::none().with_available(crate::VmAccelerator::Kvm);
-        let planner =
-            QemuPlanner::new(capabilities).with_cpu_tuning(crate::GuestCpuTuning::Baseline);
-        assert_eq!(planner.cpu_tuning(), crate::GuestCpuTuning::Baseline);
-        let plan = planner
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("plan should be built");
-        let command = plan.display_command();
-        assert!(command.contains("-enable-kvm -cpu host -rtc"));
-        assert!(!command.contains("hv-"));
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn planner_presents_vcpus_as_cores_of_one_socket() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        let plan = QemuPlanner::new(headless_capabilities())
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("plan should be built");
-        let command = plan.display_command();
-        assert!(command.contains("-smp 4,sockets=1,cores=4,threads=1"));
-        assert!(command.contains("-rtc base=utc,driftfix=slew"));
-        // TCG never advertises Hyper-V features it cannot accelerate.
-        assert!(command.contains("-accel tcg,thread=multi -cpu max"));
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn run_identity_uses_the_windows_inbox_ide_path() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock must be valid")
-            .as_nanos();
-        let instance_dir = std::env::temp_dir().join(format!("lsw-qemu-identity-{nonce}"));
-        fs::create_dir_all(instance_dir.join("identity-seed"))
-            .expect("identity directory should be created");
-        let plan = QemuPlanner::new(headless_capabilities())
-            .plan(&manifest, &instance_dir, LaunchPhase::Run)
-            .expect("plan should be built");
-        let command = plan.display_command();
-        assert!(command.contains("id=lsw-identity,snapshot=on"));
-        assert!(command.contains("-device ide-hd,drive=lsw-identity"));
-        assert!(!command.contains("usb-storage,drive=lsw-identity"));
-        fs::remove_dir_all(instance_dir).expect("temporary instance should be removable");
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn secure_profile_does_not_claim_test_driver_support() {
-        let (manifest, iso) = test_manifest(WindowsProfile::Secure);
-        let planner = QemuPlanner::new(headless_capabilities());
-        let plan = planner
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("plan should be built");
-        assert!(plan.notes.iter().any(|note| note.contains("driverless")));
-        assert!(!plan
-            .notes
-            .iter()
-            .any(|note| note.contains("test-signed guest")));
-        let command = plan.display_command();
-        assert!(command.contains("smm=on"));
-        assert!(command.contains("cfi.pflash01,property=secure,value=on"));
-        assert!(plan
-            .missing_capabilities
-            .contains(&"Secure Boot OVMF code firmware"));
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn nat_network_publishes_requested_tcp_ports_on_loopback() {
-        let (mut manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        manifest.spec.network = NetworkMode::Nat;
-        manifest.spec.port_forwards = vec![
-            crate::PortForward::new(8080, 80).expect("ports should be valid"),
-            crate::PortForward::new(8443, 443).expect("ports should be valid"),
-        ];
-        let plan = QemuPlanner::new(headless_capabilities())
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("plan should be built");
-        let command = plan.display_command();
-        assert!(command.contains("hostfwd=tcp:127.0.0.1:8080-:80"));
-        assert!(command.contains("hostfwd=tcp:127.0.0.1:8443-:443"));
-        assert!(!command.contains("0.0.0.0:8080"));
-        assert!(plan
-            .notes
-            .iter()
-            .any(|note| note.contains("127.0.0.1:8080")));
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-
-    #[test]
-    fn live_share_uses_only_the_approved_qemu_smb_root() {
-        let (mut manifest, iso) = test_manifest(WindowsProfile::Vanilla);
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock must be valid")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("lsw-live-share-{nonce},root"));
-        fs::create_dir(&root).expect("share root should be created");
-        manifest.folder_shares.push(FolderShare {
-            name: "linux".to_owned(),
-            host_path: root.clone(),
-            guest_path: "L:\\".to_owned(),
-            mode: FolderShareMode::ReadWrite,
-            transport: FolderShareTransport::LiveSmb,
-        });
-        let mut capabilities = headless_capabilities();
-        capabilities.smbd = Some(PathBuf::from("/usr/sbin/smbd"));
-        let plan = QemuPlanner::new(capabilities)
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("live-share plan should be built");
-        let command = plan.display_command();
-        assert!(command.contains("guestfwd=tcp:10.0.2.4:139-cmd:"));
-        assert!(command.contains("guestfwd=tcp:10.0.2.4:445-cmd:"));
-        assert!(command.contains("/state/win-dev/run/live-smb/smb.conf"));
-        assert!(!command.contains(",smb="));
-        assert!(plan.notes.iter().any(|note| {
-            note.contains("private authenticated QEMU SMB") && note.contains("root")
-        }));
-        assert!(!plan
-            .missing_capabilities
-            .contains(&"smbd (Samba user-mode server)"));
-        let blocked = QemuPlanner::new(headless_capabilities())
-            .plan(&manifest, Path::new("/state/win-dev"), LaunchPhase::Run)
-            .expect("missing smbd should be reported in the plan");
-        assert!(blocked
-            .missing_capabilities
-            .contains(&"smbd (Samba user-mode server)"));
-        fs::remove_dir(root).expect("share root should be removable");
-        fs::remove_file(iso).expect("temporary ISO should be removable");
-    }
-}
+mod tests;

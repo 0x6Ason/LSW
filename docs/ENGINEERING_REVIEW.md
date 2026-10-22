@@ -100,12 +100,11 @@ last, a real `systemd --user` session:
    and `lswg` still need per-crate error enums (`thiserror` is acceptable;
    the hand-written `LswError` style also works).
 4. **Break up the giant functions.** `install_seed/guest_setup.rs` (363
-   lines), `QemuPlanner::plan` (now ~370), `lswg/presenter/mod.rs:53` (304),
-   `winpe_dism/vm.rs:18` (263), `presenter/wslg.rs:67` (205),
-   `lsw-agent/requests.rs:5` (171). `plan()` in particular should become a
-   builder with one method per device group, and its tests should assert on
-   the `arguments` vector rather than on substrings of the rendered command
-   line.
+   lines), `lswg/presenter/mod.rs:53` (304), `winpe_dism/vm.rs:18` (263),
+   `presenter/wslg.rs:67` (205), `lsw-agent/requests.rs:5` (171).
+   `QemuPlanner::plan` is done: `LaunchArguments` adds one device group per
+   method and `qemu/tests.rs` asserts on the argument vector; use it as the
+   pattern for the others.
 5. **Use the `windows` crate instead of hand-typed FFI.** The agent pulls
    `windows` 0.54 with 29 features and still declares its own
    `extern "system"` bindings and constants in twelve modules (registry, SCM,

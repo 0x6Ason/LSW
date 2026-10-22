@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Split the 370-line `QemuPlanner::plan` into a `LaunchArguments` builder
+  with one method per device group (machine and CPU, firmware, system disk,
+  network, platform devices, boot media, seeds, vTPM, control sockets) and
+  moved its tests to `qemu/tests.rs`, where they now assert on the argument
+  vector and option order instead of substrings of the rendered command.
+  The generated command line is unchanged.
 - Replaced the daemon's `KEY=VALUE` line protocol with typed requests and
   replies. `lsw-core::daemon_protocol` defines `DaemonRequest`,
   `DaemonResponse`, and the JSON `DaemonReply` envelope; `lswd` dispatches on
