@@ -5,6 +5,7 @@
 mod backend;
 mod capabilities;
 mod customization;
+mod daemon_protocol;
 mod error;
 mod fs_checks;
 #[cfg(not(windows))]
@@ -33,6 +34,12 @@ pub use capabilities::HostCapabilities;
 pub use customization::{
     AppxRemoval, CustomizationPlan, ProductUninstaller, RegistryHive, RegistryPolicy,
     ServicePolicy, ServiceStartup, PROFILE_MANIFEST_VERSION,
+};
+pub use daemon_protocol::{
+    read_daemon_reply, read_daemon_request, write_daemon_reply, write_daemon_request, DaemonInfo,
+    DaemonReply, DaemonRequest, DaemonResponse, InstanceStatus, InstanceSummary, LaunchPlanSummary,
+    Liveness, StartedInstance, DAEMON_PROTOCOL_VERSION, MAX_DAEMON_REPLY_BYTES,
+    MAX_DAEMON_REQUEST_BYTES,
 };
 pub use error::{LswError, Result};
 #[cfg(not(windows))]
@@ -72,5 +79,4 @@ pub use winpe_dism::{
 };
 
 pub const AGENT_TOKEN_FILE: &str = "agent.token";
-pub const DAEMON_PROTOCOL_VERSION: u16 = 2;
 pub const MANIFEST_FILE: &str = "instance.lsw";

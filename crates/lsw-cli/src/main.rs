@@ -42,10 +42,10 @@ use arguments::{
 use installation::{find_windows_agent, install_instance};
 use license::{license, show_activation_notice_once};
 use lsw_core::{
-    FolderShareTransport, HostCapabilities, IdlePolicy, ImageManager, InstallSeedBuilder,
-    InstallSeedOptions, InstanceManifest, InstanceSpec, InstanceState, LaunchPhase, LswError,
-    MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage, PeImportSymbol, Provisioner, QemuBackend,
-    QemuPlanner, StateStore, VmAccelerator,
+    DaemonRequest, DaemonResponse, FolderShareTransport, HostCapabilities, IdlePolicy,
+    ImageManager, InstallSeedBuilder, InstallSeedOptions, InstanceManifest, InstanceSpec,
+    InstanceState, LaunchPhase, LswError, MicrosoftIsoRequest, MicrosoftIsoResolver, PeImage,
+    PeImportSymbol, Provisioner, QemuBackend, QemuPlanner, StateStore, VmAccelerator,
 };
 use lsw_host::{agent_address, AgentClient, DaemonClient};
 use lsw_protocol::{GuiStartRequest, ProcessEnvironment, SessionKind, StartRequest};

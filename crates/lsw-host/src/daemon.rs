@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::env;
+use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -10,11 +11,74 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lsw_core::{StateStore, DAEMON_PROTOCOL_VERSION};
+use lsw_core::{
+    read_daemon_reply, write_daemon_request, DaemonInfo, DaemonReply, DaemonRequest,
+    DaemonResponse, InstanceStatus, LaunchPhase, LswError, StateStore, DAEMON_PROTOCOL_VERSION,
+};
 
-const RESPONSE_LIMIT: u64 = 2 * 1024 * 1024;
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a daemon request did not produce a response.
+#[derive(Debug)]
+pub enum DaemonError {
+    /// The socket could not be reached or the connection failed mid-request.
+    Io(io::Error),
+    /// The daemon answered with something that is not a well-formed reply.
+    Protocol(String),
+    /// The daemon understood the request and refused it.
+    Rejected(String),
+    /// A daemon is listening but speaks another protocol version.
+    Incompatible { socket: PathBuf, daemon: u16 },
+    /// `lswd` could not be started on demand.
+    Startup(String),
+    /// The daemon answered a different request kind than the one sent.
+    UnexpectedResponse(DaemonResponse),
+}
+
+impl fmt::Display for DaemonError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "lswd connection failed: {error}"),
+            Self::Protocol(reason) => write!(formatter, "lswd protocol error: {reason}"),
+            Self::Rejected(reason) => formatter.write_str(reason),
+            Self::Incompatible { socket, daemon } => write!(
+                formatter,
+                "lswd at {} speaks daemon protocol {daemon} but this lsw needs {DAEMON_PROTOCOL_VERSION}; \
+                 stop it with `lsw shutdown` and `lsw daemon disable`, or wait for it to exit idle",
+                socket.display()
+            ),
+            Self::Startup(reason) => formatter.write_str(reason),
+            Self::UnexpectedResponse(response) => {
+                write!(formatter, "lswd answered with an unexpected response: {response:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DaemonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for DaemonError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<LswError> for DaemonError {
+    fn from(error: LswError) -> Self {
+        match error {
+            LswError::Io(error) => Self::Io(error),
+            other => Self::Protocol(other.to_string()),
+        }
+    }
+}
 
 pub struct DaemonClient<'a> {
     store: &'a StateStore,
@@ -29,21 +93,19 @@ impl<'a> DaemonClient<'a> {
         Self { store, socket }
     }
 
-    pub fn ensure_running(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self
-            .request("PING")
-            .map(|lines| daemon_protocol_matches(&lines))
-            .unwrap_or(false)
-        {
-            return Ok(());
+    /// Starts `lswd` on demand unless a compatible daemon already answers.
+    pub fn ensure_running(&self) -> Result<(), DaemonError> {
+        match self.ping() {
+            Ok(_) => return Ok(()),
+            Err(error @ DaemonError::Incompatible { .. }) => return Err(error),
+            Err(_) => {}
         }
 
         self.store.initialize()?;
         let default_socket = env::var_os("LSW_DAEMON_SOCKET").is_none();
-        let run_directory = self
-            .socket
-            .parent()
-            .ok_or("daemon socket path has no parent directory")?;
+        let run_directory = self.socket.parent().ok_or_else(|| {
+            DaemonError::Startup("daemon socket path has no parent directory".to_owned())
+        })?;
         if !run_directory.exists() {
             fs::create_dir_all(run_directory)?;
             fs::set_permissions(run_directory, fs::Permissions::from_mode(0o700))?;
@@ -58,7 +120,7 @@ impl<'a> DaemonClient<'a> {
             .mode(0o600)
             .open(&log_path)?;
         let stderr = stdout.try_clone()?;
-        let daemon = daemon_program()?;
+        let daemon = daemon_program();
         let mut command = Command::new("setsid");
         command
             .arg(daemon)
@@ -73,82 +135,115 @@ impl<'a> DaemonClient<'a> {
 
         let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         loop {
-            if self
-                .request("PING")
-                .map(|lines| daemon_protocol_matches(&lines))
-                .unwrap_or(false)
-            {
-                return Ok(());
+            match self.ping() {
+                Ok(_) => return Ok(()),
+                Err(error @ DaemonError::Incompatible { .. }) => return Err(error),
+                Err(_) => {}
             }
             if let Some(status) = child.try_wait()? {
-                return Err(format!(
+                return Err(DaemonError::Startup(format!(
                     "lswd exited during startup with {status}; inspect {}",
                     log_path.display()
-                )
-                .into());
+                )));
             }
             if Instant::now() >= deadline {
-                return Err(format!(
+                return Err(DaemonError::Startup(format!(
                     "timed out waiting for lswd at {}; inspect {}",
                     self.socket.display(),
                     log_path.display()
-                )
-                .into());
+                )));
             }
             thread::sleep(Duration::from_millis(50));
         }
     }
 
-    pub fn request_checked(
-        &self,
-        request: &str,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    /// Sends one request, starting the daemon first when necessary.
+    pub fn call_checked(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
         self.ensure_running()?;
-        self.request(request)
+        self.call(request)
     }
 
-    pub fn request(&self, request: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        if request.is_empty() || request.len() > 4095 || request.contains(['\r', '\n']) {
-            return Err("invalid daemon request".into());
-        }
+    /// Sends one request to a daemon that is expected to be listening.
+    pub fn call(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
         let mut stream = UnixStream::connect(&self.socket)?;
         stream.set_read_timeout(Some(IO_TIMEOUT))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        writeln!(stream, "{request}")?;
-        stream.flush()?;
+        write_daemon_request(&mut stream, request)?;
+        let mut reader = BufReader::new(stream);
+        match read_daemon_reply(&mut reader)? {
+            Some(DaemonReply::Ok(response)) => Ok(response),
+            Some(DaemonReply::Error(reason)) => Err(DaemonError::Rejected(reason)),
+            None => Err(DaemonError::Protocol(
+                "lswd closed the connection without a response".to_owned(),
+            )),
+        }
+    }
 
-        let mut reader = BufReader::new(stream).take(RESPONSE_LIMIT + 1);
-        let mut header = String::new();
-        if reader.read_line(&mut header)? == 0 {
-            return Err("lswd closed the connection without a response".into());
+    /// Probes the daemon without starting it and requires a matching protocol.
+    pub fn ping(&self) -> Result<DaemonInfo, DaemonError> {
+        match self.call(&DaemonRequest::Ping)? {
+            DaemonResponse::Pong(info) if info.is_compatible() => Ok(info),
+            DaemonResponse::Pong(info) => Err(DaemonError::Incompatible {
+                socket: self.socket.clone(),
+                daemon: info.protocol,
+            }),
+            other => Err(DaemonError::UnexpectedResponse(other)),
         }
-        let header = header.trim_end_matches(&['\r', '\n'][..]);
-        let success = header == "OK";
-        let daemon_error = header.strip_prefix("ERR ").map(percent_decode);
-        if !success && daemon_error.is_none() {
-            return Err("lswd returned an invalid response header".into());
-        }
+    }
 
-        let mut lines = Vec::new();
-        loop {
-            let mut line = String::new();
-            let length = reader.read_line(&mut line)?;
-            if length == 0 {
-                return Err("lswd response was not terminated".into());
-            }
-            if reader.limit() == 0 && !line.ends_with('\n') {
-                return Err("lswd response exceeded the size limit".into());
-            }
-            let line = line.trim_end_matches(&['\r', '\n'][..]);
-            if line == "." {
-                break;
-            }
-            lines.push(percent_decode(line));
+    /// The reconciled state of an instance.
+    pub fn status(&self, name: &str) -> Result<InstanceStatus, DaemonError> {
+        match self.call_checked(&DaemonRequest::Status {
+            name: name.to_owned(),
+        })? {
+            DaemonResponse::Status(status) => Ok(status),
+            other => Err(DaemonError::UnexpectedResponse(other)),
         }
-        if let Some(error) = daemon_error {
-            return Err(error.into());
-        }
-        Ok(lines)
+    }
+
+    pub fn start(&self, name: &str, phase: LaunchPhase) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Start {
+            name: name.to_owned(),
+            phase,
+        })
+    }
+
+    pub fn stop(&self, name: &str, force: bool) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Stop {
+            name: name.to_owned(),
+            force,
+        })
+    }
+
+    pub fn suspend(&self, name: &str) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Suspend {
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn resume(&self, name: &str) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Resume {
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn hibernate(&self, name: &str) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Hibernate {
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn record_activity(&self, name: &str) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Activity {
+            name: name.to_owned(),
+        })
+    }
+
+    pub fn balloon(&self, name: &str, memory_mib: u32) -> Result<DaemonResponse, DaemonError> {
+        self.call_checked(&DaemonRequest::Balloon {
+            name: name.to_owned(),
+            memory_mib,
+        })
     }
 
     pub fn socket(&self) -> &Path {
@@ -156,61 +251,128 @@ impl<'a> DaemonClient<'a> {
     }
 }
 
-fn daemon_protocol_matches(lines: &[String]) -> bool {
-    let expected_protocol = format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}");
-    lines.iter().any(|line| line == "PONG") && lines.iter().any(|line| line == &expected_protocol)
-}
-
-fn daemon_program() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn daemon_program() -> PathBuf {
     if let Some(configured) = env::var_os("LSW_DAEMON") {
-        return Ok(PathBuf::from(configured));
+        return PathBuf::from(configured);
     }
     if let Ok(current) = env::current_exe() {
         if let Some(parent) = current.parent() {
             let sibling = parent.join("lswd");
             if sibling.is_file() {
-                return Ok(sibling);
+                return sibling;
             }
         }
     }
-    Ok(PathBuf::from("lswd"))
-}
-
-fn percent_decode(value: &str) -> String {
-    value
-        .replace("%09", "\t")
-        .replace("%0D", "\r")
-        .replace("%0A", "\n")
-        .replace("%25", "%")
+    PathBuf::from("lswd")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+
+    use lsw_core::{read_daemon_request, write_daemon_reply, Liveness};
+
     use super::*;
 
-    #[test]
-    fn response_unescaping_reverses_daemon_encoding_order() {
-        assert_eq!(percent_decode("a%09b%0Ac%25"), "a\tb\nc%");
-        assert_eq!(percent_decode("literal%2Fvalue"), "literal%2Fvalue");
+    fn client_with_socket(socket: PathBuf) -> (StateStore, PathBuf) {
+        (
+            StateStore::new(std::env::temp_dir().join("lsw-host-daemon-test")),
+            socket,
+        )
+    }
+
+    fn serve_one(listener: UnixListener, reply: DaemonReply) -> thread::JoinHandle<DaemonRequest> {
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("client connects");
+            let mut reader = BufReader::new(stream.try_clone().expect("stream clones"));
+            let request = read_daemon_request(&mut reader)
+                .expect("request decodes")
+                .expect("request is present");
+            let mut writer = stream;
+            write_daemon_reply(&mut writer, &reply).expect("reply is written");
+            writer.flush().expect("reply is flushed");
+            request
+        })
+    }
+
+    fn temporary_socket(label: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("lsw-host-daemon-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("socket directory");
+        directory.join("lswd.sock")
     }
 
     #[test]
-    fn daemon_compatibility_uses_the_shared_protocol_version() {
-        let compatible = vec![
-            "PONG".to_owned(),
-            format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
-        ];
-        assert!(daemon_protocol_matches(&compatible));
+    fn typed_status_requests_decode_the_typed_reply() {
+        let socket = temporary_socket("status");
+        let listener = UnixListener::bind(&socket).expect("listener binds");
+        let (store, socket) = client_with_socket(socket);
+        let server = serve_one(
+            listener,
+            DaemonReply::Ok(DaemonResponse::Status(InstanceStatus {
+                state: lsw_core::InstanceState::Suspended,
+                qmp: Some("paused".to_owned()),
+                active: Liveness::Active,
+            })),
+        );
+        let client = DaemonClient {
+            store: &store,
+            socket,
+        };
+        let status = match client.call(&DaemonRequest::Status {
+            name: "win-dev".to_owned(),
+        }) {
+            Ok(DaemonResponse::Status(status)) => status,
+            other => panic!("unexpected result {other:?}"),
+        };
+        assert_eq!(status.state, lsw_core::InstanceState::Suspended);
+        assert_eq!(status.qmp.as_deref(), Some("paused"));
+        assert_eq!(
+            server.join().expect("server finishes"),
+            DaemonRequest::Status {
+                name: "win-dev".to_owned()
+            }
+        );
+    }
 
-        let previous_version = DAEMON_PROTOCOL_VERSION
-            .checked_sub(1)
-            .expect("daemon protocol version must be positive");
-        assert!(!daemon_protocol_matches(&[
-            "PONG".to_owned(),
-            format!("PROTOCOL={previous_version}"),
-        ]));
-        assert!(!daemon_protocol_matches(&[format!(
-            "PROTOCOL={DAEMON_PROTOCOL_VERSION}"
-        )]));
+    #[test]
+    fn rejections_and_incompatible_daemons_are_distinct_errors() {
+        let socket = temporary_socket("reject");
+        let listener = UnixListener::bind(&socket).expect("listener binds");
+        let (store, socket) = client_with_socket(socket);
+        let server = serve_one(listener, DaemonReply::Error("no such instance".to_owned()));
+        let client = DaemonClient {
+            store: &store,
+            socket: socket.clone(),
+        };
+        assert!(matches!(
+            client.call(&DaemonRequest::Suspend {
+                name: "x".to_owned()
+            }),
+            Err(DaemonError::Rejected(reason)) if reason == "no such instance"
+        ));
+        server.join().expect("server finishes");
+
+        let listener = UnixListener::bind(&socket).unwrap_or_else(|_| {
+            fs::remove_file(&socket).expect("stale socket removed");
+            UnixListener::bind(&socket).expect("listener rebinds")
+        });
+        let server = serve_one(
+            listener,
+            DaemonReply::Ok(DaemonResponse::Pong(DaemonInfo {
+                protocol: DAEMON_PROTOCOL_VERSION - 1,
+                features: Vec::new(),
+                pid: 1,
+                rss_kib: None,
+            })),
+        );
+        assert!(matches!(
+            client.ping(),
+            Err(DaemonError::Incompatible { daemon, .. }) if daemon == DAEMON_PROTOCOL_VERSION - 1
+        ));
+        server.join().expect("server finishes");
+        assert!(matches!(client.ping(), Err(DaemonError::Io(_))));
     }
 }

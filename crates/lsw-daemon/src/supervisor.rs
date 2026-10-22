@@ -11,9 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use lsw_core::{
-    prepare_live_share_runtime, CommandInvocation, GuestCpuTuning, HostCapabilities, IdlePolicy,
-    InstanceManifest, InstanceState, LaunchPhase, Provisioner, QemuPlanner, StateStore,
-    WindowsProfile,
+    prepare_live_share_runtime, CommandInvocation, DaemonResponse, GuestCpuTuning,
+    HostCapabilities, IdlePolicy, InstanceManifest, InstanceState, InstanceStatus, LaunchPhase,
+    Liveness, Provisioner, QemuPlanner, StartedInstance, StateStore, WindowsProfile,
 };
 use lsw_protocol::{
     read_frame, write_frame, ClientHello, Frame, FrameKind, ServerHello, AGENT_PROTOCOL_VERSION,
@@ -31,6 +31,10 @@ const AGENT_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 struct ManagedVm {
     qemu: Child,
     helpers: Vec<Child>,
+}
+
+fn notice(line: String) -> DaemonResponse {
+    DaemonResponse::Notice { lines: vec![line] }
 }
 
 pub struct Supervisor {
@@ -155,7 +159,7 @@ impl Supervisor {
         &mut self,
         name: &str,
         phase: LaunchPhase,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    ) -> Result<DaemonResponse, Box<dyn std::error::Error>> {
         self.poll();
         if let Ok(qmp_state) = self.qmp_status(name) {
             let manifest = self.store.load(name)?;
@@ -165,7 +169,7 @@ impl Supervisor {
             {
                 return self.resume(name);
             }
-            return Ok(vec![format!("instance {name} is already running")]);
+            return Ok(notice(format!("instance {name} is already running")));
         }
 
         let manifest = self.store.load(name)?;
@@ -271,11 +275,12 @@ impl Supervisor {
         )?;
         self.record_activity(name)?;
         let _ = self.set_balloon_target(name, manifest.spec.memory_mib);
-        Ok(vec![
-            format!("instance {name} started in {phase} phase"),
-            format!("QMP={}", instance_dir.join("run/qmp.sock").display()),
-            format!("LOG={}", instance_dir.join("qemu.log").display()),
-        ])
+        Ok(DaemonResponse::Started(StartedInstance {
+            name: name.to_owned(),
+            phase,
+            qmp_socket: instance_dir.join("run/qmp.sock"),
+            log: instance_dir.join("qemu.log"),
+        }))
     }
 
     pub fn stop(
@@ -344,7 +349,7 @@ impl Supervisor {
         Ok(vec![format!("instance {name} stopped")])
     }
 
-    pub fn status(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub fn status(&mut self, name: &str) -> Result<InstanceStatus, Box<dyn std::error::Error>> {
         self.poll();
         let manifest = self.store.load(name)?;
         match self.qmp_status(name) {
@@ -357,11 +362,11 @@ impl Supervisor {
                 if reconciled != manifest.state {
                     self.set_state(name, reconciled)?;
                 }
-                Ok(vec![
-                    format!("STATE={reconciled}"),
-                    format!("QMP={qmp}"),
-                    "ACTIVE=true".to_owned(),
-                ])
+                Ok(InstanceStatus {
+                    state: reconciled,
+                    qmp: Some(qmp),
+                    active: Liveness::Active,
+                })
             }
             Err(_) => {
                 let active_manifest = matches!(
@@ -381,15 +386,16 @@ impl Supervisor {
                         // owned or externally inherited QEMU temporarily
                         // unreachable. Never unlink its live sockets or make a
                         // second launch eligible from one failed connection.
-                        return Ok(vec![
-                            format!("STATE={}", manifest.state),
-                            "QMP=unavailable".to_owned(),
-                            match evidence {
-                                QemuProcessEvidence::Live => "ACTIVE=true".to_owned(),
-                                QemuProcessEvidence::Unknown => "ACTIVE=unknown".to_owned(),
-                                QemuProcessEvidence::Gone => unreachable!(),
+                        return Ok(InstanceStatus {
+                            state: manifest.state,
+                            qmp: None,
+                            active: match evidence {
+                                QemuProcessEvidence::Live => Liveness::Active,
+                                QemuProcessEvidence::Unknown | QemuProcessEvidence::Gone => {
+                                    Liveness::Unknown
+                                }
                             },
-                        ]);
+                        });
                     }
                 }
                 let state = if matches!(
@@ -414,11 +420,11 @@ impl Supervisor {
                 } else {
                     manifest.state
                 };
-                Ok(vec![
-                    format!("STATE={state}"),
-                    "QMP=unavailable".to_owned(),
-                    "ACTIVE=false".to_owned(),
-                ])
+                Ok(InstanceStatus {
+                    state,
+                    qmp: None,
+                    active: Liveness::Inactive,
+                })
             }
         }
     }
@@ -461,7 +467,7 @@ impl Supervisor {
         Ok(vec![format!("instance {name} suspended in memory")])
     }
 
-    pub fn resume(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    pub fn resume(&mut self, name: &str) -> Result<DaemonResponse, Box<dyn std::error::Error>> {
         self.poll();
         let manifest = self.store.load(name)?;
         if manifest.state == InstanceState::Hibernated {
@@ -472,7 +478,7 @@ impl Supervisor {
         let status = qmp.status()?;
 
         if manifest.state == InstanceState::Running && status == "running" {
-            return Ok(vec![format!("instance {name} is already running")]);
+            return Ok(notice(format!("instance {name} is already running")));
         }
         if manifest.state != InstanceState::Suspended || status != "paused" {
             return Err(format!(
@@ -492,7 +498,7 @@ impl Supervisor {
         self.set_state(name, InstanceState::Running)?;
         self.record_activity(name)?;
         let _ = self.set_balloon_target(name, manifest.spec.memory_mib);
-        Ok(vec![format!("instance {name} resumed")])
+        Ok(notice(format!("instance {name} resumed")))
     }
 
     pub fn hibernate(&mut self, name: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {

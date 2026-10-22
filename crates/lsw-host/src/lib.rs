@@ -16,4 +16,4 @@ pub use agent::{
     GuiWindowWriter,
 };
 #[cfg(unix)]
-pub use daemon::DaemonClient;
+pub use daemon::{DaemonClient, DaemonError};

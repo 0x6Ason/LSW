@@ -103,7 +103,7 @@ pub(super) fn request_graceful_stop_and_wait(
     name: &str,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    DaemonClient::new(store).request_checked(&format!("STOP {name} graceful"))?;
+    DaemonClient::new(store).stop(name, false)?;
     let deadline = Instant::now() + timeout;
     loop {
         match store.load(name)?.state {
@@ -759,9 +759,9 @@ pub(super) fn daemon(
         }
         "diagnose" => {
             print_systemd_state();
-            match client.request("PING") {
-                Ok(lines) => {
-                    for line in lines {
+            match client.ping() {
+                Ok(info) => {
+                    for line in info.lines() {
                         println!("{line}");
                     }
                 }
@@ -770,10 +770,10 @@ pub(super) fn daemon(
             println!("Idle daemon RSS gate: below 30720 KiB.");
             println!("With only lswd.socket waiting, lswd.service must be inactive.");
         }
-        "status" => match client.request("PING") {
-            Ok(lines) => {
+        "status" => match client.ping() {
+            Ok(info) => {
                 println!("lswd is ready at {}", client.socket().display());
-                for line in lines {
+                for line in info.lines() {
                     println!("  {line}");
                 }
             }

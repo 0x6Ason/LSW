@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 pub use lsw_protocol::WindowsUserRole;
 
 use crate::{LswError, Result, WindowsProfile};
@@ -336,7 +338,8 @@ impl InstanceSpec {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum InstanceState {
     Configured,
     Installing,

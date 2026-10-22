@@ -54,13 +54,12 @@ The real problems are structural:
    a stable boundary. Give each module an explicit `use` list and a
    `pub(crate)` surface; the daemon's twenty-two `pub` items and the CLI's ten
    should become `pub(crate)`.
-3. **Typed errors and a typed daemon protocol.** Outside `lsw-core` every
-   binary returns `Box<dyn Error>` from ~530 `Err("...".into())` sites, and
-   eighteen functions return `Result<_, String>`. The daemon answers with
-   `KEY=VALUE` lines that `lsw-host` re-parses with a hand-written percent
-   decoder. Introduce per-crate error enums (`thiserror` is acceptable; the
-   hand-written `LswError` style also works) and a typed status struct over
-   the daemon socket.
+3. **Typed errors.** Outside `lsw-core` every binary returns
+   `Box<dyn Error>` from ~530 `Err("...".into())` sites, and eighteen
+   functions return `Result<_, String>`. The daemon protocol is typed now
+   (`lsw-core::daemon_protocol`, `lsw-host::DaemonError`); the agent, CLI,
+   and `lswg` still need per-crate error enums (`thiserror` is acceptable;
+   the hand-written `LswError` style also works).
 4. **Break up the giant functions.** `install_seed/guest_setup.rs` (363
    lines), `QemuPlanner::plan` (now ~370), `lswg/presenter/mod.rs:53` (304),
    `winpe_dism/vm.rs:18` (263), `presenter/wslg.rs:67` (205),

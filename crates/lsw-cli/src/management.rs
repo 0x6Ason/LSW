@@ -422,12 +422,11 @@ pub(super) fn shutdown(
         return Ok(());
     }
     let client = DaemonClient::new(store);
-    let mode = if force { "force" } else { "graceful" };
     let mut failures = Vec::new();
     for name in names {
-        match client.request_checked(&format!("STOP {name} {mode}")) {
-            Ok(lines) => {
-                for line in lines {
+        match client.stop(&name, force) {
+            Ok(response) => {
+                for line in response.lines() {
                     println!("{line}");
                 }
             }
@@ -515,8 +514,10 @@ pub(super) fn diagnose(
         )?;
         let daemon = DaemonClient::new(store);
         let status = daemon
-            .request(&format!("STATUS {name}"))
-            .map(|lines| lines.join("\n"))
+            .call(&DaemonRequest::Status {
+                name: name.to_owned(),
+            })
+            .map(|response| response.lines().join("\n"))
             .unwrap_or_else(|error| format!("unavailable: {error}"));
         fs::write(staging.join("status.txt"), format!("{status}\n"))?;
         if let Ok(plan) = QemuPlanner::new(HostCapabilities::detect()).plan(

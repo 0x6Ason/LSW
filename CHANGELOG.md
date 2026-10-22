@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Replaced the daemon's `KEY=VALUE` line protocol with typed requests and
+  replies. `lsw-core::daemon_protocol` defines `DaemonRequest`,
+  `DaemonResponse`, and the JSON `DaemonReply` envelope; `lswd` dispatches on
+  the enum and `lsw-host::DaemonClient` exposes typed calls (`ping`, `status`,
+  `start`, `stop`, ...) with a `DaemonError` that distinguishes a rejection
+  from a transport failure or an incompatible daemon. The protocol version is
+  now 3; `lsw status`, `lsw daemon status`, and `lsw plan` print the same
+  lines as before, so scripts are unaffected.
 - Made release reproducibility meaningful. The builder now stages the
   corresponding source first (git-tracked files, `SOURCE_COMMIT`, vendored
   dependencies) and compiles every binary from that snapshot offline with the

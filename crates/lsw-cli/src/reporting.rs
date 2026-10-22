@@ -35,7 +35,7 @@ pub(super) fn bench(
     let capabilities = HostCapabilities::detect();
     let capability_scan_us = started.elapsed().as_micros();
     let started = Instant::now();
-    let daemon_ready = DaemonClient::new(store).request("PING").is_ok();
+    let daemon_ready = DaemonClient::new(store).ping().is_ok();
     let daemon_ping_us = daemon_ready.then_some(started.elapsed().as_micros());
 
     let name = requested

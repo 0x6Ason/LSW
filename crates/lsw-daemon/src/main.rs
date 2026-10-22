@@ -13,7 +13,7 @@ mod supervisor;
 
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -22,12 +22,14 @@ use std::thread;
 use std::time::Duration;
 
 use lsw_core::{
-    GuestCpuTuning, HostCapabilities, LaunchPhase, StateStore, DAEMON_PROTOCOL_VERSION,
+    read_daemon_request, write_daemon_reply, DaemonInfo, DaemonReply, DaemonRequest,
+    DaemonResponse, GuestCpuTuning, HostCapabilities, InstanceSummary, LaunchPhase,
+    LaunchPlanSummary, StateStore, DAEMON_PROTOCOL_VERSION,
 };
 use runtime_config::*;
 use supervisor::Supervisor;
 
-const MAX_REQUEST_BYTES: u64 = 4096;
+const DAEMON_FEATURES: &[&str] = &["suspend", "resume", "hibernate", "balloon", "idle-exit"];
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(30);
@@ -143,123 +145,86 @@ fn handle_connection(
     stream: UnixStream,
     supervisor: &mut Supervisor,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut request = String::new();
-    let reader = BufReader::new(stream.try_clone()?);
-    let bytes_read = reader.take(MAX_REQUEST_BYTES + 1).read_line(&mut request)?;
-
-    let response = if bytes_read == 0 {
-        Err("empty request".to_owned())
-    } else if bytes_read as u64 > MAX_REQUEST_BYTES || !request.ends_with('\n') {
-        Err("request is too large or is not newline-terminated".to_owned())
-    } else {
-        dispatch(request.trim_end_matches(&['\r', '\n'][..]), supervisor)
-            .map_err(|error| error.to_string())
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let reply = match read_daemon_request(&mut reader) {
+        Ok(Some(request)) => match dispatch(request, supervisor) {
+            Ok(response) => DaemonReply::Ok(response),
+            Err(error) => DaemonReply::Error(error.to_string()),
+        },
+        Ok(None) => DaemonReply::Error("empty request".to_owned()),
+        Err(error) => DaemonReply::Error(error.to_string()),
     };
-
     let mut writer = BufWriter::new(stream);
-    match response {
-        Ok(lines) => {
-            writer.write_all(b"OK\n")?;
-            for line in lines {
-                writeln!(writer, "{}", escape_line(&line))?;
-            }
-        }
-        Err(error) => writeln!(writer, "ERR {}", escape_line(&error))?,
-    }
-    writer.write_all(b".\n")?;
-    writer.flush()?;
+    write_daemon_reply(&mut writer, &reply)?;
     Ok(())
 }
 
 fn dispatch(
-    request: &str,
+    request: DaemonRequest,
     supervisor: &mut Supervisor,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let parts = request.split_ascii_whitespace().collect::<Vec<_>>();
-    match parts.as_slice() {
-        ["PING"] => Ok(vec![
-            "PONG".to_owned(),
-            format!("PROTOCOL={DAEMON_PROTOCOL_VERSION}"),
-            "FEATURES=suspend,resume,hibernate,balloon,idle-exit".to_owned(),
-            format!("PID={}", std::process::id()),
-            format!("RSS_KIB={}", current_rss_kib().unwrap_or(0)),
-        ]),
-        ["LIST"] => Ok(supervisor
-            .store()
-            .list()?
-            .into_iter()
-            .map(|manifest| {
-                format!(
-                    "INSTANCE\t{}\t{}\t{}",
-                    manifest.spec.name, manifest.state, manifest.spec.profile
-                )
-            })
-            .collect()),
-        ["SHOW", name] => Ok(supervisor
-            .store()
-            .load(name)?
-            .encode()?
-            .lines()
-            .map(str::to_owned)
-            .collect()),
-        ["PLAN", name, phase] => plan(supervisor, name, phase),
-        ["START", name, phase] => supervisor.start(name, parse_phase(phase)?),
-        ["STATUS", name] => supervisor.status(name),
-        ["SUSPEND", name] => supervisor.suspend(name),
-        ["RESUME", name] => supervisor.resume(name),
-        ["HIBERNATE", name] => supervisor.hibernate(name),
-        ["ACTIVITY", name] => supervisor.activity(name),
-        ["BALLOON", name, memory_mib] => {
-            supervisor.balloon(name, memory_mib.parse().map_err(|_| "invalid balloon target")?)
+) -> Result<DaemonResponse, Box<dyn std::error::Error>> {
+    let notice = |lines: Vec<String>| DaemonResponse::Notice { lines };
+    match request {
+        DaemonRequest::Ping => Ok(DaemonResponse::Pong(DaemonInfo {
+            protocol: DAEMON_PROTOCOL_VERSION,
+            features: DAEMON_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            pid: std::process::id(),
+            rss_kib: current_rss_kib(),
+        })),
+        DaemonRequest::List => Ok(DaemonResponse::Instances {
+            instances: supervisor
+                .store()
+                .list()?
+                .into_iter()
+                .map(|manifest| InstanceSummary {
+                    name: manifest.spec.name,
+                    state: manifest.state,
+                    profile: manifest.spec.profile,
+                })
+                .collect(),
+        }),
+        DaemonRequest::Show { name } => Ok(DaemonResponse::Manifest {
+            encoded: supervisor.store().load(&name)?.encode()?,
+        }),
+        DaemonRequest::Plan { name, phase } => plan(supervisor, &name, phase),
+        DaemonRequest::Start { name, phase } => supervisor.start(&name, phase),
+        DaemonRequest::Status { name } => supervisor.status(&name).map(DaemonResponse::Status),
+        DaemonRequest::Suspend { name } => supervisor.suspend(&name).map(notice),
+        DaemonRequest::Resume { name } => supervisor.resume(&name),
+        DaemonRequest::Hibernate { name } => supervisor.hibernate(&name).map(notice),
+        DaemonRequest::Activity { name } => supervisor.activity(&name).map(notice),
+        DaemonRequest::Balloon { name, memory_mib } => {
+            supervisor.balloon(&name, memory_mib).map(notice)
         }
-        ["STOP", name, "graceful"] => supervisor.stop(name, false),
-        ["STOP", name, "force"] => supervisor.stop(name, true),
-        [] => Err("empty request".into()),
-        _ => Err(
-            "unknown request; expected PING, LIST, SHOW, PLAN, START, STATUS, SUSPEND, RESUME, HIBERNATE, ACTIVITY, BALLOON, or STOP"
-                .into(),
-        ),
+        DaemonRequest::Stop { name, force } => supervisor.stop(&name, force).map(notice),
     }
 }
 
 fn plan(
     supervisor: &Supervisor,
     name: &str,
-    phase: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let phase = parse_phase(phase)?;
+    phase: LaunchPhase,
+) -> Result<DaemonResponse, Box<dyn std::error::Error>> {
     let manifest = supervisor.store().load(name)?;
     let instance_dir = supervisor.store().instance_dir(name)?;
     let plan = supervisor.planner().plan(&manifest, &instance_dir, phase)?;
-    let mut response = plan
-        .helper_commands
-        .iter()
-        .map(|helper| format!("HELPER\t{}", helper.display_command()))
-        .collect::<Vec<_>>();
-    response.push(format!("COMMAND\t{}", plan.display_command()));
-    response.extend(plan.notes.into_iter().map(|note| format!("NOTE\t{note}")));
-    response.extend(
-        plan.missing_capabilities
+    Ok(DaemonResponse::Plan(LaunchPlanSummary {
+        helper_commands: plan
+            .helper_commands
+            .iter()
+            .map(|helper| helper.display_command())
+            .collect(),
+        command: plan.display_command(),
+        notes: plan.notes,
+        missing_capabilities: plan
+            .missing_capabilities
             .into_iter()
-            .map(|missing| format!("MISSING\t{missing}")),
-    );
-    Ok(response)
-}
-
-fn parse_phase(phase: &str) -> Result<LaunchPhase, Box<dyn std::error::Error>> {
-    match phase {
-        "install" => Ok(LaunchPhase::Install),
-        "run" => Ok(LaunchPhase::Run),
-        _ => Err("phase must be install or run".into()),
-    }
-}
-
-fn escape_line(value: &str) -> String {
-    value
-        .replace('%', "%25")
-        .replace('\t', "%09")
-        .replace('\r', "%0D")
-        .replace('\n', "%0A")
+            .map(str::to_owned)
+            .collect(),
+    }))
 }
 
 #[cfg(test)]

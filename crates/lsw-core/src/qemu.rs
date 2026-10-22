@@ -6,6 +6,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     FolderShareTransport, GuestCpuTuning, HostCapabilities, InstanceManifest, NetworkMode,
     QemuBackend, Result,
@@ -15,7 +17,8 @@ use lsw_protocol::AGENT_GUEST_PORT;
 pub const LIVE_SMB_RUNTIME_DIRECTORY: &str = "live-smb";
 pub const LIVE_SMB_CONFIG_FILE: &str = "smb.conf";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LaunchPhase {
     Install,
     Run,

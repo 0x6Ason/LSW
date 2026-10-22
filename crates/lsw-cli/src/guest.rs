@@ -18,7 +18,7 @@ pub(super) fn start_named_instance(
     phase: LaunchPhase,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = DaemonClient::new(store);
-    for line in client.request_checked(&format!("START {name} {phase}"))? {
+    for line in client.start(name, phase)?.lines() {
         println!("{line}");
     }
     if phase == LaunchPhase::Install {
@@ -59,7 +59,7 @@ pub(super) fn status(
     let name = resolve_name(store, requested)?;
     let client = DaemonClient::new(store);
     println!("instance={name}");
-    for line in client.request_checked(&format!("STATUS {name}"))? {
+    for line in DaemonResponse::Status(client.status(&name)?).lines() {
         println!("{line}");
     }
     let manifest = store.load(&name)?;
@@ -95,9 +95,8 @@ pub(super) fn stop(
         }
     }
     let name = resolve_name(store, requested)?;
-    let mode = if force { "force" } else { "graceful" };
     let client = DaemonClient::new(store);
-    for line in client.request_checked(&format!("STOP {name} {mode}"))? {
+    for line in client.stop(&name, force)?.lines() {
         println!("{line}");
     }
     Ok(())
@@ -110,7 +109,7 @@ pub(super) fn suspend(
     let requested = optional_name(arguments, "suspend")?;
     let name = resolve_name(store, requested)?;
     let client = DaemonClient::new(store);
-    for line in client.request_checked(&format!("SUSPEND {name}"))? {
+    for line in client.suspend(&name)?.lines() {
         println!("{line}");
     }
     Ok(())
@@ -123,7 +122,7 @@ pub(super) fn resume(
     let requested = optional_name(arguments, "resume")?;
     let name = resolve_name(store, requested)?;
     let client = DaemonClient::new(store);
-    for line in client.request_checked(&format!("RESUME {name}"))? {
+    for line in client.resume(&name)?.lines() {
         println!("{line}");
     }
     Ok(())
@@ -136,7 +135,7 @@ pub(super) fn hibernate(
     let requested = optional_name(arguments, "hibernate")?;
     let name = resolve_name(store, requested)?;
     let client = DaemonClient::new(store);
-    for line in client.request_checked(&format!("HIBERNATE {name}"))? {
+    for line in client.hibernate(&name)?.lines() {
         println!("{line}");
     }
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -172,7 +171,7 @@ pub(super) fn memory_command(
         "restore" => manifest.spec.memory_mib,
         _ => return Err("usage: lsw memory <reclaim|restore> [NAME]".into()),
     };
-    for line in DaemonClient::new(store).request_checked(&format!("BALLOON {name} {target}"))? {
+    for line in DaemonClient::new(store).balloon(&name, target)?.lines() {
         println!("{line}");
     }
     Ok(())
@@ -563,7 +562,7 @@ pub(super) fn connect_agent(
     let mut manifest = store.load(name)?;
     let token = store.read_agent_token(name)?;
     if let Ok(client) = AgentClient::connect(&manifest, &token) {
-        let _ = DaemonClient::new(store).request_checked(&format!("ACTIVITY {name}"));
+        let _ = DaemonClient::new(store).record_activity(name);
         return Ok(client);
     }
 
@@ -576,14 +575,14 @@ pub(super) fn connect_agent(
         InstanceState::Stopped | InstanceState::Hibernated | InstanceState::Failed => {
             eprintln!("Starting {name:?}...");
             let daemon = DaemonClient::new(store);
-            for line in daemon.request_checked(&format!("START {name} run"))? {
+            for line in daemon.start(name, LaunchPhase::Run)?.lines() {
                 eprintln!("{line}");
             }
         }
         InstanceState::Suspended => {
             eprintln!("Resuming {name:?}...");
             let daemon = DaemonClient::new(store);
-            for line in daemon.request_checked(&format!("RESUME {name}"))? {
+            for line in daemon.resume(name)?.lines() {
                 eprintln!("{line}");
             }
         }

@@ -482,7 +482,7 @@ fn restart_instance_observed(
     let active = matches!(state, InstanceState::Running | InstanceState::Suspended);
     if active {
         let client = DaemonClient::new(store);
-        for line in client.request_checked(&format!("STOP {name} graceful"))? {
+        for line in client.stop(name, false)?.lines() {
             println!("{line}");
         }
         let fallback_deadline = Instant::now() + NATIVE_SHUTDOWN_FALLBACK_DELAY;
@@ -490,7 +490,7 @@ fn restart_instance_observed(
         let mut fallback_requested = false;
         let mut fallback_error = None;
         loop {
-            let _ = client.request_checked(&format!("STATUS {name}"));
+            let _ = client.status(name);
             if matches!(
                 store.load(name)?.state,
                 InstanceState::Stopped | InstanceState::Failed

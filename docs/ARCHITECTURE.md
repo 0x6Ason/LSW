@@ -205,13 +205,20 @@ images/SHA256/
 
 ## Control and guest protocols
 
-The daemon protocol is newline-delimited, versioned by `PING`, bounded, and
-available only on a mode-0600 socket in a mode-0700 directory. `lswd` can bind
-that socket directly or accept exactly one PID-scoped descriptor through the
-systemd activation environment; an inherited descriptor must resolve to the
-same private pathname before use. Mutations are
-strict commands (`START`, `SUSPEND`, `RESUME`, `HIBERNATE`, `ACTIVITY`,
-`BALLOON`, `STOP`) rather than shell strings.
+The daemon protocol is typed: `lsw-core::daemon_protocol` defines
+`DaemonRequest`, `DaemonResponse`, and the `DaemonReply` envelope that `lswd`
+and `lsw-host::DaemonClient` share, so neither side re-parses text. One request
+is one bounded, newline-terminated JSON object on a mode-0600 socket in a
+mode-0700 directory; the answer is `{"ok": ...}` or `{"error": "..."}`. Status
+replies carry the reconciled `InstanceState`, QEMU's own status word, and a
+`Liveness`; `lsw status` renders them as the `STATE=`, `QMP=`, and `ACTIVE=`
+lines scripts match. `PING` reports `DAEMON_PROTOCOL_VERSION`, and a client
+that meets a daemon speaking another version reports that instead of trying to
+start a second daemon beside it. `lswd` can bind the socket directly or accept
+exactly one PID-scoped descriptor through the systemd activation environment;
+an inherited descriptor must resolve to the same private pathname before use.
+Mutations are enum variants (`Start`, `Suspend`, `Resume`, `Hibernate`,
+`Activity`, `Balloon`, `Stop`) with typed fields rather than shell strings.
 QEMU state is read and changed through negotiated QMP commands, never by
 trusting a PID file.
 
